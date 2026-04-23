@@ -1440,14 +1440,10 @@ public class TableReader implements Closeable, SymbolTableSource {
                                     parquetPartitions.setQuick(partitionIndex, parquetMem);
                                 }
                             } catch (CairoException e) {
-                                // The local parquet file vanished between exists() and mmap (writer dropped it for cold storage).
-                                LOG.info().$("local parquet unavailable, switching partition to cold-storage path [path=")
-                                        .$substr(dbRootSize, path).$(", errno=").$(e.getErrno()).I$();
                                 Misc.free(parquetPartitions.getQuick(partitionIndex));
                                 parquetPartitions.setQuick(partitionIndex, NullMemoryCMR.INSTANCE);
                             }
                         } else {
-                            // The file might not exist if it was sent to object store.
                             Misc.free(parquetPartitions.getQuick(partitionIndex));
                             parquetPartitions.setQuick(partitionIndex, NullMemoryCMR.INSTANCE);
                         }
