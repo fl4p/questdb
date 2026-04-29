@@ -26,7 +26,6 @@ use qdb_core::col_type::ColumnType;
 pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetPartitionDecoder_decodeRowGroup(
     mut env: JNIEnv,
     _class: JClass,
-    allocator: *const QdbAllocator,
     ctx: *mut DecodeContext,
     parquet_file_ptr: *const u8,
     parquet_file_size: u64,
@@ -40,7 +39,6 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetParti
 ) -> u32 {
     let env = &mut env;
     let res = parquet_meta_decode_row_group_impl(
-        allocator,
         ctx,
         parquet_file_ptr,
         parquet_file_size,
@@ -65,7 +63,6 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetParti
 pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetPartitionDecoder_decodeRowGroupWithRowFilter(
     mut env: JNIEnv,
     _class: JClass,
-    allocator: *const QdbAllocator,
     ctx: *mut DecodeContext,
     parquet_file_ptr: *const u8,
     parquet_file_size: u64,
@@ -87,7 +84,6 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetParti
         filtered_rows_size as usize
     };
     let res = parquet_meta_decode_row_group_filtered_impl::<false>(
-        allocator,
         ctx,
         parquet_file_ptr,
         parquet_file_size,
@@ -112,7 +108,6 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetParti
 pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetPartitionDecoder_decodeRowGroupWithRowFilterFillNulls(
     mut env: JNIEnv,
     _class: JClass,
-    allocator: *const QdbAllocator,
     ctx: *mut DecodeContext,
     parquet_file_ptr: *const u8,
     parquet_file_size: u64,
@@ -134,7 +129,6 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetParti
         filtered_rows_size as usize
     };
     let res = parquet_meta_decode_row_group_filtered_impl::<true>(
-        allocator,
         ctx,
         parquet_file_ptr,
         parquet_file_size,
@@ -157,7 +151,6 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetParti
 
 #[allow(clippy::too_many_arguments)]
 fn parquet_meta_decode_row_group_filtered_impl<const FILL_NULLS: bool>(
-    _allocator: *const QdbAllocator,
     ctx: *mut DecodeContext,
     parquet_file_ptr: *const u8,
     parquet_file_size: u64,
@@ -228,7 +221,6 @@ fn parquet_meta_decode_row_group_filtered_impl<const FILL_NULLS: bool>(
 
 #[allow(clippy::too_many_arguments)]
 fn parquet_meta_decode_row_group_impl(
-    _allocator: *const QdbAllocator,
     ctx: *mut DecodeContext,
     parquet_file_ptr: *const u8,
     parquet_file_size: u64,
