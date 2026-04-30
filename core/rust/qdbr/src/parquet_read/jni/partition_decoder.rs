@@ -149,6 +149,262 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetParti
     }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetPartitionDecoder_decodeRowGroupFromBuffers(
+    mut env: JNIEnv,
+    _class: JClass,
+    ctx: *mut DecodeContext,
+    parquet_meta_reader_ptr: *const JniParquetMetaReader,
+    row_group_bufs: *mut RowGroupBuffers,
+    columns: *const (ParquetColumnIndex, ColumnType),
+    column_count: u32,
+    row_group_index: u32,
+    chunks_ptr: *const u64,
+    row_group_lo: u32,
+    row_group_hi: u32,
+) -> u32 {
+    let env = &mut env;
+    let res = parquet_meta_decode_row_group_from_buffers_impl(
+        ctx,
+        parquet_meta_reader_ptr,
+        row_group_bufs,
+        columns,
+        column_count,
+        row_group_index,
+        chunks_ptr,
+        row_group_lo,
+        row_group_hi,
+    );
+    match res {
+        Ok(count) => count as u32,
+        Err(mut err) => {
+            err.add_context("error in ParquetMetaPartitionDecoder.decodeRowGroupFromBuffers");
+            err.into_cairo_exception().throw(env)
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetPartitionDecoder_decodeRowGroupWithRowFilterFromBuffers(
+    mut env: JNIEnv,
+    _class: JClass,
+    ctx: *mut DecodeContext,
+    parquet_meta_reader_ptr: *const JniParquetMetaReader,
+    row_group_bufs: *mut RowGroupBuffers,
+    column_offset: u32,
+    columns: *const (ParquetColumnIndex, ColumnType),
+    column_count: u32,
+    row_group_index: u32,
+    chunks_ptr: *const u64,
+    row_group_lo: u32,
+    row_group_hi: u32,
+    filtered_rows_ptr: *const i64,
+    filtered_rows_size: i64,
+) {
+    let env = &mut env;
+    let filtered_rows_count = if filtered_rows_size < 0 {
+        0usize
+    } else {
+        filtered_rows_size as usize
+    };
+    let res = parquet_meta_decode_row_group_filtered_from_buffers_impl::<false>(
+        ctx,
+        parquet_meta_reader_ptr,
+        row_group_bufs,
+        column_offset as usize,
+        columns,
+        column_count,
+        row_group_index,
+        chunks_ptr,
+        row_group_lo,
+        row_group_hi,
+        filtered_rows_ptr,
+        filtered_rows_count,
+    );
+    if let Err(mut err) = res {
+        err.add_context(
+            "error in ParquetMetaPartitionDecoder.decodeRowGroupWithRowFilterFromBuffers",
+        );
+        let _: () = err.into_cairo_exception().throw(env);
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_ParquetPartitionDecoder_decodeRowGroupWithRowFilterFillNullsFromBuffers(
+    mut env: JNIEnv,
+    _class: JClass,
+    ctx: *mut DecodeContext,
+    parquet_meta_reader_ptr: *const JniParquetMetaReader,
+    row_group_bufs: *mut RowGroupBuffers,
+    column_offset: u32,
+    columns: *const (ParquetColumnIndex, ColumnType),
+    column_count: u32,
+    row_group_index: u32,
+    chunks_ptr: *const u64,
+    row_group_lo: u32,
+    row_group_hi: u32,
+    filtered_rows_ptr: *const i64,
+    filtered_rows_size: i64,
+) {
+    let env = &mut env;
+    let filtered_rows_count = if filtered_rows_size < 0 {
+        0usize
+    } else {
+        filtered_rows_size as usize
+    };
+    let res = parquet_meta_decode_row_group_filtered_from_buffers_impl::<true>(
+        ctx,
+        parquet_meta_reader_ptr,
+        row_group_bufs,
+        column_offset as usize,
+        columns,
+        column_count,
+        row_group_index,
+        chunks_ptr,
+        row_group_lo,
+        row_group_hi,
+        filtered_rows_ptr,
+        filtered_rows_count,
+    );
+    if let Err(mut err) = res {
+        err.add_context(
+            "error in ParquetMetaPartitionDecoder.decodeRowGroupWithRowFilterFillNullsFromBuffers",
+        );
+        let _: () = err.into_cairo_exception().throw(env);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parquet_meta_decode_row_group_from_buffers_impl(
+    ctx: *mut DecodeContext,
+    parquet_meta_reader_ptr: *const JniParquetMetaReader,
+    row_group_bufs: *mut RowGroupBuffers,
+    columns: *const (ParquetColumnIndex, ColumnType),
+    column_count: u32,
+    row_group_index: u32,
+    chunks_ptr: *const u64,
+    row_group_lo: u32,
+    row_group_hi: u32,
+) -> ParquetResult<usize> {
+    if ctx.is_null() {
+        return Err(fmt_err!(InvalidType, "decode context pointer is null"));
+    }
+    if row_group_bufs.is_null() {
+        return Err(fmt_err!(InvalidType, "row group buffers pointer is null"));
+    }
+    if columns.is_null() && column_count > 0 {
+        return Err(fmt_err!(InvalidType, "columns pointer is null"));
+    }
+    if column_count > 0 {
+        let col_pairs = unsafe { slice::from_raw_parts(columns, column_count as usize) };
+        validate_jni_column_types(col_pairs)?;
+    }
+    if parquet_meta_reader_ptr.is_null() {
+        return Err(fmt_err!(
+            InvalidType,
+            "JniParquetMetaReader pointer is null"
+        ));
+    }
+    if chunks_ptr.is_null() && column_count > 0 {
+        return Err(fmt_err!(InvalidType, "chunks pointer is null"));
+    }
+
+    let parquet_meta_reader: &ParquetMetaReader = unsafe { &*parquet_meta_reader_ptr }.reader();
+    let ctx = unsafe { &mut *ctx };
+    let row_group_bufs = unsafe { &mut *row_group_bufs };
+    let col_pairs = if columns.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(columns, column_count as usize) }
+    };
+    let chunks = if chunks_ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(chunks_ptr, 2 * column_count as usize) }
+    };
+
+    decode_row_group(
+        ctx,
+        row_group_bufs,
+        ColumnChunkSource::Buffers(chunks),
+        parquet_meta_reader,
+        col_pairs,
+        row_group_index as usize,
+        row_group_lo as usize,
+        row_group_hi as usize,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parquet_meta_decode_row_group_filtered_from_buffers_impl<const FILL_NULLS: bool>(
+    ctx: *mut DecodeContext,
+    parquet_meta_reader_ptr: *const JniParquetMetaReader,
+    row_group_bufs: *mut RowGroupBuffers,
+    column_offset: usize,
+    columns: *const (ParquetColumnIndex, ColumnType),
+    column_count: u32,
+    row_group_index: u32,
+    chunks_ptr: *const u64,
+    row_group_lo: u32,
+    row_group_hi: u32,
+    filtered_rows_ptr: *const i64,
+    filtered_rows_count: usize,
+) -> ParquetResult<usize> {
+    if ctx.is_null() {
+        return Err(fmt_err!(InvalidType, "decode context pointer is null"));
+    }
+    if row_group_bufs.is_null() {
+        return Err(fmt_err!(InvalidType, "row group buffers pointer is null"));
+    }
+    if columns.is_null() && column_count > 0 {
+        return Err(fmt_err!(InvalidType, "columns pointer is null"));
+    }
+    if filtered_rows_ptr.is_null() && filtered_rows_count > 0 {
+        return Err(fmt_err!(InvalidType, "filtered rows pointer is null"));
+    }
+    if parquet_meta_reader_ptr.is_null() {
+        return Err(fmt_err!(
+            InvalidType,
+            "JniParquetMetaReader pointer is null"
+        ));
+    }
+    if chunks_ptr.is_null() && column_count > 0 {
+        return Err(fmt_err!(InvalidType, "chunks pointer is null"));
+    }
+
+    let parquet_meta_reader: &ParquetMetaReader = unsafe { &*parquet_meta_reader_ptr }.reader();
+    let ctx = unsafe { &mut *ctx };
+    let row_group_bufs = unsafe { &mut *row_group_bufs };
+    let col_pairs = if columns.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(columns, column_count as usize) }
+    };
+    let chunks = if chunks_ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(chunks_ptr, 2 * column_count as usize) }
+    };
+    let filtered_rows = if filtered_rows_ptr.is_null() {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(filtered_rows_ptr, filtered_rows_count) }
+    };
+
+    decode_row_group_filtered::<FILL_NULLS>(
+        ctx,
+        row_group_bufs,
+        ColumnChunkSource::Buffers(chunks),
+        parquet_meta_reader,
+        column_offset,
+        col_pairs,
+        row_group_index as usize,
+        row_group_lo as usize,
+        row_group_hi as usize,
+        filtered_rows,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parquet_meta_decode_row_group_filtered_impl<const FILL_NULLS: bool>(
     ctx: *mut DecodeContext,
