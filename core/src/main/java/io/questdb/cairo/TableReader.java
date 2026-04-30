@@ -447,10 +447,18 @@ public class TableReader implements Closeable, SymbolTableSource {
     }
 
     /**
-     * Returns previously open Parquet partition read size or -1 in case of a native partition.
+     * Returns the parquet file size recorded in {@code _txn} for this
+     * partition. Returns {@code 0} for a native partition (the slot is
+     * zero-initialised; {@link TxReader#getPartitionParquetFileSize(int)}
+     * permits {@code 0} for non-parquet partitions). Reading from
+     * {@link TxReader} keeps the size authoritative when the local
+     * {@code data.parquet} mapping is a {@link NullMemoryCMR} (e.g. the
+     * file has been removed under the reader): {@code _txn} still records
+     * the size the file had at commit time, which is what callers like the
+     * parquet decoder's footer resolver need.
      */
     public long getParquetFileSize(int partitionIndex) {
-        return parquetPartitions.getQuick(partitionIndex).size();
+        return txFile.getPartitionParquetFileSize(partitionIndex);
     }
 
     public long getParquetMetadataAddr(int partitionIndex) {
