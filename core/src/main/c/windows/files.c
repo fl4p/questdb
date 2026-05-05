@@ -315,6 +315,22 @@ JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_readNonNegativeLong
 
 }
 
+JNIEXPORT jboolean JNICALL Java_io_questdb_std_Files_writeNonNegativeLong
+        (JNIEnv *e, jclass cl, jint fd, jlong offset, jlong value) {
+    OVERLAPPED overlapped = {0};
+    overlapped.Offset = (DWORD)(offset & 0xFFFFFFFF);
+    overlapped.OffsetHigh = (DWORD)(offset >> 32);
+
+    HANDLE handle = FD_TO_HANDLE(fd);
+    DWORD bytesWritten;
+    if (!WriteFile(handle, (LPCVOID) &value, sizeof(uint64_t), &bytesWritten, &overlapped)
+        || bytesWritten != sizeof(uint64_t)) {
+        SaveLastError();
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
 #define MILLIS_SINCE_1970 11644473600000
 
 JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getLastModified

@@ -565,6 +565,14 @@ public class FailureFileFacade implements FilesFacade {
         return ff.write(fd, address, len, offset);
     }
 
+    @Override
+    public boolean writeNonNegativeLong(long fd, long offset, long value) {
+        if (checkForFailure()) {
+            return false;
+        }
+        return ff.writeNonNegativeLong(fd, offset, value);
+    }
+
     private boolean checkForFailure() {
         boolean fail = osCallsCount.decrementAndGet() == 0;
         if (fail) {

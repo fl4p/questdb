@@ -159,6 +159,13 @@ JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_readNonNegativeLong
     return result;
 }
 
+JNIEXPORT jboolean JNICALL Java_io_questdb_std_Files_writeNonNegativeLong
+        (JNIEnv *e, jclass cl, jint fd, jlong offset, jlong value) {
+    ssize_t writtenLen;
+    RESTARTABLE(pwrite((int) fd, (const void *) &value, sizeof(jlong), (off_t) offset), writtenLen);
+    return writtenLen == sizeof(jlong) ? JNI_TRUE : JNI_FALSE;
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_std_Files_openRO
         (JNIEnv *e, jclass cl, jlong lpszName) {
     return open((const char *) lpszName, O_RDONLY);

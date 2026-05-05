@@ -183,6 +183,14 @@ JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_write
 
 /*
  * Class:     com_questdb_std_Files
+ * Method:    writeNonNegativeLong
+ * Signature: (IJJ)Z
+ */
+JNIEXPORT jboolean JNICALL Java_io_questdb_std_Files_writeNonNegativeLong
+        (JNIEnv *, jclass, jint, jlong, jlong);
+
+/*
+ * Class:     com_questdb_std_Files
  * Method:    close0
  * Signature: (I)I
  */

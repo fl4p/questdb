@@ -555,6 +555,11 @@ public class FilesFacadeImpl implements FilesFacade {
         return Files.write(fd, address, len, offset);
     }
 
+    @Override
+    public boolean writeNonNegativeLong(long fd, long offset, long value) {
+        return Files.writeNonNegativeLong(fd, offset, value);
+    }
+
     private long computeMapPageSize() {
         long pageSize = getPageSize();
         long mapPageSize = pageSize * pageSize;

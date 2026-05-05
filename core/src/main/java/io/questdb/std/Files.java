@@ -621,6 +621,10 @@ public final class Files {
         return write(toOsFd(fd), address, len, offset);
     }
 
+    public static boolean writeNonNegativeLong(long fd, long offset, long value) {
+        return writeNonNegativeLong(toOsFd(fd), offset, value);
+    }
+
     private native static boolean allocate(int fd, long size);
 
     private native static long append(int fd, long address, long len);
@@ -771,6 +775,8 @@ public final class Files {
     }
 
     private native static long write(int fd, long address, long len, long offset);
+
+    private native static boolean writeNonNegativeLong(int fd, long offset, long value);
 
     native static int close0(int fd);
 
