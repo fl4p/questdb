@@ -770,7 +770,14 @@ public class ApplyWal2TableJob extends AbstractQueueConsumerJob<WalTxnNotificati
                 lastCommittedRows = 0;
                 return 1;
             default:
-                throw new UnsupportedOperationException("Unsupported WAL txn type: " + walTxnType);
+                try (WalEventReader eventReader = walEventReader) {
+                    final WalEventCursor walEventCursor = eventReader.of(walPath, segmentTxn);
+                    walTelemetryFacade.store(WAL_TXN_APPLY_START, writer.getTableToken(), walId, seqTxn, -1L, -1L, start - commitTimestamp, Numbers.LONG_NULL, Numbers.LONG_NULL);
+                    int rows = engine.getWalTxnTypeHandler().applyUnknownWalTxn(walTxnType, writer, walEventCursor, seqTxn);
+                    writer.markSeqTxnCommitted(seqTxn);
+                    lastCommittedRows = 0;
+                    return Math.max(rows, 1);
+                }
         }
     }
 

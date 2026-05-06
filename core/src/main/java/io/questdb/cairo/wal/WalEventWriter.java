@@ -349,6 +349,20 @@ class WalEventWriter implements Closeable {
         return txn++;
     }
 
+    int appendCustomEvent(byte txnType, WalEventPayloadWriter payload) {
+        assert WalTxnType.isDownstreamType(txnType) : "custom event types must be in reserved range 64..127, got: " + txnType;
+        startOffset = eventMem.getAppendOffset() - Integer.BYTES;
+        eventMem.putLong(txn);
+        eventMem.putByte(txnType);
+        payload.write(eventMem);
+        eventMem.putInt(startOffset, (int) (eventMem.getAppendOffset() - startOffset));
+        eventMem.putInt(-1);
+
+        appendIndex(eventMem.getAppendOffset() - Integer.BYTES);
+        eventMem.putInt(WALE_MAX_TXN_OFFSET_32, txn);
+        return txn++;
+    }
+
     int appendMatViewInvalidate(
             long lastRefreshBaseTxn,
             long lastRefreshTimestamp,

@@ -433,6 +433,20 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         }
     }
 
+    public void setPartitionParquetFileSize(int partitionIndex, long size) {
+        setPartitionParquetFileSizeByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, size);
+    }
+
+    public void setPartitionParquetFileSizeByRawIndex(int indexRaw, long size) {
+        if (indexRaw < 0) {
+            throw CairoException.nonCritical().put("bad partition index -1");
+        }
+        final int offset = indexRaw + PARTITION_PARQUET_FILE_SIZE_OFFSET;
+        final long current = attachedPartitions.getQuick(offset);
+        final long uploadedBit = (current != -1L) ? (current & PARQUET_FILE_SIZE_UPLOADED_BIT) : 0L;
+        attachedPartitions.setQuick(offset, (size & PARQUET_FILE_SIZE_VALUE_MASK) | uploadedBit);
+    }
+
     public void setPartitionParquetFormat(long timestamp, long fileLength) {
         setPartitionParquetFormat(timestamp, fileLength, true);
     }
@@ -492,6 +506,29 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
 
     public void setPartitionReadOnlyByTimestamp(long timestamp, boolean isReadOnly) {
         setPartitionReadOnlyByRawIndex(findAttachedPartitionRawIndex(timestamp), isReadOnly);
+    }
+
+    public void setPartitionUploaded(int partitionIndex, boolean isUploaded) {
+        setPartitionUploadedByRawIndex(partitionIndex * LONGS_PER_TX_ATTACHED_PARTITION, isUploaded);
+    }
+
+    public void setPartitionUploadedByRawIndex(int indexRaw, boolean isUploaded) {
+        if (indexRaw < 0) {
+            throw CairoException.nonCritical().put("bad partition index -1");
+        }
+        final int offset = indexRaw + PARTITION_PARQUET_FILE_SIZE_OFFSET;
+        final long raw = attachedPartitions.getQuick(offset);
+        if (raw == -1L) {
+            throw CairoException.nonCritical().put("cannot set UPLOADED on partition without parquet");
+        }
+        final long updated = isUploaded
+                ? raw | PARQUET_FILE_SIZE_UPLOADED_BIT
+                : raw & PARQUET_FILE_SIZE_VALUE_MASK;
+        attachedPartitions.setQuick(offset, updated);
+    }
+
+    public void setPartitionUploadedByTimestamp(long timestamp, boolean isUploaded) {
+        setPartitionUploadedByRawIndex(findAttachedPartitionRawIndex(timestamp), isUploaded);
     }
 
     public void setSeqTxn(long seqTxn) {
@@ -841,7 +878,7 @@ public final class TxWriter extends TxReader implements Closeable, Mutable, Symb
         return getLong(TX_OFFSET_TRANSIENT_ROW_COUNT_64);
     }
 
-    void updatePartitionSizeAndTxnByRawIndex(int index, long partitionSize) {
+    public void updatePartitionSizeAndTxnByRawIndex(int index, long partitionSize) {
         recordStructureVersion++;
         updatePartitionSizeByRawIndex(index, partitionSize);
         // New partition version is written, reset the squash counter.

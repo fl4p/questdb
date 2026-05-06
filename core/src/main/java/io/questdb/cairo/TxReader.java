@@ -46,6 +46,8 @@ import static io.questdb.cairo.TableUtils.*;
 
 public class TxReader implements Closeable, Mutable {
     public static final long DEFAULT_PARTITION_TIMESTAMP = 0L;
+    public static final long PARQUET_FILE_SIZE_UPLOADED_BIT = 1L << 63;
+    public static final long PARQUET_FILE_SIZE_VALUE_MASK = ~PARQUET_FILE_SIZE_UPLOADED_BIT;
     public static final long PARTITION_FLAGS_MASK = 0x7FFFF00000000000L;
     public static final long PARTITION_SIZE_MASK = 0x80000FFFFFFFFFFFL;
     public static final int PARTITION_SQUASH_COUNTER_MAX = 0xFFFF;
@@ -70,7 +72,15 @@ public class TxReader implements Closeable, Mutable {
     // a negative size value to mean that the partition is not open.
     // the parquet format bit indicates that the partition has been converted to parquet format
     // the parquet generated bit indicates that a parquet file has been generated for the partition
-    // The last long in partition is the parquet file size.
+    // The last long in partition is the parquet file size. Layout:
+    //   bit 63: UPLOADED
+    //   bits 0..62: file size in bytes
+    // The sentinel value -1L means "no parquet for this partition" and is recognised before
+    // masking; bit 63 is never inspected on the sentinel.
+    // UPLOADED is implicitly cleared whenever a parquet rewrite stores a fresh non-negative
+    // file size into this slot (bit 63 = 0 by construction). All paths that mutate
+    // data.parquet go through that rewrite, so the bit can never outlive the bytes it claims
+    // were uploaded.
     protected static final int PARTITION_TS_OFFSET = 0;
     protected final LongList attachedPartitions = new LongList();
     protected final FilesFacade ff;
@@ -498,6 +508,23 @@ public class TxReader implements Closeable, Mutable {
         return checkPartitionOptionBit(indexRaw, PARTITION_MASK_READ_ONLY_BIT_OFFSET);
     }
 
+    public boolean isPartitionUploaded(int i) {
+        return isPartitionUploadedByRawIndex(i * LONGS_PER_TX_ATTACHED_PARTITION);
+    }
+
+    public boolean isPartitionUploadedByPartitionTimestamp(long ts) {
+        int indexRaw = findAttachedPartitionRawIndexByLoTimestamp(ts);
+        if (indexRaw > -1) {
+            return isPartitionUploadedByRawIndex(indexRaw);
+        }
+        return false;
+    }
+
+    public boolean isPartitionUploadedByRawIndex(int indexRaw) {
+        final long raw = attachedPartitions.getQuick(indexRaw + PARTITION_PARQUET_FILE_SIZE_OFFSET);
+        return raw != -1L && (raw & PARQUET_FILE_SIZE_UPLOADED_BIT) != 0;
+    }
+
     /**
      * Copies all _txn values from the given reader.
      */
@@ -731,7 +758,11 @@ public class TxReader implements Closeable, Mutable {
     }
 
     private long getPartitionParquetFileSizeByRawIndex(int partitionRawIndex) {
-        return attachedPartitions.getQuick(partitionRawIndex + PARTITION_PARQUET_FILE_SIZE_OFFSET);
+        final long raw = attachedPartitions.getQuick(partitionRawIndex + PARTITION_PARQUET_FILE_SIZE_OFFSET);
+        if (raw == -1L) {
+            return -1L;
+        }
+        return raw & PARQUET_FILE_SIZE_VALUE_MASK;
     }
 
     private boolean isPartitionParquetGeneratedByRawIndex(int indexRaw) {

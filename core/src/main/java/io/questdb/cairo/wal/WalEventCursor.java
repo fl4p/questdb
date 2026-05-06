@@ -59,6 +59,7 @@ public class WalEventCursor {
     private final MatViewDataInfo mvDataInfo = new MatViewDataInfo();
     private final MatViewInvalidationInfo mvInvalidationInfo = new MatViewInvalidationInfo();
     private final SqlInfo sqlInfo = new SqlInfo();
+    private final UnknownInfo unknownInfo = new UnknownInfo();
     private final ViewDefinitionInfo viewDefinitionInfo = new ViewDefinitionInfo();
     private long memSize;
     private long nextOffset = Integer.BYTES;
@@ -125,6 +126,13 @@ public class WalEventCursor {
 
     public byte getType() {
         return type;
+    }
+
+    public UnknownInfo getUnknownInfo() {
+        if (!WalTxnType.isDownstreamType(type)) {
+            throw CairoException.critical(CairoException.ILLEGAL_OPERATION).put("WAL event type is not unknown, type=").put(type);
+        }
+        return unknownInfo;
     }
 
     public ViewDefinitionInfo getViewDefinitionInfo() {
@@ -260,7 +268,8 @@ public class WalEventCursor {
                 viewDefinitionInfo.read();
                 break;
             default:
-                throw CairoException.critical(CairoException.METADATA_VALIDATION).put("Unsupported WAL event type: ").put(type);
+                unknownInfo.read();
+                break;
         }
     }
 
@@ -756,6 +765,29 @@ public class WalEventCursor {
             rndSeed1 = readLong();
             arrayViewPool.clear();
             byteViewPool.clear();
+        }
+    }
+
+    public class UnknownInfo {
+        private long payloadAddr;
+        private long payloadSize;
+
+        public long getPayloadAddr() {
+            return payloadAddr;
+        }
+
+        public long getPayloadSize() {
+            return payloadSize;
+        }
+
+        public byte getType() {
+            return type;
+        }
+
+        private void read() {
+            payloadAddr = eventMem.addressOf(offset);
+            payloadSize = nextOffset - offset;
+            offset = nextOffset;
         }
     }
 

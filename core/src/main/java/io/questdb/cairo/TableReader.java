@@ -335,9 +335,8 @@ public class TableReader implements Closeable, SymbolTableSource {
         long parquetSize = getParquetFileSize(partitionIndex);
         if (decoder.getParquetMetaAddr() != parquetMetaAddr || decoder.getParquetMetaSize() != parquetMetaSize) {
             final long timestamp = getPartitionTimestamp(partitionIndex);
-            final long partitionNameTxn = getPartitionNameTxn(partitionIndex);
             decoder.of(parquetMetaAddr, parquetMetaSize, parquetAddr, parquetSize,
-                    tableToken, partitionBy, timestampType, timestamp, partitionNameTxn,
+                    tableToken, partitionBy, timestampType, timestamp,
                     MemoryTag.NATIVE_PARQUET_PARTITION_DECODER);
         }
         return decoder;

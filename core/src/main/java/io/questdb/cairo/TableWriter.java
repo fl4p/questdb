@@ -2356,7 +2356,6 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         return metadata.getTtlHoursOrMonths();
     }
 
-    @TestOnly
     public TxWriter getTxWriter() {
         return txWriter;
     }

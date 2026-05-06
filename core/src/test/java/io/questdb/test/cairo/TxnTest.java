@@ -206,6 +206,155 @@ public class TxnTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testPartitionUploadedBitDefaultsFalseAndSentinelSafe() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            assertMemoryLeak(() -> {
+                String tableName = "txnUploadedDefault";
+                TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+                model.timestamp();
+                AbstractCairoTest.create(model);
+
+                try (Path path = new Path()) {
+                    TableToken tableToken = engine.verifyTableName(tableName);
+                    path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                    try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), TableUtils.getTimestampType(model), PartitionBy.DAY)) {
+                        long ts0 = 0;
+                        long ts1 = Micros.DAY_MICROS;
+                        tw.updatePartitionSizeByTimestamp(ts0, 1);
+                        tw.updatePartitionSizeByTimestamp(ts1, 1);
+
+                        // partition 0: native (no parquet) -> sentinel -1L in file size slot
+                        Assert.assertEquals(-1L, tw.getPartitionParquetFileSize(0));
+                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        Assert.assertFalse(tw.isPartitionUploadedByPartitionTimestamp(ts0));
+
+                        // partition 1: parquet with file size 1024 -> default UPLOADED=false
+                        tw.setPartitionParquetFormat(ts1, 1024L);
+                        Assert.assertEquals(1024L, tw.getPartitionParquetFileSize(1));
+                        Assert.assertFalse(tw.isPartitionUploaded(1));
+                        Assert.assertFalse(tw.isPartitionUploadedByPartitionTimestamp(ts1));
+                    }
+                }
+            });
+        });
+    }
+
+    @Test
+    public void testPartitionUploadedBitIndependentFromReadOnly() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            assertMemoryLeak(() -> {
+                String tableName = "txnUploadedReadOnly";
+                TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+                model.timestamp();
+                AbstractCairoTest.create(model);
+
+                try (Path path = new Path()) {
+                    TableToken tableToken = engine.verifyTableName(tableName);
+                    path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                    try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), TableUtils.getTimestampType(model), PartitionBy.DAY)) {
+                        long ts = 0;
+                        tw.updatePartitionSizeByTimestamp(ts, 1);
+                        tw.setPartitionParquetFormat(ts, 4096L);
+
+                        // flip read_only -> UPLOADED still 0
+                        tw.setPartitionReadOnlyByTimestamp(ts, true);
+                        Assert.assertTrue(tw.isPartitionReadOnly(0));
+                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
+
+                        // flip UPLOADED -> read_only still 1, size still 4096
+                        tw.setPartitionUploaded(0, true);
+                        Assert.assertTrue(tw.isPartitionReadOnly(0));
+                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
+
+                        // clear read_only -> UPLOADED still 1
+                        tw.setPartitionReadOnlyByTimestamp(ts, false);
+                        Assert.assertFalse(tw.isPartitionReadOnly(0));
+                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        Assert.assertEquals(4096L, tw.getPartitionParquetFileSize(0));
+                    }
+                }
+            });
+        });
+    }
+
+    @Test
+    public void testPartitionUploadedBitToggleStripsBitFromGetter() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            assertMemoryLeak(() -> {
+                String tableName = "txnUploadedToggle";
+                TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+                model.timestamp();
+                AbstractCairoTest.create(model);
+
+                try (Path path = new Path()) {
+                    TableToken tableToken = engine.verifyTableName(tableName);
+                    path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                    try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), TableUtils.getTimestampType(model), PartitionBy.DAY)) {
+                        long ts = 0;
+                        long fileLength = 1L << 30; // 1 GiB - non-trivial value, bit 63 still 0
+                        tw.updatePartitionSizeByTimestamp(ts, 1);
+                        tw.setPartitionParquetFormat(ts, fileLength);
+
+                        // set UPLOADED -> getter strips bit, returns original size
+                        tw.setPartitionUploaded(0, true);
+                        Assert.assertTrue(tw.isPartitionUploaded(0));
+                        Assert.assertEquals(fileLength, tw.getPartitionParquetFileSize(0));
+
+                        // clear UPLOADED -> size still preserved
+                        tw.setPartitionUploadedByTimestamp(ts, false);
+                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        Assert.assertEquals(fileLength, tw.getPartitionParquetFileSize(0));
+
+                        // round-trip via raw index variant
+                        tw.setPartitionUploadedByRawIndex(0, true);
+                        Assert.assertTrue(tw.isPartitionUploadedByRawIndex(0));
+                        Assert.assertEquals(fileLength, tw.getPartitionParquetFileSize(0));
+                    }
+                }
+            });
+        });
+    }
+
+    @Test
+    public void testSetPartitionUploadedRejectsNoParquet() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            FilesFacade ff = engine.getConfiguration().getFilesFacade();
+            assertMemoryLeak(() -> {
+                String tableName = "txnUploadedReject";
+                TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY);
+                model.timestamp();
+                AbstractCairoTest.create(model);
+
+                try (Path path = new Path()) {
+                    TableToken tableToken = engine.verifyTableName(tableName);
+                    path.of(configuration.getDbRoot()).concat(tableToken).concat(TXN_FILE_NAME).$();
+                    try (TxWriter tw = new TxWriter(ff, configuration).ofRW(path.$(), TableUtils.getTimestampType(model), PartitionBy.DAY)) {
+                        long ts = 0;
+                        tw.updatePartitionSizeByTimestamp(ts, 1);
+                        // No setPartitionParquetFormat -> file size slot remains -1L sentinel.
+
+                        try {
+                            tw.setPartitionUploaded(0, true);
+                            Assert.fail("expected CairoException for setPartitionUploaded on no-parquet partition");
+                        } catch (CairoException ex) {
+                            TestUtils.assertContains(ex.getFlyweightMessage(), "cannot set UPLOADED on partition without parquet");
+                        }
+
+                        // partition is unchanged
+                        Assert.assertFalse(tw.isPartitionUploaded(0));
+                        Assert.assertEquals(-1L, tw.getPartitionParquetFileSize(0));
+                    }
+                }
+            });
+        });
+    }
+
+    @Test
     public void testSquashCounterOverflow() throws IOException {
         try (Path p = new Path()) {
             try (TxWriter tw = new TxWriter(engine.getConfiguration().getFilesFacade(), engine.getConfiguration())) {
