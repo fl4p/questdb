@@ -73,15 +73,6 @@ public class MemoryCMRDetachedImpl extends MemoryCMRImpl {
         }
     }
 
-    @Override
-    public void ofWithSizeFromHeader(FilesFacade ff, LPSZ name, int memoryTag) {
-        super.ofWithSizeFromHeader(ff, name, memoryTag);
-        if (ff != null && ff.close(fd)) {
-            LOG.debug().$("closing [fd=").$(fd).I$();
-            fd = -1;
-        }
-    }
-
     public boolean tryChangeSize(long newSize) {
         if (newSize == size()) {
             return true;

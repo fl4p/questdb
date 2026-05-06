@@ -1394,10 +1394,9 @@ public class TableReader implements Closeable, SymbolTableSource {
         if (parquetMetaMem != null && parquetMetaMem != NullMemoryCMR.INSTANCE) {
             parquetMetaMem.of(ff, path.$(), parquetMetaFileSize, parquetMetaFileSize, MemoryTag.MMAP_PARQUET_METADATA_READER);
         } else {
-            parquetMetaMem = new MemoryCMRDetachedImpl();
+            parquetMetaMem = new MemoryCMRDetachedImpl(ff, path.$(), parquetMetaFileSize, MemoryTag.MMAP_PARQUET_METADATA_READER, false);
             parquetMetadataPartitions.setQuick(partitionIndex, parquetMetaMem);
         }
-        parquetMetaMem.ofWithSizeFromHeader(ff, path.$(), MemoryTag.MMAP_PARQUET_METADATA_READER);
 
         parquetMetaReader.of(parquetMetaMem.addressOf(0), parquetMetaMem.size());
         if (!parquetMetaReader.resolveFooter(parquetFileSize)) {

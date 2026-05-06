@@ -237,7 +237,7 @@ public class ParquetPartitionDecoder implements ParquetDecoder, QuietCloseable {
         }
     }
 
-    public void of(long parquetMetaAddr, long parquetMetaSize, long parquetAddr, long parquetSize, TableToken table, int partitionBy, int timestampType, long timestamp, long nameTxn, int memoryTag) {
+    public void of(long parquetMetaAddr, long parquetMetaSize, long parquetAddr, long parquetSize, TableToken table, int partitionBy, int timestampType, long timestamp, int memoryTag) {
         of(parquetMetaAddr, parquetMetaSize, parquetAddr, parquetSize, memoryTag);
     }
 

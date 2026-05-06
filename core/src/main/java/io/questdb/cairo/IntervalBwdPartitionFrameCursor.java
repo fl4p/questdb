@@ -229,7 +229,7 @@ public class IntervalBwdPartitionFrameCursor extends AbstractIntervalPartitionFr
                     final byte format = reader.getPartitionFormat(currentPartition);
                     if (format == PartitionFormat.PARQUET) {
                         frame.format = PartitionFormat.PARQUET;
-                        frame.parquetMetaDecoder = reader.getAndInitParquetMetaPartitionDecoder(currentPartition);
+                        frame.parquetMetaDecoder = reader.getAndInitParquetPartitionDecoder(currentPartition);
                     } else {
                         assert format == PartitionFormat.NATIVE;
                         frame.format = PartitionFormat.NATIVE;
