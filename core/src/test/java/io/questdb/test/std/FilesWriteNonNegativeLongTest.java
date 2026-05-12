@@ -24,6 +24,7 @@
 
 package io.questdb.test.std;
 
+import io.questdb.ParanoiaState;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.FilesFacadeImpl;
@@ -164,16 +165,24 @@ public class FilesWriteNonNegativeLongTest {
 
     @Test
     public void testWriteToClosedFdReturnsFalse() throws Exception {
-        assertMemoryLeak(() -> {
-            File temp = temporaryFolder.newFile();
-            try (Path path = new Path().of(temp.getAbsolutePath())) {
-                long fd = Files.openRW(path.$());
-                Assert.assertTrue(Files.allocate(fd, Long.BYTES));
-                Files.close(fd);
+        // Exercises the post-cache native return path; FD_PARANOIA_MODE would
+        // assert in toOsFd before we reach it.
+        boolean savedFdParanoia = ParanoiaState.FD_PARANOIA_MODE;
+        ParanoiaState.FD_PARANOIA_MODE = false;
+        try {
+            assertMemoryLeak(() -> {
+                File temp = temporaryFolder.newFile();
+                try (Path path = new Path().of(temp.getAbsolutePath())) {
+                    long fd = Files.openRW(path.$());
+                    Assert.assertTrue(Files.allocate(fd, Long.BYTES));
+                    Files.close(fd);
 
-                Assert.assertFalse(Files.writeNonNegativeLong(fd, 0, 0xDEADL));
-            }
-        });
+                    Assert.assertFalse(Files.writeNonNegativeLong(fd, 0, 0xDEADL));
+                }
+            });
+        } finally {
+            ParanoiaState.FD_PARANOIA_MODE = savedFdParanoia;
+        }
     }
 
     @Test
