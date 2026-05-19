@@ -225,7 +225,6 @@ public class CairoEngine implements Closeable, WriterSource {
     private volatile @NotNull DurableAckRegistry durableAckRegistry = DefaultDurableAckRegistry.INSTANCE;
     private FrameFactory frameFactory;
     private @NotNull MatViewStateStore matViewStateStore = NoOpMatViewStateStore.INSTANCE;
-    private volatile QwpServerInfoProvider qwpServerInfoProvider;
     private volatile Runnable recentWriteTrackerHydrationCallback;
     private @NotNull ViewStateStore viewStateStore = NoOpViewStateStore.INSTANCE;
     private @NotNull WalDirectoryPolicy walDirectoryPolicy = DefaultWalDirectoryPolicy.INSTANCE;
@@ -737,7 +736,7 @@ public class CairoEngine implements Closeable, WriterSource {
                     path.of(configuration.getDbRoot()).concat(tableToken).$();
                     if (!configuration.getFilesFacade().unlinkOrRemove(path, LOG)) {
                         throw CairoException.critical(configuration.getFilesFacade().errno())
-                                .put("could not remove table [table=").put(tableToken).put(", thread=").put(Thread.currentThread().getId()).put(']');
+                                .put("could not remove table [table=").put(tableToken).put(", thread=").put(Thread.currentThread().threadId()).put(']');
                     }
 
                     tableNameRegistry.dropTable(tableToken);
@@ -913,8 +912,7 @@ public class CairoEngine implements Closeable, WriterSource {
     }
 
     public @NotNull QwpServerInfoProvider getQwpServerInfoProvider() {
-        QwpServerInfoProvider provider = qwpServerInfoProvider;
-        return provider != null ? provider : configuration.getQwpServerInfoProvider();
+        return configuration.getQwpServerInfoProvider();
     }
 
     public TableReader getReader(CharSequence tableName) {
@@ -1410,7 +1408,7 @@ public class CairoEngine implements Closeable, WriterSource {
                     // not locked
                     if (readerPool.lock(tableToken)) {
                         LOG.info().$("locked [table=").$(tableToken)
-                                .$(", thread=").$(Thread.currentThread().getId())
+                                .$(", thread=").$(Thread.currentThread().threadId())
                                 .I$();
                         return null;
                     }
@@ -1625,7 +1623,7 @@ public class CairoEngine implements Closeable, WriterSource {
         if (listener != null) {
             listener.onEvent(
                     PoolListener.SRC_TABLE_REGISTRY,
-                    Thread.currentThread().getId(),
+                    Thread.currentThread().threadId(),
                     tableToken,
                     PoolListener.EV_REMOVE_TOKEN,
                     (short) 0,
@@ -1789,10 +1787,6 @@ public class CairoEngine implements Closeable, WriterSource {
         this.readerPool.setPoolListener(poolListener);
         this.walWriterPool.setPoolListener(poolListener);
         this.viewWalWriterPool.setPoolListener(poolListener);
-    }
-
-    public void setQwpServerInfoProvider(@NotNull QwpServerInfoProvider provider) {
-        this.qwpServerInfoProvider = provider;
     }
 
     @TestOnly
