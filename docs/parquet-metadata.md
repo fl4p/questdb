@@ -109,9 +109,14 @@ header is. A reader mmaps the 32-byte header prefix, reads `PARQUET_META_FILE_SI
                  |  entry 0: offset --------------+--> ROW GROUP BLOCK 0
                  |  entry 1: offset --------------+--> ROW GROUP BLOCK 1
                  |  ...                           |
-                 | FOOTER FEATURE SECTIONS        |
+                 | HEADER-FLAG FEATURE SECTIONS   |
                  |  bloom filter offsets          |
                  |  (if BLOOM_FILTERS set)        |
+                 | FOOTER-FLAG FEATURE SECTIONS   |
+                 |  payload per set optional bit, |
+                 |  ascending bit order; each     |
+                 |  section's size is hardcoded   |
+                 |  per bit                       |
                  |  CRC32                         |
                  |  FOOTER_LENGTH (4B)            |  <-- trailer at parquet_meta_file_size - 4
   _txn field 3:  +================================+
@@ -172,15 +177,26 @@ Both fields share the same bit policy:
 - **Bits 0-31**: optional - unknown bits may be ignored.
 - **Bits 32-63**: required - unknown bits must cause the reader to reject the file (or, for footer flags, the specific footer the reader is about to use).
 
-Feature sections appear in bit order. Header-gated sections live at the end of
-the header (after name strings); footer-gated sections live at the end of the
-footer (after row group entries, before the CRC). The footer-trailer's
-`FOOTER_LENGTH` bounds all footer sections so readers can locate the CRC
-without recognizing every bit.
+Header-flag sections live at the end of the header (after name strings),
+in bit order.
+
+Inside the footer, sections appear in two groups: header-flag-gated
+sections first (currently just the bloom filter section, sized from
+header info), then footer-flag-gated sections in ascending bit order.
+Each footer-flag section has a hardcoded byte size known to the reader
+from the bit position; the walker iterates known bits and steps backward
+from `crc_offset` by the hardcoded size.
+
+An older reader that doesn't recognize a footer-flag bit ignores it
+entirely. Bloom is at its unchanged offset (right after row group
+entries), so old readers find it correctly regardless of which
+footer-flag bits are set.
+
+`FOOTER_LENGTH` from the trailer bounds the whole region.
 
 #### Defined feature flags
 
-No footer flag bits are defined yet. Header flag bits:
+**Header flag bits:**
 
 | bit | name                   | dependency | header section                                                                                                           | footer section                                                                                                                                 |
 | --- | ---------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -190,6 +206,12 @@ No footer flag bits are defined yet. Header flag bits:
 
 Bit 0 is only set when at least one column has a bloom filter. Bit 1 cannot be set without bit 0; the reader rejects the
 file otherwise. Feature sections are ordered by bit position.
+
+**Footer flag bits:**
+
+| bit | name    | footer section                                                       |
+| --- | ------- | -------------------------------------------------------------------- |
+| 0   | SEQ_TXN | 8 bytes: `i64` per-snapshot apply-time `seqTxn`. Set when ≠ -1. |
 
 Bit 2 indicates that the partition's sorting order is implicitly the designated timestamp column in ascending order. The
 on-disk `SORTING_COLUMN_COUNT` is 0 and the SORTING_COLUMNS section is absent, but readers treat the partition as sorted
@@ -413,7 +435,8 @@ offset 0. It is located via `FOOTER_LENGTH`: `CRC offset = footer_start + FOOTER
 | 24     | 8    | PREV_PARQUET_META_FILE_SIZE | u64  | committed `_pm` file size at the previous snapshot (0 if first); walk back via trailer at `prev - 4` |
 | 32     | 8    | FOOTER_FEATURE_FLAGS        | u64  | per-footer feature flags; independent of the header's FEATURE_FLAGS                                  |
 | 40     | ..   | ROW_GROUP_ENTRIES           |      | ROW_GROUP_COUNT * Row group entry (4B each)                                                          |
-| ..     | ..   | FOOTER_FEATURE_SECTIONS     |      | Feature-flag-gated sections, in bit order (may be empty)                                             |
+| ..     | ..   | HEADER_FLAG_FEATURE_SECTIONS |     | Header-flag-gated sections (currently: bloom filter offsets if `BLOOM_FILTERS` set), in bit order    |
+| ..     | ..   | FOOTER_FLAG_FEATURE_SECTIONS |     | Footer-flag-gated sections, each a hardcoded-size payload, in ascending bit order (may be empty) |
 | ..     | 4    | CHECKSUM                    | u32  | CRC32 over bytes `[8, this field)` — all content after `PARQUET_META_FILE_SIZE`                      |
 | ..     | 4    | FOOTER_LENGTH               | u32  | total bytes from footer start through CHECKSUM (inclusive); NOT covered by CHECKSUM                  |
 

@@ -93,6 +93,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
             TableWriter tableWriter,
             long srcNameTxn,
             long txn,
+            long seqTxn,
             long partitionUpdateSinkAddr,
             long dedupColSinkAddr,
             long o3TimestampMin,
@@ -300,7 +301,8 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
                         minCompressionRatio,
                         parquetMetaFdOs,
                         updaterParquetMetaFileSize,
-                        parquetFileSize
+                        parquetFileSize,
+                        seqTxn
                 );
 
                 if (hasSchemaChange) {
@@ -676,6 +678,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
             long srcNameTxn,
             boolean last,
             long txn,
+            long seqTxn,
             long sortedTimestampsAddr,
             TableWriter tableWriter,
             AtomicInteger columnCounter,
@@ -707,6 +710,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
                     tableWriter,
                     srcNameTxn,
                     txn,
+                    seqTxn,
                     partitionUpdateSinkAddr,
                     dedupColSinkAddr,
                     o3TimestampMin,
@@ -1526,6 +1530,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
         final long srcNameTxn = task.getSrcNameTxn();
         final boolean last = task.isLast();
         final long txn = task.getTxn();
+        final long seqTxn = task.getSeqTxn();
         final long sortedTimestampsAddr = task.getSortedTimestampsAddr();
         final TableWriter tableWriter = task.getTableWriter();
         final AtomicInteger columnCounter = task.getColumnCounter();
@@ -1555,6 +1560,7 @@ public class O3PartitionJob extends AbstractQueueConsumerJob<O3PartitionTask> {
                 srcNameTxn,
                 last,
                 txn,
+                seqTxn,
                 sortedTimestampsAddr,
                 tableWriter,
                 columnCounter,

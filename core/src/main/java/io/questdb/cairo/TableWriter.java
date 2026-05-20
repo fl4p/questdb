@@ -7256,6 +7256,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                     srcNameTxn,
                     last,
                     getTxn(),
+                    getSeqTxn(),
                     sortedTimestampsAddr,
                     this,
                     columnCounter,
@@ -7285,6 +7286,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                     srcNameTxn,
                     last,
                     getTxn(),
+                    getSeqTxn(),
                     sortedTimestampsAddr,
                     this,
                     columnCounter,
@@ -10054,7 +10056,8 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                 bloomFilterColumns,
                 bloomFilterFpp,
                 parquetBloomFilterIndexes,
-                -1L
+                -1L,
+                txWriter.getSeqTxn()
         );
     }
 

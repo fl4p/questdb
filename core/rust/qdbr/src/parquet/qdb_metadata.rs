@@ -153,6 +153,10 @@ pub struct QdbMetaV1 {
     #[serde(default = "default_neg_one_i64")]
     #[serde(skip_serializing_if = "is_neg_one_i64")]
     pub squash_tracker: i64,
+
+    #[serde(default = "default_neg_one_i64")]
+    #[serde(skip_serializing_if = "is_neg_one_i64")]
+    pub seq_txn: i64,
 }
 
 impl QdbMetaV1 {
@@ -162,6 +166,7 @@ impl QdbMetaV1 {
             schema: QdbMetaSchema::with_capacity(column_count),
             unused_bytes: 0,
             squash_tracker: -1,
+            seq_txn: -1,
         }
     }
 }
@@ -224,6 +229,7 @@ mod tests {
             ],
             unused_bytes: 0,
             squash_tracker: -1,
+            seq_txn: -1,
         };
 
         let expected = json!({
@@ -272,6 +278,7 @@ mod tests {
             }],
             unused_bytes: 4096,
             squash_tracker: -1,
+            seq_txn: -1,
         };
 
         let expected = json!({
@@ -298,12 +305,13 @@ mod tests {
 
     #[test]
     fn test_deserialize_without_unused_bytes() -> ParquetResult<()> {
-        // Backward compatibility: old JSON without unused_bytes and squash_tracker
-        // should default to 0 and -1 respectively
+        // Backward compatibility: old JSON without unused_bytes, squash_tracker,
+        // and seq_txn should default to 0, -1, -1 respectively.
         let json_str = r#"{"version":1,"schema":[{"column_type":5,"column_top":0}]}"#;
         let deserialized = QdbMeta::deserialize(json_str)?;
         assert_eq!(deserialized.unused_bytes, 0);
         assert_eq!(deserialized.squash_tracker, -1);
+        assert_eq!(deserialized.seq_txn, -1);
         Ok(())
     }
 
@@ -319,6 +327,7 @@ mod tests {
             }],
             unused_bytes: 0,
             squash_tracker: -1,
+            seq_txn: -1,
         };
 
         let serialized_str = metadata.serialize()?;
@@ -329,6 +338,45 @@ mod tests {
         assert!(serialized.get("unused_bytes").is_none());
         // When squash_tracker is -1, it should be omitted from JSON
         assert!(serialized.get("squash_tracker").is_none());
+        // When seq_txn is -1, it should be omitted from JSON
+        assert!(serialized.get("seq_txn").is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_serialize_with_seq_txn() -> ParquetResult<()> {
+        let metadata = QdbMeta {
+            version: U32Const,
+            schema: vec![QdbMetaCol {
+                column_type: ColumnTypeTag::Int.into_type(),
+                column_top: 0,
+                format: None,
+                ascii: None,
+            }],
+            unused_bytes: 0,
+            squash_tracker: -1,
+            seq_txn: 7,
+        };
+
+        let expected = json!({
+            "version": 1,
+            "schema": [
+                {
+                    "column_type": 5,
+                    "column_top": 0
+                }
+            ],
+            "seq_txn": 7
+        });
+
+        let serialized_str = metadata.serialize()?;
+        let serialized: Value = serde_json::from_str(serialized_str.as_str())
+            .map_err(|e| ParquetErrorReason::QdbMeta(e.into()).into_err())?;
+        assert_eq!(serialized, expected);
+
+        let deserialized = QdbMeta::deserialize(&serialized_str)?;
+        assert_eq!(metadata, deserialized);
 
         Ok(())
     }
@@ -345,6 +393,7 @@ mod tests {
             }],
             unused_bytes: 0,
             squash_tracker: 42,
+            seq_txn: -1,
         };
 
         let expected = json!({

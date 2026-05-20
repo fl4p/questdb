@@ -562,15 +562,13 @@ public class ParquetMetaFileReader implements ParquetRowGroupSkipper {
     }
 
     /**
-     * Writes the total row count (i64) at {@code destAddr} and the partition
-     * squash tracker (i64) at {@code destAddr + 8}. The squash tracker is
-     * {@code -1} when the {@code _pm} header has no {@code SQUASH_TRACKER}
-     * feature section. Caller must provide a 16-byte buffer.
-     * <p>
-     * Enterprise callers use this to retrieve both values in a single JNI
-     * round trip.
+     * Writes three longs into a 24-byte buffer at {@code destAddr}:
+     * row count, partition squash tracker, and latest-footer
+     * {@code seqTxn}. Squash tracker and {@code seqTxn} are {@code -1}
+     * when their respective feature bits are absent. Enterprise callers
+     * use this to retrieve all three values in one JNI round trip.
      *
-     * @param destAddr address of a 16-byte buffer to receive the two longs
+     * @param destAddr address of a 24-byte buffer to receive the three longs
      * @throws CairoException on malformed {@code _pm} data
      */
     public void readPartitionMeta(long destAddr) {

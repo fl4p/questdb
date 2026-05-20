@@ -30,7 +30,7 @@ use crate::parquet_metadata::column_chunk::ColumnChunkRaw;
 use crate::parquet_metadata::error::ParquetMetaErrorKind;
 use crate::parquet_metadata::row_group::RowGroupBlockBuilder;
 use crate::parquet_metadata::types::{
-    encode_stat_sizes, Codec, ColumnFlags, EncodingMask, FieldRepetition, StatFlags,
+    encode_stat_sizes, Codec, ColumnFlags, EncodingMask, FieldRepetition, SeqTxn, StatFlags,
 };
 use crate::parquet_metadata::writer::ParquetMetaWriter;
 use parquet2::metadata::FileMetaData;
@@ -109,6 +109,7 @@ pub fn convert_from_parquet(
     writer.parquet_footer(parquet_footer_offset, parquet_footer_length);
     if let Some(meta) = qdb_meta {
         writer.squash_tracker(meta.squash_tracker);
+        writer.seq_txn(SeqTxn::new(meta.seq_txn));
     }
 
     // Add sorting columns.
@@ -474,12 +475,14 @@ pub fn generate_parquet_metadata(
     bloom_bitsets: &[Vec<Option<Vec<u8>>>],
     unused_bytes: u64,
     squash_tracker: i64,
+    seq_txn: SeqTxn,
 ) -> ParquetResult<(Vec<u8>, u64)> {
     let mut writer = ParquetMetaWriter::new();
     writer.designated_timestamp(designated_timestamp);
     writer.parquet_footer(parquet_footer_offset, parquet_footer_length);
     writer.unused_bytes(unused_bytes);
     writer.squash_tracker(squash_tracker);
+    writer.seq_txn(seq_txn);
 
     for &sc_idx in sorting_columns {
         writer.add_sorting_column(sc_idx);
@@ -538,6 +541,7 @@ pub fn update_parquet_metadata(
     parquet_footer_length: u32,
     bloom_bitsets: &[Vec<Option<Vec<u8>>>],
     unused_bytes: u64,
+    seq_txn: SeqTxn,
 ) -> ParquetResult<ParquetMetaUpdateResult> {
     let existing_parquet_meta_len =
         usize::try_from(existing_parquet_meta_file_size).map_err(|_| {
@@ -640,6 +644,7 @@ pub fn update_parquet_metadata(
 
     updater.parquet_footer(parquet_footer_offset, parquet_footer_length);
     updater.unused_bytes(unused_bytes);
+    updater.seq_txn(seq_txn);
     let (append_bytes, new_file_size) = updater.finish()?;
     debug_assert_eq!(
         new_file_size,
@@ -979,6 +984,41 @@ mod tests {
             ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
         assert!(!reader.feature_flags().has_squash_tracker());
         assert_eq!(reader.squash_tracker(), None);
+    }
+
+    #[test]
+    fn convert_propagates_seq_txn_from_qdb_meta() {
+        // When QdbMeta.seq_txn != -1, the _pm footer carries it.
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+
+        let mut qdb_meta = extract_qdb_meta_from(&metadata).expect("test parquet has qdb meta");
+        qdb_meta.seq_txn = 77;
+
+        let (parquet_meta_bytes, parquet_meta_file_size) =
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, None).unwrap();
+        let reader =
+            ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
+        assert!(reader.footer_feature_flags().has_seq_txn());
+        assert_eq!(reader.seq_txn(), Some(SeqTxn::new(77)));
+    }
+
+    #[test]
+    fn convert_omits_seq_txn_when_neg_one() {
+        let parquet_data = write_test_parquet(10, CompressionOptions::Uncompressed);
+        let mut cursor = Cursor::new(&parquet_data);
+        let metadata = read_metadata_with_size(&mut cursor, parquet_data.len() as u64).unwrap();
+
+        let mut qdb_meta = extract_qdb_meta_from(&metadata).expect("test parquet has qdb meta");
+        qdb_meta.seq_txn = -1;
+
+        let (parquet_meta_bytes, parquet_meta_file_size) =
+            convert_from_parquet(&metadata, Some(&qdb_meta), 0, 0, None).unwrap();
+        let reader =
+            ParquetMetaReader::from_file_size(&parquet_meta_bytes, parquet_meta_file_size).unwrap();
+        assert!(!reader.footer_feature_flags().has_seq_txn());
+        assert_eq!(reader.seq_txn(), None);
     }
 
     #[test]
@@ -1870,6 +1910,7 @@ mod tests {
             &[],
             0,
             -1,
+            SeqTxn::UNSET,
         )
         .unwrap();
 
@@ -1939,6 +1980,7 @@ mod tests {
             &[],
             0,
             -1,
+            SeqTxn::UNSET,
         )
         .unwrap();
 
@@ -1957,9 +1999,17 @@ mod tests {
         }
         extended_rgs.push(new_rg);
 
-        let result =
-            update_parquet_metadata(&initial_pm, initial_size, &extended_rgs, 200, 60, &[], 0)
-                .unwrap();
+        let result = update_parquet_metadata(
+            &initial_pm,
+            initial_size,
+            &extended_rgs,
+            200,
+            60,
+            &[],
+            0,
+            SeqTxn::UNSET,
+        )
+        .unwrap();
 
         assert!(!result.bytes.is_empty(), "should have append bytes");
 
@@ -2056,9 +2106,19 @@ mod tests {
         three_rgs.push(third_rg);
         assert_eq!(three_rgs.len(), 3);
 
-        let (initial_pm, _) =
-            generate_parquet_metadata(&col_infos, &three_rgs, 0, &[0], 100, 50, &[], 0, -1)
-                .unwrap();
+        let (initial_pm, _) = generate_parquet_metadata(
+            &col_infos,
+            &three_rgs,
+            0,
+            &[0],
+            100,
+            50,
+            &[],
+            0,
+            -1,
+            SeqTxn::UNSET,
+        )
+        .unwrap();
         let initial_size = initial_pm.len() as u64;
 
         let initial_reader = ParquetMetaReader::from_file_size(&initial_pm, initial_size).unwrap();
@@ -2066,7 +2126,16 @@ mod tests {
 
         // Drop the third row group and ask for an update with only 2.
         let two_rgs = three_rgs[..2].to_vec();
-        let result = update_parquet_metadata(&initial_pm, initial_size, &two_rgs, 100, 50, &[], 0);
+        let result = update_parquet_metadata(
+            &initial_pm,
+            initial_size,
+            &two_rgs,
+            100,
+            50,
+            &[],
+            0,
+            SeqTxn::UNSET,
+        );
 
         let err = match result {
             Ok(_) => panic!("update should fail when row groups shrink"),
@@ -2154,7 +2223,7 @@ mod tests {
 
         // Use chunked API to capture bloom filter bitsets.
         let (schema, additional_meta) =
-            crate::parquet_write::schema::to_parquet_schema(&partition, false, -1).unwrap();
+            crate::parquet_write::schema::to_parquet_schema(&partition, false, -1, -1).unwrap();
         let encodings = crate::parquet_write::schema::to_encodings(&partition);
         let compressions = crate::parquet_write::schema::to_compressions(&partition);
         let mut chunked = writer
@@ -2191,6 +2260,7 @@ mod tests {
             bloom_bitsets,
             0,
             -1,
+            SeqTxn::UNSET,
         )
         .unwrap();
 
@@ -2346,6 +2416,7 @@ mod tests {
             &[],
             0,
             -1,
+            SeqTxn::UNSET,
         )
         .unwrap();
 
@@ -2433,7 +2504,7 @@ mod tests {
         };
         let partition = Partition { table: "test".to_string(), columns: vec![col] };
 
-        let (schema, _empty_meta) = to_parquet_schema(&partition, false, -1).unwrap();
+        let (schema, _empty_meta) = to_parquet_schema(&partition, false, -1, -1).unwrap();
         let encodings = to_encodings(&partition);
         let compressions = to_compressions(&partition);
 

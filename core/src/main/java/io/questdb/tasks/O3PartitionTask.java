@@ -60,6 +60,10 @@ public class O3PartitionTask {
     private long srcOooMax;
     private TableWriter tableWriter;
     private long txn;
+    /// WAL apply-time seqTxn that scheduled this task. Threaded into the
+    /// parquet writer so the produced `_pm`'s SEQ_TXN section identifies
+    /// the WAL transaction that produced it.
+    private long seqTxn;
 
     public AtomicInteger getColumnCounter() {
         return columnCounter;
@@ -149,6 +153,10 @@ public class O3PartitionTask {
         return tableWriter;
     }
 
+    public long getSeqTxn() {
+        return seqTxn;
+    }
+
     public long getTxn() {
         return txn;
     }
@@ -176,6 +184,7 @@ public class O3PartitionTask {
             long srcNameTxn,
             boolean last,
             long txn,
+            long seqTxn,
             long sortedTimestampsAddr,
             TableWriter tableWriter,
             AtomicInteger columnCounter,
@@ -190,6 +199,7 @@ public class O3PartitionTask {
     ) {
         this.pathToTable = path;
         this.txn = txn;
+        this.seqTxn = seqTxn;
         this.srcOooLo = srcOooLo;
         this.srcOooHi = srcOooHi;
         this.srcOooMax = srcOooMax;

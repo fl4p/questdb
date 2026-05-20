@@ -112,7 +112,8 @@ public class PartitionUpdater implements QuietCloseable {
             double minCompressionRatio,
             int parquetMetaFd,
             long parquetFileSize,
-            long existingParquetMetaFileSize
+            long existingParquetMetaFileSize,
+            long seqTxn
     ) {
         final long allocator = Unsafe.getNativeAllocator(MemoryTag.NATIVE_PARQUET_PARTITION_UPDATER);
         destroy();
@@ -134,7 +135,8 @@ public class PartitionUpdater implements QuietCloseable {
                 minCompressionRatio,
                 parquetMetaFd,
                 parquetFileSize,
-                existingParquetMetaFileSize
+                existingParquetMetaFileSize,
+                seqTxn
         );
     }
 
@@ -237,7 +239,8 @@ public class PartitionUpdater implements QuietCloseable {
             double minCompressionRatio,
             int parquetMetaFd,
             long parquetFileSize,
-            long existingParquetMetaFileSize
+            long existingParquetMetaFileSize,
+            long seqTxn
     ) throws CairoException;
 
     private static native void destroy(long impl);

@@ -28,9 +28,31 @@ use crate::error::ParquetMetaErrorKind;
 use crate::error::ParquetMetaResult;
 use crate::parquet_meta_err;
 use crate::types::{
-    BlockAlignedOffset, FooterFeatureFlags, BLOCK_ALIGNMENT_SHIFT, FOOTER_CHECKSUM_SIZE,
-    FOOTER_FIXED_SIZE, FOOTER_TRAILER_SIZE, ROW_GROUP_ENTRY_SIZE,
+    BlockAlignedOffset, FooterFeatureFlags, SeqTxn, BLOCK_ALIGNMENT_SHIFT, FOOTER_CHECKSUM_SIZE,
+    FOOTER_FIXED_SIZE, FOOTER_TRAILER_SIZE, ROW_GROUP_ENTRY_SIZE, SUPPORTED_FOOTER_SECTIONS,
 };
+
+/// Index of the `SEQ_TXN_BIT` section in the footer-flag offsets array.
+pub const SEQ_TXN_SECTION_IDX: usize = 0;
+const _: () = assert!(SEQ_TXN_SECTION_IDX < SUPPORTED_FOOTER_SECTIONS);
+
+/// Walks set footer-flag bits forward from `sections_start` (= end of the
+/// bloom filter section, or `entries_end` when bloom is absent), stamping
+/// each known section's offset and advancing the cursor by its hardcoded
+/// size. Returns `(offsets, sections_end)`; the caller bounds-checks
+/// `sections_end` against `crc_offset`. Add one branch per new known bit.
+pub fn compute_section_offsets(
+    feature_flags: FooterFeatureFlags,
+    sections_start: usize,
+) -> ([u32; SUPPORTED_FOOTER_SECTIONS], usize) {
+    let mut offsets = [0u32; SUPPORTED_FOOTER_SECTIONS];
+    let mut cursor = sections_start;
+    if feature_flags.has_seq_txn() {
+        offsets[SEQ_TXN_SECTION_IDX] = cursor as u32;
+        cursor += 8;
+    }
+    (offsets, cursor)
+}
 
 // ── On-disk footer fixed portion (40 bytes) ─────────────────────────────
 
@@ -60,21 +82,50 @@ pub struct FooterRaw {
 /// [feature sections gated by header or footer feature flags],
 /// CHECKSUM(u32).
 ///
+/// Feature sections sit between row group entries and CRC, in this order:
+/// header-flag-gated sections first (currently just the bloom filter
+/// section at `BLOOM_FILTERS_BIT`, parsed by the higher-level reader),
+/// then footer-flag-gated sections in ascending bit order. Each
+/// footer-flag section has a hardcoded byte size determined by its bit
+/// position (see [`compute_section_offsets`]).
+///
+/// Header-first ordering is the forward-compat contract: a reader that
+/// doesn't know any footer-flag bits still finds bloom at the unchanged
+/// offset and treats trailing footer-flag bytes as opaque (still
+/// CRC-covered).
+///
+/// `Footer::new` stamps the offset of recognized footer-flag sections
+/// into `section_offsets`; payload bytes are parsed lazily by accessors
+/// (`seq_txn()`, etc.).
+///
 /// CRC is located via `footer_length` from the trailer: `CRC offset =
-/// footer_length - 4` relative to footer start. This handles unknown
-/// feature sections between the entries and CRC.
+/// footer_length - 4` relative to footer start.
 pub struct Footer<'a> {
     raw: FooterRaw,
     data: &'a [u8],
     footer_length_through_crc: u32,
+    /// Byte offset of each footer-flag-gated section's payload start.
+    /// Entry `i` is meaningful only when bit `i` is set in
+    /// `raw.feature_flags`; otherwise it is zero.
+    section_offsets: [u32; SUPPORTED_FOOTER_SECTIONS],
+    /// Byte offset where the bloom filter section ends (= where the
+    /// footer-flag-gated sections begin).
+    bloom_section_end: u32,
 }
 
 impl<'a> Footer<'a> {
     /// Creates a footer reader over the byte slice starting at the footer offset.
     ///
-    /// `footer_length_through_crc` is the value from the trailer (bytes from
-    /// footer start through CRC, inclusive).
-    pub fn new(data: &'a [u8], footer_length_through_crc: u32) -> ParquetMetaResult<Self> {
+    /// `footer_length_through_crc` is the value from the trailer.
+    /// `bloom_section_size` is the byte size of the bloom filter section
+    /// (computed by the caller from header info; pass `0` when bloom is
+    /// absent). Footer-flag sections sit immediately after the bloom
+    /// section.
+    pub fn new(
+        data: &'a [u8],
+        footer_length_through_crc: u32,
+        bloom_section_size: usize,
+    ) -> ParquetMetaResult<Self> {
         if data.len() < FOOTER_FIXED_SIZE + FOOTER_CHECKSUM_SIZE {
             return Err(parquet_meta_err!(
                 ParquetMetaErrorKind::Truncated,
@@ -129,10 +180,39 @@ impl<'a> Footer<'a> {
             ));
         }
 
+        let entries_end = FOOTER_FIXED_SIZE + (raw.row_group_count as usize) * ROW_GROUP_ENTRY_SIZE;
+        let crc_offset = (footer_length_through_crc as usize) - FOOTER_CHECKSUM_SIZE;
+        let bloom_section_end = entries_end.checked_add(bloom_section_size).ok_or_else(|| {
+            parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "bloom section size {} overflows footer",
+                bloom_section_size
+            )
+        })?;
+        if bloom_section_end > crc_offset {
+            return Err(parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "bloom section ({} bytes) exceeds CRC offset",
+                bloom_section_size
+            ));
+        }
+        let (section_offsets, sections_end) =
+            compute_section_offsets(raw.feature_flags, bloom_section_end);
+        if sections_end > crc_offset {
+            return Err(parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "footer-flag sections end {} exceeds CRC offset {}",
+                sections_end,
+                crc_offset
+            ));
+        }
+
         Ok(Self {
             raw,
             data,
             footer_length_through_crc,
+            section_offsets,
+            bloom_section_end: bloom_section_end as u32,
         })
     }
 
@@ -200,6 +280,25 @@ impl<'a> Footer<'a> {
         self.raw.feature_flags
     }
 
+    /// Per-footer `seqTxn`, or `None` when `SEQ_TXN_BIT` is unset.
+    /// Consumed by the enterprise build; OSS does not read it.
+    pub fn seq_txn(&self) -> Option<SeqTxn> {
+        if !self.raw.feature_flags.has_seq_txn() {
+            return None;
+        }
+        let off = self.section_offsets[SEQ_TXN_SECTION_IDX] as usize;
+        // Unwrap: Footer::new validated `off + 8 <= crc_offset`.
+        let raw = i64::from_le_bytes(self.data[off..off + 8].try_into().unwrap());
+        Some(SeqTxn::new(raw))
+    }
+
+    /// Byte offset (relative to footer start) where the bloom filter
+    /// section ends. Higher-level readers use this as the end bound when
+    /// slicing the bloom section from `entries_end..bloom_section_end()`.
+    pub fn bloom_section_end(&self) -> usize {
+        self.bloom_section_end as usize
+    }
+
     /// Returns the actual byte offset of the row group block at `index`.
     /// The stored value is right-shifted by [`BLOCK_ALIGNMENT_SHIFT`].
     pub fn row_group_block_offset(&self, index: usize) -> ParquetMetaResult<u64> {
@@ -250,8 +349,9 @@ pub struct FooterBuilder {
     feature_flags: FooterFeatureFlags,
     row_group_offsets: Vec<u64>,
     /// Optional bloom filter footer feature section bytes, written between
-    /// row group entries and CRC.
+    /// the seq_txn payload and CRC.
     bloom_filter_section: Vec<u8>,
+    seq_txn: Option<SeqTxn>,
 }
 
 impl FooterBuilder {
@@ -264,6 +364,7 @@ impl FooterBuilder {
             feature_flags: FooterFeatureFlags::new(),
             row_group_offsets: Vec::new(),
             bloom_filter_section: Vec::new(),
+            seq_txn: None,
         }
     }
 
@@ -286,9 +387,15 @@ impl FooterBuilder {
     }
 
     /// Sets the bloom filter footer feature section bytes. Written between
-    /// row group entries and CRC.
+    /// the seq_txn payload and CRC.
     pub fn set_bloom_filter_section(&mut self, section: Vec<u8>) -> &mut Self {
         self.bloom_filter_section = section;
+        self
+    }
+
+    /// Sets the per-footer `seqTxn`. `SeqTxn::UNSET` omits the section.
+    pub fn set_seq_txn(&mut self, value: SeqTxn) -> &mut Self {
+        self.seq_txn = if value.is_set() { Some(value) } else { None };
         self
     }
 
@@ -308,21 +415,33 @@ impl FooterBuilder {
     pub fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         let footer_start = buf.len();
 
+        // Force SEQ_TXN_BIT to match section presence so a caller-set
+        // feature_flags() can't desync from the actual payload.
+        let mut effective_flags = self.feature_flags;
+        if self.seq_txn.is_some() {
+            effective_flags = effective_flags.with_seq_txn();
+        }
+
         buf.extend_from_slice(&self.parquet_footer_offset.to_le_bytes());
         buf.extend_from_slice(&self.parquet_footer_length.to_le_bytes());
         buf.extend_from_slice(&(self.row_group_offsets.len() as u32).to_le_bytes());
         buf.extend_from_slice(&self.unused_bytes.to_le_bytes());
         buf.extend_from_slice(&self.prev_parquet_meta_file_size.to_le_bytes());
-        buf.extend_from_slice(&self.feature_flags.to_le_bytes());
+        buf.extend_from_slice(&effective_flags.to_le_bytes());
 
         for &offset in &self.row_group_offsets {
             let stored = (offset >> BLOCK_ALIGNMENT_SHIFT) as u32;
             buf.extend_from_slice(&stored.to_le_bytes());
         }
 
-        // Footer feature sections (between row group entries and CRC).
+        // Header-flag sections first (bloom), then footer-flag sections
+        // in ascending bit order. Each footer-flag section has a hardcoded
+        // size known to readers from the bit position.
         if !self.bloom_filter_section.is_empty() {
             buf.extend_from_slice(&self.bloom_filter_section);
+        }
+        if let Some(value) = self.seq_txn {
+            buf.extend_from_slice(&value.get().to_le_bytes());
         }
 
         // CRC32 placeholder (filled by the top-level writer).
@@ -341,8 +460,12 @@ mod tests {
     use super::*;
 
     fn parse_footer(buf: &[u8], start: usize) -> Footer<'_> {
+        parse_footer_with_bloom(buf, start, 0)
+    }
+
+    fn parse_footer_with_bloom(buf: &[u8], start: usize, bloom_section_size: usize) -> Footer<'_> {
         let footer_length = u32::from_le_bytes(buf[buf.len() - 4..].try_into().unwrap());
-        Footer::new(&buf[start..], footer_length).unwrap()
+        Footer::new(&buf[start..], footer_length, bloom_section_size).unwrap()
     }
 
     #[test]
@@ -393,7 +516,7 @@ mod tests {
 
     #[test]
     fn footer_too_small() {
-        assert!(Footer::new(&[0u8; 4], 4).is_err());
+        assert!(Footer::new(&[0u8; 4], 4, 0).is_err());
     }
 
     #[test]
@@ -418,7 +541,7 @@ mod tests {
         buf.extend_from_slice(&0u64.to_le_bytes()); // prev_parquet_meta_file_size
         buf.extend_from_slice(&0u64.to_le_bytes()); // footer_feature_flags
                                                     // Need 40 + 5*4 + 4 = 64 bytes, but only have 40.
-        assert!(Footer::new(&buf, 40).is_err());
+        assert!(Footer::new(&buf, 40, 0).is_err());
     }
 
     #[test]
@@ -461,20 +584,7 @@ mod tests {
 
         // Pass a footer_length_through_crc smaller than the required base size.
         let too_small = (FOOTER_FIXED_SIZE + FOOTER_CHECKSUM_SIZE - 1) as u32;
-        assert!(Footer::new(&buf[start..], too_small).is_err());
-    }
-
-    #[test]
-    fn feature_flags_round_trip() {
-        use crate::types::FooterFeatureFlags;
-
-        let mut fb = FooterBuilder::new(0, 0);
-        fb.feature_flags(FooterFeatureFlags(0xA5));
-        let mut buf = Vec::new();
-        let start = fb.write_to(&mut buf);
-
-        let footer = parse_footer(&buf, start);
-        assert_eq!(footer.feature_flags(), FooterFeatureFlags(0xA5));
+        assert!(Footer::new(&buf[start..], too_small, 0).is_err());
     }
 
     #[test]
@@ -497,6 +607,95 @@ mod tests {
         let start = fb.write_to(&mut buf);
 
         let exact = (FOOTER_FIXED_SIZE + FOOTER_CHECKSUM_SIZE) as u32;
-        Footer::new(&buf[start..], exact).unwrap();
+        Footer::new(&buf[start..], exact, 0).unwrap();
+    }
+
+    #[test]
+    fn seq_txn_round_trip() {
+        let mut fb = FooterBuilder::new(0, 0);
+        fb.set_seq_txn(SeqTxn::new(42));
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let footer = parse_footer(&buf, start);
+        assert!(footer.feature_flags().has_seq_txn());
+        assert_eq!(footer.seq_txn(), Some(SeqTxn::new(42)));
+    }
+
+    #[test]
+    fn seq_txn_absent_when_unset() {
+        let fb = FooterBuilder::new(0, 0);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let footer = parse_footer(&buf, start);
+        assert!(!footer.feature_flags().has_seq_txn());
+        assert_eq!(footer.seq_txn(), None);
+    }
+
+    #[test]
+    fn seq_txn_unset_sentinel_omits_section() {
+        let fb_none = FooterBuilder::new(0, 0);
+        let mut buf_none = Vec::new();
+        fb_none.write_to(&mut buf_none);
+
+        let mut fb_unset = FooterBuilder::new(0, 0);
+        fb_unset.set_seq_txn(SeqTxn::UNSET);
+        let mut buf_unset = Vec::new();
+        fb_unset.write_to(&mut buf_unset);
+
+        assert_eq!(buf_none, buf_unset);
+    }
+
+    #[test]
+    fn seq_txn_negative_values_round_trip() {
+        // i64::MIN must survive — only `SeqTxn::UNSET` (-1) is a sentinel.
+        let mut fb = FooterBuilder::new(0, 0);
+        fb.set_seq_txn(SeqTxn::new(i64::MIN));
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let footer = parse_footer(&buf, start);
+        assert_eq!(footer.seq_txn(), Some(SeqTxn::new(i64::MIN)));
+    }
+
+    #[test]
+    fn seq_txn_truncated_payload_rejected() {
+        // Flip SEQ_TXN_BIT without appending the 8-byte payload.
+        let fb = FooterBuilder::new(0, 0);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let flags = crate::types::FooterFeatureFlags::SEQ_TXN_BIT;
+        let flags_off = start + crate::types::FOOTER_FEATURE_FLAGS_OFF;
+        buf[flags_off..flags_off + 8].copy_from_slice(&flags.to_le_bytes());
+
+        let trailer = u32::from_le_bytes(buf[buf.len() - 4..].try_into().unwrap());
+        // SEQ_TXN_BIT set but no payload follows the row group entries.
+        assert!(Footer::new(&buf[start..], trailer, 0).is_err());
+    }
+
+    #[test]
+    fn seq_txn_coexists_with_bloom_filter_section() {
+        // Asserts on-disk order: bloom section first, then seq_txn (8 bytes).
+        let mut fb = FooterBuilder::new(0, 0);
+        fb.add_row_group_offset(0).unwrap();
+        fb.set_seq_txn(SeqTxn::new(7));
+        fb.set_bloom_filter_section(vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let footer = parse_footer_with_bloom(&buf, start, 4);
+        assert!(footer.feature_flags().has_seq_txn());
+        assert_eq!(footer.seq_txn(), Some(SeqTxn::new(7)));
+
+        let entries_end = FOOTER_FIXED_SIZE + ROW_GROUP_ENTRY_SIZE;
+        assert_eq!(
+            &buf[start + entries_end..start + entries_end + 4],
+            &[0xAA, 0xBB, 0xCC, 0xDD]
+        );
+        let bloom_end = start + footer.bloom_section_end();
+        assert_eq!(&buf[bloom_end..bloom_end + 8], &7i64.to_le_bytes());
+        assert_eq!(bloom_end + 8, start + footer.crc_offset());
     }
 }

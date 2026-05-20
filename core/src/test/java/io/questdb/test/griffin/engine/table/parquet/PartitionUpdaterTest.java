@@ -131,7 +131,8 @@ public class PartitionUpdaterTest extends AbstractCairoTest {
                         0.0,
                         -1, // no _pm fd
                         0L,
-                        -1L
+                        -1L,
+                        -1L // seq_txn
                 );
 
                 PartitionEncoder.populateFromTableReader(reader, descriptor, 0);
@@ -216,7 +217,8 @@ public class PartitionUpdaterTest extends AbstractCairoTest {
                         0.0,
                         -1, // no _pm fd
                         0L,
-                        -1L
+                        -1L,
+                        -1L // seq_txn
                 );
 
                 PartitionEncoder.populateFromTableReader(reader, descriptor, 0);
@@ -289,7 +291,8 @@ public class PartitionUpdaterTest extends AbstractCairoTest {
                         0.0,
                         parquetMetaFd,
                         parquetPartitionSize,
-                        0L
+                        0L,
+                        -1L // seq_txn
                 );
 
                 PartitionEncoder.populateFromTableReader(reader, descriptor, 0);

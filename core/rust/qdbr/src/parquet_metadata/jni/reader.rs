@@ -34,6 +34,7 @@
 
 use crate::parquet::error::{fmt_err, ParquetResult};
 use crate::parquet_metadata::reader::ParquetMetaReader;
+use crate::parquet_metadata::types::SeqTxn;
 use crate::parquet_read::ColumnFilterPacked;
 use jni::objects::JClass;
 use jni::JNIEnv;
@@ -135,13 +136,12 @@ pub extern "system" fn Java_io_questdb_cairo_ParquetMetaFileReader_destroyNative
     }
 }
 
-/// Writes `(total_row_count: i64, squash_tracker: i64)` to `[dest_addr, dest_addr + 16)`.
-///
-/// `total_row_count` is the sum of `num_rows` across every row group in the
-/// `_pm` file. `squash_tracker` is `-1` when the `SQUASH_TRACKER` feature bit
-/// is absent. Used by the enterprise build to retrieve both values in a
-/// single JNI call; OSS consumers read the same values through Java-side
-/// accessors on [`super::ParquetMetaFileReader`].
+/// Writes `(total_row_count, squash_tracker, seq_txn)` as three i64s to
+/// `[dest_addr, dest_addr + 24)`. `total_row_count` sums `num_rows` across
+/// every row group in the `_pm`. `squash_tracker` is `-1` when the
+/// `SQUASH_TRACKER` header bit is absent; `seq_txn` is `-1` when the
+/// latest footer's `SEQ_TXN` bit is absent. Lets the enterprise build
+/// retrieve all three values in a single JNI call.
 #[no_mangle]
 pub extern "system" fn Java_io_questdb_cairo_ParquetMetaFileReader_readPartitionMeta0(
     mut env: JNIEnv,
@@ -153,7 +153,7 @@ pub extern "system" fn Java_io_questdb_cairo_ParquetMetaFileReader_readPartition
     let env = &mut env;
     let res = read_partition_meta_impl(parquet_meta_addr, parquet_meta_size);
     match res {
-        Ok((row_count, squash_tracker)) => {
+        Ok((row_count, squash_tracker, seq_txn)) => {
             if dest_addr == 0 {
                 let err = fmt_err!(InvalidLayout, "dest_addr is null");
                 let _: () = err.into_cairo_exception().throw(env);
@@ -163,6 +163,7 @@ pub extern "system" fn Java_io_questdb_cairo_ParquetMetaFileReader_readPartition
                 let dest = dest_addr as *mut i64;
                 dest.write_unaligned(row_count);
                 dest.add(1).write_unaligned(squash_tracker);
+                dest.add(2).write_unaligned(seq_txn);
             }
         }
         Err(mut err) => {
@@ -172,13 +173,13 @@ pub extern "system" fn Java_io_questdb_cairo_ParquetMetaFileReader_readPartition
     }
 }
 
-/// Parses the `_pm` buffer and returns `(total_row_count, squash_tracker)`.
+/// Parses the `_pm` buffer and returns `(total_row_count, squash_tracker, seq_txn)`.
 /// Split from the JNI wrapper so unit tests can exercise the error paths
 /// without constructing a `JNIEnv`.
 fn read_partition_meta_impl(
     parquet_meta_addr: *const u8,
     parquet_meta_size: u64,
-) -> ParquetResult<(i64, i64)> {
+) -> ParquetResult<(i64, i64, i64)> {
     if parquet_meta_addr.is_null() {
         return Err(fmt_err!(InvalidLayout, "_pm file pointer is null"));
     }
@@ -211,7 +212,8 @@ fn read_partition_meta_impl(
         })?;
     }
     let squash_tracker = reader.squash_tracker().unwrap_or(-1);
-    Ok((row_count, squash_tracker))
+    let seq_txn = reader.seq_txn().unwrap_or(SeqTxn::UNSET).get();
+    Ok((row_count, squash_tracker, seq_txn))
 }
 
 /// Verifies the CRC32 checksum of the `_pm` file at `[addr, addr + file_size)`.
@@ -485,10 +487,12 @@ mod tests {
         assert!(res.is_err(), "row group index 5 out of range");
     }
 
-    /// Builds a `_pm` with the given row-group sizes and optional squash_tracker.
+    /// Builds a `_pm` with the given row-group sizes and optional
+    /// squash_tracker / seq_txn values.
     fn build_parquet_meta_with_row_groups(
         row_group_sizes: &[u64],
         squash_tracker: Option<i64>,
+        seq_txn: Option<i64>,
     ) -> Vec<u8> {
         let mut writer = ParquetMetaWriter::new();
         writer
@@ -507,6 +511,9 @@ mod tests {
         if let Some(tracker) = squash_tracker {
             writer.squash_tracker(tracker);
         }
+        if let Some(value) = seq_txn {
+            writer.seq_txn(SeqTxn::new(value));
+        }
         for &num_rows in row_group_sizes {
             let mut rg = RowGroupBlockBuilder::new(1);
             rg.set_num_rows(num_rows);
@@ -522,30 +529,42 @@ mod tests {
 
     #[test]
     fn read_partition_meta_sums_row_groups_and_returns_tracker() {
-        let bytes = build_parquet_meta_with_row_groups(&[100, 250], Some(42));
-        let (row_count, squash_tracker) =
+        let bytes = build_parquet_meta_with_row_groups(&[100, 250], Some(42), Some(11));
+        let (row_count, squash_tracker, seq_txn) =
             read_partition_meta_impl(bytes.as_ptr(), bytes.len() as u64).unwrap();
         assert_eq!(row_count, 350);
         assert_eq!(squash_tracker, 42);
+        assert_eq!(seq_txn, 11);
     }
 
     #[test]
     fn read_partition_meta_returns_neg_one_when_tracker_absent() {
-        let bytes = build_parquet_meta_with_row_groups(&[10, 20, 30], None);
-        let (row_count, squash_tracker) =
+        let bytes = build_parquet_meta_with_row_groups(&[10, 20, 30], None, None);
+        let (row_count, squash_tracker, seq_txn) =
             read_partition_meta_impl(bytes.as_ptr(), bytes.len() as u64).unwrap();
         assert_eq!(row_count, 60);
         assert_eq!(squash_tracker, -1);
+        assert_eq!(seq_txn, -1);
     }
 
     #[test]
     fn read_partition_meta_handles_zero_row_groups() {
         // _pm with no row groups is unusual but must not underflow the accumulator.
-        let bytes = build_parquet_meta_with_row_groups(&[], Some(7));
-        let (row_count, squash_tracker) =
+        let bytes = build_parquet_meta_with_row_groups(&[], Some(7), Some(3));
+        let (row_count, squash_tracker, seq_txn) =
             read_partition_meta_impl(bytes.as_ptr(), bytes.len() as u64).unwrap();
         assert_eq!(row_count, 0);
         assert_eq!(squash_tracker, 7);
+        assert_eq!(seq_txn, 3);
+    }
+
+    #[test]
+    fn read_partition_meta_returns_seq_txn_independent_of_squash_tracker() {
+        let bytes = build_parquet_meta_with_row_groups(&[5], None, Some(99));
+        let (_row_count, squash_tracker, seq_txn) =
+            read_partition_meta_impl(bytes.as_ptr(), bytes.len() as u64).unwrap();
+        assert_eq!(squash_tracker, -1);
+        assert_eq!(seq_txn, 99);
     }
 
     #[test]

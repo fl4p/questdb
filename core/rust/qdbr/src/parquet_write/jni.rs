@@ -1,4 +1,5 @@
 use crate::parquet::error::{fmt_err, ParquetError, ParquetErrorExt, ParquetResult};
+use crate::parquet_metadata::types::SeqTxn;
 use crate::parquet_write::file::{
     ChunkedWriter, ParquetWriter, DEFAULT_BLOOM_FILTER_FPP, DEFAULT_ROW_GROUP_SIZE,
 };
@@ -172,6 +173,7 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_PartitionUpd
     parquet_meta_fd: jint,
     parquet_meta_file_size: jlong,
     existing_parquet_meta_file_size: jlong,
+    seq_txn: jlong,
 ) -> *mut ParquetUpdater {
     let env = &mut env;
     let create = || -> ParquetResult<ParquetUpdater> {
@@ -221,6 +223,7 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_PartitionUpd
             parquet_meta_fd_handle,
             parquet_meta_file_size as u64,
             existing_parquet_meta_file_size,
+            SeqTxn::new(seq_txn),
         )
     };
 
@@ -478,6 +481,7 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_PartitionEnc
     min_compression_ratio: jdouble,
     parquet_meta_fd: jint,
     squash_tracker: jlong,
+    seq_txn: jlong,
 ) -> jlong {
     let env = &mut env;
     let encode = || -> ParquetResult<i64> {
@@ -551,12 +555,14 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_PartitionEnc
             .with_bloom_filter_columns(bloom_filter_cols)
             .with_bloom_filter_fpp(bloom_filter_fpp)
             .with_min_compression_ratio(min_compression_ratio)
-            .with_squash_tracker(squash_tracker);
+            .with_squash_tracker(squash_tracker)
+            .with_seq_txn(seq_txn);
 
         let (schema, additional_meta) = crate::parquet_write::schema::to_parquet_schema(
             &partition,
             raw_array_encoding,
             squash_tracker,
+            seq_txn,
         )?;
         let encodings = crate::parquet_write::schema::to_encodings(&partition);
         let compressions = crate::parquet_write::schema::to_compressions(&partition);
@@ -613,6 +619,7 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_PartitionEnc
                 chunked.bloom_bitsets(),
                 0, // unused_bytes: new file, no dead space
                 squash_tracker,
+                SeqTxn::new(seq_txn),
             )
             .context("generate_parquet_metadata failed")?;
 
@@ -1047,6 +1054,7 @@ pub extern "system" fn Java_io_questdb_griffin_engine_table_parquet_PartitionEnc
         let (parquet_schema, additional_data) = crate::parquet_write::schema::to_parquet_schema(
             &partition_template,
             raw_array_encoding != 0,
+            -1,
             -1,
         )?;
         // SAFETY: Pointer was passed from Java and points to a valid allocator for the JNI call duration.

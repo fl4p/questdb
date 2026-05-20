@@ -952,13 +952,14 @@ public class ParquetMetaFileReaderTest extends AbstractCairoTest {
                 Assert.assertTrue(reader.resolveFooter(Long.MAX_VALUE));
                 Assert.assertEquals(0, reader.getDesignatedTimestampColumnIndex());
 
-                long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
                 try {
                     reader.readPartitionMeta(buf);
                     Assert.assertEquals(12L, Unsafe.getLong(buf));
                     Assert.assertEquals(-1L, Unsafe.getLong(buf + 8));
+                    Assert.assertEquals(-1L, Unsafe.getLong(buf + 16));
                 } finally {
-                    Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
                 }
                 reader.clear();
             }
@@ -977,13 +978,14 @@ public class ParquetMetaFileReaderTest extends AbstractCairoTest {
                 Assert.assertTrue(reader.resolveFooter(Long.MAX_VALUE));
                 Assert.assertEquals(2, reader.getDesignatedTimestampColumnIndex());
 
-                long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
                 try {
                     reader.readPartitionMeta(buf);
                     Assert.assertEquals(7L, Unsafe.getLong(buf));
                     Assert.assertEquals(-1L, Unsafe.getLong(buf + 8));
+                    Assert.assertEquals(-1L, Unsafe.getLong(buf + 16));
                 } finally {
-                    Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
                 }
                 reader.clear();
             }
@@ -1002,13 +1004,14 @@ public class ParquetMetaFileReaderTest extends AbstractCairoTest {
                 reader.of(file.dataPtr, file.parquetMetaFileSize);
                 Assert.assertTrue(reader.resolveFooter(Long.MAX_VALUE));
 
-                long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
                 try {
                     reader.readPartitionMeta(buf);
                     Assert.assertEquals(12L, Unsafe.getLong(buf));
                     Assert.assertEquals(-1L, Unsafe.getLong(buf + 8));
+                    Assert.assertEquals(-1L, Unsafe.getLong(buf + 16));
                 } finally {
-                    Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
                 }
                 reader.clear();
             }
@@ -1064,13 +1067,14 @@ public class ParquetMetaFileReaderTest extends AbstractCairoTest {
                 reader.of(file.dataPtr, file.parquetMetaFileSize);
                 Assert.assertTrue(reader.resolveFooter(Long.MAX_VALUE));
 
-                long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
                 try {
                     reader.readPartitionMeta(buf);
                     Assert.assertEquals(5L, Unsafe.getLong(buf));
                     Assert.assertEquals(-1L, Unsafe.getLong(buf + 8));
+                    Assert.assertEquals(-1L, Unsafe.getLong(buf + 16));
                 } finally {
-                    Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
                 }
                 reader.clear();
             }
@@ -1094,13 +1098,14 @@ public class ParquetMetaFileReaderTest extends AbstractCairoTest {
                 Assert.assertEquals(0, reader.getColumnCount());
                 Assert.assertEquals(0, reader.getRowGroupCount());
 
-                long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
                 try {
                     reader.readPartitionMeta(buf);
                     Assert.assertEquals(0L, Unsafe.getLong(buf));
                     Assert.assertEquals(-1L, Unsafe.getLong(buf + 8));
+                    Assert.assertEquals(-1L, Unsafe.getLong(buf + 16));
                 } finally {
-                    Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
                 }
                 reader.clear();
             }
@@ -1119,13 +1124,14 @@ public class ParquetMetaFileReaderTest extends AbstractCairoTest {
                 Assert.assertTrue(reader.resolveFooter(Long.MAX_VALUE));
                 Assert.assertEquals(0, reader.getRowGroupCount());
 
-                long buf = Unsafe.malloc(16, MemoryTag.NATIVE_DEFAULT);
+                long buf = Unsafe.malloc(24, MemoryTag.NATIVE_DEFAULT);
                 try {
                     reader.readPartitionMeta(buf);
                     Assert.assertEquals(0L, Unsafe.getLong(buf));
                     Assert.assertEquals(-1L, Unsafe.getLong(buf + 8));
+                    Assert.assertEquals(-1L, Unsafe.getLong(buf + 16));
                 } finally {
-                    Unsafe.free(buf, 16, MemoryTag.NATIVE_DEFAULT);
+                    Unsafe.free(buf, 24, MemoryTag.NATIVE_DEFAULT);
                 }
                 reader.clear();
             }
