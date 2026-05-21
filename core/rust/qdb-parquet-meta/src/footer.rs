@@ -57,9 +57,7 @@ pub fn compute_section_offsets(
     let mut cursor = sections_start;
     if feature_flags.has_seq_txn() {
         offsets[SEQ_TXN_SECTION_IDX] = cursor as u32;
-        cursor = cursor.checked_add(8).ok_or_else(|| {
-            parquet_meta_err!(ParquetMetaErrorKind::Truncated, "seq_txn section overflows")
-        })?;
+        cursor += 8;
         if cursor > end {
             return Err(parquet_meta_err!(
                 ParquetMetaErrorKind::Truncated,
@@ -70,13 +68,7 @@ pub fn compute_section_offsets(
     }
     if feature_flags.has_scratchpad() {
         offsets[SCRATCHPAD_SECTION_IDX] = cursor as u32;
-        let scratchpad_size = parse_scratchpad_size(data, cursor, end)?;
-        cursor = cursor.checked_add(scratchpad_size).ok_or_else(|| {
-            parquet_meta_err!(
-                ParquetMetaErrorKind::Truncated,
-                "scratchpad section overflows"
-            )
-        })?;
+        cursor += parse_scratchpad_size(data, cursor, end)?;
     }
     Ok((offsets, cursor))
 }
@@ -84,13 +76,10 @@ pub fn compute_section_offsets(
 /// Parses the scratchpad payload (`[entry_count u32]` + per-entry
 /// `[code u32, length u32, content]`) starting at `cursor` and returns its
 /// total on-disk size in bytes. Bounds-checks every read against `end`.
+/// `cursor` and `end` are bounded by the u32 footer length, so plain usize
+/// arithmetic cannot overflow on a 64-bit target.
 fn parse_scratchpad_size(data: &[u8], cursor: usize, end: usize) -> ParquetMetaResult<usize> {
-    let count_end = cursor.checked_add(4).ok_or_else(|| {
-        parquet_meta_err!(
-            ParquetMetaErrorKind::Truncated,
-            "scratchpad entry_count overflow"
-        )
-    })?;
+    let count_end = cursor + 4;
     if count_end > end {
         return Err(parquet_meta_err!(
             ParquetMetaErrorKind::Truncated,
@@ -106,12 +95,7 @@ fn parse_scratchpad_size(data: &[u8], cursor: usize, end: usize) -> ParquetMetaR
     }
     let mut p = count_end;
     for _ in 0..entry_count {
-        let hdr_end = p.checked_add(8).ok_or_else(|| {
-            parquet_meta_err!(
-                ParquetMetaErrorKind::Truncated,
-                "scratchpad entry header overflow"
-            )
-        })?;
+        let hdr_end = p + 8;
         if hdr_end > end {
             return Err(parquet_meta_err!(
                 ParquetMetaErrorKind::Truncated,
@@ -119,12 +103,7 @@ fn parse_scratchpad_size(data: &[u8], cursor: usize, end: usize) -> ParquetMetaR
             ));
         }
         let length = u32::from_le_bytes(data[p + 4..p + 8].try_into().unwrap()) as usize;
-        let content_end = hdr_end.checked_add(length).ok_or_else(|| {
-            parquet_meta_err!(
-                ParquetMetaErrorKind::Truncated,
-                "scratchpad entry length overflow"
-            )
-        })?;
+        let content_end = hdr_end + length;
         if content_end > end {
             return Err(parquet_meta_err!(
                 ParquetMetaErrorKind::Truncated,
