@@ -330,7 +330,7 @@ impl<'a> ParquetMetaReader<'a> {
     pub fn footer(&self) -> &Footer<'a> {
         &self.footer
     }
-    
+
     /// Returns the feature flags stored in the currently selected footer.
     pub fn footer_feature_flags(&self) -> FooterFeatureFlags {
         self.footer.feature_flags()
@@ -346,6 +346,13 @@ impl<'a> ParquetMetaReader<'a> {
     /// Consumed by the enterprise build; OSS does not read it.
     pub fn seq_txn(&self) -> Option<SeqTxn> {
         self.footer.seq_txn()
+    }
+
+    /// First scratchpad entry matching `code` on the latest footer, or
+    /// `None`. Opaque to OSS; enterprise consumers pick `code` values
+    /// privately.
+    pub fn scratchpad_entry(&self, code: u32) -> Option<&'a [u8]> {
+        self.footer.scratchpad_entry(code)
     }
 
     /// Returns the raw file data slice.

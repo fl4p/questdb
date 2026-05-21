@@ -29,29 +29,154 @@ use crate::error::ParquetMetaResult;
 use crate::parquet_meta_err;
 use crate::types::{
     BlockAlignedOffset, FooterFeatureFlags, SeqTxn, BLOCK_ALIGNMENT_SHIFT, FOOTER_CHECKSUM_SIZE,
-    FOOTER_FIXED_SIZE, FOOTER_TRAILER_SIZE, ROW_GROUP_ENTRY_SIZE, SUPPORTED_FOOTER_SECTIONS,
+    FOOTER_FIXED_SIZE, FOOTER_TRAILER_SIZE, MAX_SCRATCHPAD_SIZE, ROW_GROUP_ENTRY_SIZE,
+    SUPPORTED_FOOTER_SECTIONS,
 };
 
 /// Index of the `SEQ_TXN_BIT` section in the footer-flag offsets array.
 pub const SEQ_TXN_SECTION_IDX: usize = 0;
 const _: () = assert!(SEQ_TXN_SECTION_IDX < SUPPORTED_FOOTER_SECTIONS);
 
+/// Index of the `SCRATCHPAD_BIT` section in the footer-flag offsets array.
+pub const SCRATCHPAD_SECTION_IDX: usize = 1;
+const _: () = assert!(SCRATCHPAD_SECTION_IDX < SUPPORTED_FOOTER_SECTIONS);
+
 /// Walks set footer-flag bits forward from `sections_start` (= end of the
 /// bloom filter section, or `entries_end` when bloom is absent), stamping
-/// each known section's offset and advancing the cursor by its hardcoded
-/// size. Returns `(offsets, sections_end)`; the caller bounds-checks
-/// `sections_end` against `crc_offset`. Add one branch per new known bit.
+/// each known section's offset and advancing the cursor by its on-disk
+/// size. `data` is the full footer byte slice (used for the variable-size
+/// scratchpad branch); `end` bounds the walk (= CRC offset). Returns
+/// `(offsets, sections_end)`. Add one branch per new known bit.
 pub fn compute_section_offsets(
     feature_flags: FooterFeatureFlags,
     sections_start: usize,
-) -> ([u32; SUPPORTED_FOOTER_SECTIONS], usize) {
+    data: &[u8],
+    end: usize,
+) -> ParquetMetaResult<([u32; SUPPORTED_FOOTER_SECTIONS], usize)> {
     let mut offsets = [0u32; SUPPORTED_FOOTER_SECTIONS];
     let mut cursor = sections_start;
     if feature_flags.has_seq_txn() {
         offsets[SEQ_TXN_SECTION_IDX] = cursor as u32;
-        cursor += 8;
+        cursor = cursor.checked_add(8).ok_or_else(|| {
+            parquet_meta_err!(ParquetMetaErrorKind::Truncated, "seq_txn section overflows")
+        })?;
+        if cursor > end {
+            return Err(parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "seq_txn section exceeds CRC offset {}",
+                end
+            ));
+        }
     }
-    (offsets, cursor)
+    if feature_flags.has_scratchpad() {
+        offsets[SCRATCHPAD_SECTION_IDX] = cursor as u32;
+        let scratchpad_size = parse_scratchpad_size(data, cursor, end)?;
+        cursor = cursor.checked_add(scratchpad_size).ok_or_else(|| {
+            parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "scratchpad section overflows"
+            )
+        })?;
+    }
+    Ok((offsets, cursor))
+}
+
+/// Parses the scratchpad payload (`[entry_count u32]` + per-entry
+/// `[code u32, length u32, content]`) starting at `cursor` and returns its
+/// total on-disk size in bytes. Bounds-checks every read against `end`.
+fn parse_scratchpad_size(data: &[u8], cursor: usize, end: usize) -> ParquetMetaResult<usize> {
+    let count_end = cursor.checked_add(4).ok_or_else(|| {
+        parquet_meta_err!(
+            ParquetMetaErrorKind::Truncated,
+            "scratchpad entry_count overflow"
+        )
+    })?;
+    if count_end > end {
+        return Err(parquet_meta_err!(
+            ParquetMetaErrorKind::Truncated,
+            "scratchpad entry_count exceeds CRC offset"
+        ));
+    }
+    let entry_count = u32::from_le_bytes(data[cursor..count_end].try_into().unwrap()) as usize;
+    if entry_count == 0 {
+        return Err(parquet_meta_err!(
+            ParquetMetaErrorKind::InvalidValue,
+            "scratchpad bit set but entry_count is 0"
+        ));
+    }
+    let mut p = count_end;
+    for _ in 0..entry_count {
+        let hdr_end = p.checked_add(8).ok_or_else(|| {
+            parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "scratchpad entry header overflow"
+            )
+        })?;
+        if hdr_end > end {
+            return Err(parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "scratchpad entry header exceeds CRC offset"
+            ));
+        }
+        let length = u32::from_le_bytes(data[p + 4..p + 8].try_into().unwrap()) as usize;
+        let content_end = hdr_end.checked_add(length).ok_or_else(|| {
+            parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "scratchpad entry length overflow"
+            )
+        })?;
+        if content_end > end {
+            return Err(parquet_meta_err!(
+                ParquetMetaErrorKind::Truncated,
+                "scratchpad entry content exceeds CRC offset"
+            ));
+        }
+        p = content_end;
+    }
+    let total = p - cursor;
+    if total > MAX_SCRATCHPAD_SIZE {
+        return Err(parquet_meta_err!(
+            ParquetMetaErrorKind::InvalidValue,
+            "scratchpad payload {} exceeds MAX_SCRATCHPAD_SIZE {}",
+            total,
+            MAX_SCRATCHPAD_SIZE
+        ));
+    }
+    Ok(total)
+}
+
+/// Iterator over scratchpad entries: `(code, content)` pairs in
+/// insertion order. The slice ranges have been validated by
+/// [`compute_section_offsets`], so direct indexing is safe.
+pub struct ScratchpadIter<'a> {
+    data: &'a [u8],
+    cursor: usize,
+    remaining: u32,
+}
+
+impl<'a> Iterator for ScratchpadIter<'a> {
+    type Item = (u32, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let code = u32::from_le_bytes(
+            self.data[self.cursor..self.cursor + 4]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        );
+        let length = u32::from_le_bytes(
+            self.data[self.cursor + 4..self.cursor + 8]
+                .try_into()
+                .expect("slice is 4 bytes"),
+        ) as usize;
+        let content_start = self.cursor + 8;
+        let content = &self.data[content_start..content_start + length];
+        self.cursor = content_start + length;
+        self.remaining -= 1;
+        Some((code, content))
+    }
 }
 
 // ── On-disk footer fixed portion (40 bytes) ─────────────────────────────
@@ -197,7 +322,7 @@ impl<'a> Footer<'a> {
             ));
         }
         let (section_offsets, sections_end) =
-            compute_section_offsets(raw.feature_flags, bloom_section_end);
+            compute_section_offsets(raw.feature_flags, bloom_section_end, data, crc_offset)?;
         if sections_end > crc_offset {
             return Err(parquet_meta_err!(
                 ParquetMetaErrorKind::Truncated,
@@ -292,6 +417,35 @@ impl<'a> Footer<'a> {
         Some(SeqTxn::new(raw))
     }
 
+    /// Iterator over scratchpad entries in insertion order. Yields nothing
+    /// when `SCRATCHPAD_BIT` is unset.
+    pub fn scratchpad_entries(&self) -> ScratchpadIter<'a> {
+        if !self.raw.feature_flags.has_scratchpad() {
+            return ScratchpadIter {
+                data: self.data,
+                cursor: 0,
+                remaining: 0,
+            };
+        }
+        let off = self.section_offsets[SCRATCHPAD_SECTION_IDX] as usize;
+        // Unwrap: Footer::new validated the scratchpad payload, including
+        // entry_count.
+        let entry_count = u32::from_le_bytes(self.data[off..off + 4].try_into().unwrap());
+        ScratchpadIter {
+            data: self.data,
+            cursor: off + 4,
+            remaining: entry_count,
+        }
+    }
+
+    /// First scratchpad entry matching `code`, or `None`. O(n) — callers
+    /// typically read a handful of codes per partition open.
+    pub fn scratchpad_entry(&self, code: u32) -> Option<&'a [u8]> {
+        self.scratchpad_entries()
+            .find(|(c, _)| *c == code)
+            .map(|(_, content)| content)
+    }
+
     /// Byte offset (relative to footer start) where the bloom filter
     /// section ends. Higher-level readers use this as the end bound when
     /// slicing the bloom section from `entries_end..bloom_section_end()`.
@@ -348,10 +502,11 @@ pub struct FooterBuilder {
     prev_parquet_meta_file_size: u64,
     feature_flags: FooterFeatureFlags,
     row_group_offsets: Vec<u64>,
-    /// Optional bloom filter footer feature section bytes, written between
-    /// the seq_txn payload and CRC.
+    /// Optional bloom filter footer feature section bytes, written before
+    /// footer-flag-gated sections (seq_txn, scratchpad).
     bloom_filter_section: Vec<u8>,
     seq_txn: Option<SeqTxn>,
+    scratchpad: Vec<(u32, Vec<u8>)>,
 }
 
 impl FooterBuilder {
@@ -365,6 +520,7 @@ impl FooterBuilder {
             row_group_offsets: Vec::new(),
             bloom_filter_section: Vec::new(),
             seq_txn: None,
+            scratchpad: Vec::new(),
         }
     }
 
@@ -399,6 +555,12 @@ impl FooterBuilder {
         self
     }
 
+    /// Replaces the scratchpad entries. An empty `Vec` clears the section.
+    pub fn set_scratchpad_entries(&mut self, entries: Vec<(u32, Vec<u8>)>) -> &mut Self {
+        self.scratchpad = entries;
+        self
+    }
+
     /// Adds a row group block offset. The offset must be 8-byte aligned
     /// and representable as a block-aligned u32.
     pub fn add_row_group_offset(&mut self, offset: u64) -> ParquetMetaResult<&mut Self> {
@@ -415,11 +577,14 @@ impl FooterBuilder {
     pub fn write_to(&self, buf: &mut Vec<u8>) -> usize {
         let footer_start = buf.len();
 
-        // Force SEQ_TXN_BIT to match section presence so a caller-set
+        // Force feature bits to match section presence so a caller-set
         // feature_flags() can't desync from the actual payload.
         let mut effective_flags = self.feature_flags;
         if self.seq_txn.is_some() {
             effective_flags = effective_flags.with_seq_txn();
+        }
+        if !self.scratchpad.is_empty() {
+            effective_flags = effective_flags.with_scratchpad();
         }
 
         buf.extend_from_slice(&self.parquet_footer_offset.to_le_bytes());
@@ -435,13 +600,31 @@ impl FooterBuilder {
         }
 
         // Header-flag sections first (bloom), then footer-flag sections
-        // in ascending bit order. Each footer-flag section has a hardcoded
-        // size known to readers from the bit position.
+        // in ascending bit order: seq_txn (bit 0), scratchpad (bit 1).
         if !self.bloom_filter_section.is_empty() {
             buf.extend_from_slice(&self.bloom_filter_section);
         }
         if let Some(value) = self.seq_txn {
             buf.extend_from_slice(&value.get().to_le_bytes());
+        }
+        if !self.scratchpad.is_empty() {
+            let payload_size = 4 + self
+                .scratchpad
+                .iter()
+                .map(|(_, c)| 8 + c.len())
+                .sum::<usize>();
+            debug_assert!(
+                payload_size <= crate::types::MAX_SCRATCHPAD_SIZE,
+                "scratchpad payload {} exceeds MAX_SCRATCHPAD_SIZE {}",
+                payload_size,
+                crate::types::MAX_SCRATCHPAD_SIZE
+            );
+            buf.extend_from_slice(&(self.scratchpad.len() as u32).to_le_bytes());
+            for (code, content) in &self.scratchpad {
+                buf.extend_from_slice(&code.to_le_bytes());
+                buf.extend_from_slice(&(content.len() as u32).to_le_bytes());
+                buf.extend_from_slice(content);
+            }
         }
 
         // CRC32 placeholder (filled by the top-level writer).
@@ -673,6 +856,242 @@ mod tests {
         let trailer = u32::from_le_bytes(buf[buf.len() - 4..].try_into().unwrap());
         // SEQ_TXN_BIT set but no payload follows the row group entries.
         assert!(Footer::new(&buf[start..], trailer, 0).is_err());
+    }
+
+    #[test]
+    fn scratchpad_round_trip() {
+        let mut fb = FooterBuilder::new(0, 0);
+        fb.set_scratchpad_entries(vec![(0xCAFE_BABE, vec![1, 2, 3, 4, 5])]);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let footer = parse_footer(&buf, start);
+        assert!(footer.feature_flags().has_scratchpad());
+        assert_eq!(
+            footer.scratchpad_entry(0xCAFE_BABE),
+            Some(&[1, 2, 3, 4, 5][..])
+        );
+        let entries: Vec<_> = footer.scratchpad_entries().collect();
+        assert_eq!(entries, vec![(0xCAFE_BABE, &[1, 2, 3, 4, 5][..])]);
+    }
+
+    #[test]
+    fn scratchpad_multiple_entries() {
+        let mut fb = FooterBuilder::new(0, 0);
+        fb.set_scratchpad_entries(vec![
+            (1, vec![0xAA; 4]),
+            (2, vec![0xBB; 16]),
+            (3, vec![0xCC; 32]),
+        ]);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let footer = parse_footer(&buf, start);
+        let entries: Vec<_> = footer.scratchpad_entries().collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], (1u32, &[0xAA; 4][..]));
+        assert_eq!(entries[1], (2u32, &[0xBB; 16][..]));
+        assert_eq!(entries[2], (3u32, &[0xCC; 32][..]));
+        assert_eq!(footer.scratchpad_entry(2), Some(&[0xBB; 16][..]));
+        assert_eq!(footer.scratchpad_entry(99), None);
+    }
+
+    #[test]
+    fn scratchpad_empty_omits_bit() {
+        let fb_none = FooterBuilder::new(0, 0);
+        let mut buf_none = Vec::new();
+        fb_none.write_to(&mut buf_none);
+
+        let mut fb_empty = FooterBuilder::new(0, 0);
+        fb_empty.set_scratchpad_entries(vec![]);
+        let mut buf_empty = Vec::new();
+        fb_empty.write_to(&mut buf_empty);
+
+        assert_eq!(buf_none, buf_empty);
+    }
+
+    #[test]
+    fn scratchpad_truncated_payload_rejected() {
+        // Flip SCRATCHPAD_BIT without appending the count.
+        let fb = FooterBuilder::new(0, 0);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let flags = crate::types::FooterFeatureFlags::SCRATCHPAD_BIT;
+        let flags_off = start + crate::types::FOOTER_FEATURE_FLAGS_OFF;
+        buf[flags_off..flags_off + 8].copy_from_slice(&flags.to_le_bytes());
+
+        let trailer = u32::from_le_bytes(buf[buf.len() - 4..].try_into().unwrap());
+        assert!(Footer::new(&buf[start..], trailer, 0).is_err());
+    }
+
+    #[test]
+    fn scratchpad_zero_count_with_bit_rejected() {
+        // Hand-craft a footer with SCRATCHPAD_BIT set and entry_count=0 on disk.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u64.to_le_bytes()); // parquet_footer_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // parquet_footer_length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // row_group_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // unused_bytes
+        buf.extend_from_slice(&0u64.to_le_bytes()); // prev_parquet_meta_file_size
+        buf.extend_from_slice(&crate::types::FooterFeatureFlags::SCRATCHPAD_BIT.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // entry_count = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
+        let footer_len = buf.len() as u32;
+        buf.extend_from_slice(&footer_len.to_le_bytes());
+
+        let err = match Footer::new(&buf, footer_len, 0) {
+            Err(e) => e,
+            Ok(_) => panic!("expected zero-count rejection"),
+        };
+        assert_eq!(err.kind, ParquetMetaErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn scratchpad_entry_header_exceeds_crc_rejected() {
+        // entry_count > 0 but no room left for even the first 8-byte header.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u64.to_le_bytes()); // parquet_footer_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // parquet_footer_length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // row_group_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // unused_bytes
+        buf.extend_from_slice(&0u64.to_le_bytes()); // prev_parquet_meta_file_size
+        buf.extend_from_slice(&crate::types::FooterFeatureFlags::SCRATCHPAD_BIT.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // entry_count = 1
+        // No entry header bytes follow; CRC sits right here.
+        buf.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
+        let footer_len = buf.len() as u32;
+        buf.extend_from_slice(&footer_len.to_le_bytes());
+
+        let err = match Footer::new(&buf, footer_len, 0) {
+            Err(e) => e,
+            Ok(_) => panic!("expected entry-header-exceeds-CRC rejection"),
+        };
+        assert_eq!(err.kind, ParquetMetaErrorKind::Truncated);
+    }
+
+    #[test]
+    fn scratchpad_entry_length_overflow_rejected() {
+        // Build a valid 1-entry scratchpad, then bump the on-disk length so the
+        // declared content extends past the CRC offset.
+        let mut fb = FooterBuilder::new(0, 0);
+        fb.set_scratchpad_entries(vec![(1, vec![0xAA; 4])]);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        // Locate the entry's length field: footer_start + FOOTER_FIXED_SIZE
+        // (no row groups, no bloom, no seq_txn) + 4 (entry_count) + 4 (code).
+        let length_off = start + FOOTER_FIXED_SIZE + 4 + 4;
+        buf[length_off..length_off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let trailer = u32::from_le_bytes(buf[buf.len() - 4..].try_into().unwrap());
+        let err = match Footer::new(&buf[start..], trailer, 0) {
+            Err(e) => e,
+            Ok(_) => panic!("expected length-overflow rejection"),
+        };
+        assert_eq!(err.kind, ParquetMetaErrorKind::Truncated);
+    }
+
+    #[test]
+    fn scratchpad_exceeds_max_size_rejected() {
+        use crate::types::MAX_SCRATCHPAD_SIZE;
+
+        // Hand-craft a footer whose scratchpad declares one entry larger
+        // than MAX_SCRATCHPAD_SIZE but truncated by CRC.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u64.to_le_bytes()); // parquet_footer_offset
+        buf.extend_from_slice(&0u32.to_le_bytes()); // parquet_footer_length
+        buf.extend_from_slice(&0u32.to_le_bytes()); // row_group_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // unused_bytes
+        buf.extend_from_slice(&0u64.to_le_bytes()); // prev_parquet_meta_file_size
+        buf.extend_from_slice(&crate::types::FooterFeatureFlags::SCRATCHPAD_BIT.to_le_bytes());
+        // Scratchpad: count=1, code=0, length=MAX_SCRATCHPAD_SIZE, content=MAX_SCRATCHPAD_SIZE bytes
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&(MAX_SCRATCHPAD_SIZE as u32).to_le_bytes());
+        buf.extend(std::iter::repeat_n(0u8, MAX_SCRATCHPAD_SIZE));
+        buf.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
+        let footer_len = buf.len() as u32;
+        buf.extend_from_slice(&footer_len.to_le_bytes());
+
+        // Payload size = 4 (count) + 8 (header) + MAX = MAX + 12 > MAX, rejected.
+        let err = match Footer::new(&buf, footer_len, 0) {
+            Err(e) => e,
+            Ok(_) => panic!("expected MAX_SCRATCHPAD_SIZE rejection"),
+        };
+        assert_eq!(err.kind, ParquetMetaErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn scratchpad_coexists_with_seq_txn_and_bloom() {
+        let mut fb = FooterBuilder::new(0, 0);
+        fb.add_row_group_offset(0).unwrap();
+        fb.set_bloom_filter_section(vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        fb.set_seq_txn(SeqTxn::new(7));
+        fb.set_scratchpad_entries(vec![(42, vec![0xEE, 0xFF])]);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let footer = parse_footer_with_bloom(&buf, start, 4);
+        assert!(footer.feature_flags().has_seq_txn());
+        assert!(footer.feature_flags().has_scratchpad());
+
+        // Layout: row_group_entries(4) → bloom(4) → seq_txn(8) → scratchpad(...) → CRC.
+        let entries_end = FOOTER_FIXED_SIZE + ROW_GROUP_ENTRY_SIZE;
+        assert_eq!(
+            &buf[start + entries_end..start + entries_end + 4],
+            &[0xAA, 0xBB, 0xCC, 0xDD]
+        );
+        let bloom_end = start + footer.bloom_section_end();
+        assert_eq!(&buf[bloom_end..bloom_end + 8], &7i64.to_le_bytes());
+
+        let scratchpad_start = bloom_end + 8;
+        // entry_count = 1
+        assert_eq!(
+            u32::from_le_bytes(
+                buf[scratchpad_start..scratchpad_start + 4]
+                    .try_into()
+                    .unwrap()
+            ),
+            1
+        );
+        // code = 42
+        assert_eq!(
+            u32::from_le_bytes(
+                buf[scratchpad_start + 4..scratchpad_start + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            42
+        );
+        // length = 2
+        assert_eq!(
+            u32::from_le_bytes(
+                buf[scratchpad_start + 8..scratchpad_start + 12]
+                    .try_into()
+                    .unwrap()
+            ),
+            2
+        );
+        assert_eq!(
+            &buf[scratchpad_start + 12..scratchpad_start + 14],
+            &[0xEE, 0xFF]
+        );
+        assert_eq!(scratchpad_start + 14, start + footer.crc_offset());
+
+        assert_eq!(footer.scratchpad_entry(42), Some(&[0xEE, 0xFF][..]));
+        assert_eq!(footer.seq_txn(), Some(SeqTxn::new(7)));
+    }
+
+    #[test]
+    fn scratchpad_lookup_returns_first_match() {
+        let mut fb = FooterBuilder::new(0, 0);
+        fb.set_scratchpad_entries(vec![(7, vec![0x11]), (7, vec![0x22])]);
+        let mut buf = Vec::new();
+        let start = fb.write_to(&mut buf);
+
+        let footer = parse_footer(&buf, start);
+        assert_eq!(footer.scratchpad_entry(7), Some(&[0x11][..]));
     }
 
     #[test]
