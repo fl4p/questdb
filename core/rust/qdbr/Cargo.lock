@@ -1360,6 +1360,8 @@ dependencies = [
  "crc32fast",
  "parquet2",
  "qdb-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1387,7 +1389,6 @@ dependencies = [
  "rayon",
  "seq-macro",
  "serde",
- "serde_json",
  "tempfile",
  "zstd",
 ]

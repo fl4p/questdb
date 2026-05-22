@@ -857,7 +857,7 @@ mod tests {
     fn build_matched_parquet_meta(row_count: usize) -> ParquetResult<(Vec<u8>, Vec<u8>, u64)> {
         use crate::parquet::qdb_metadata::QdbMeta;
         use crate::parquet::tests::ColumnTypeTagExt;
-        use crate::parquet_metadata::convert::convert_from_parquet;
+        use crate::parquet_metadata::convert::{convert_from_parquet, NoBloomFilterSource};
         use crate::parquet_write::file::ParquetWriter;
         use crate::parquet_write::schema::{Column, ParquetEncodingConfig, Partition};
         use parquet2::compression::CompressionOptions;
@@ -909,8 +909,14 @@ mod tests {
             })
             .map(|j| QdbMeta::deserialize(j).unwrap());
 
-        let (parquet_meta_bytes, parquet_meta_file_size) =
-            convert_from_parquet(&metadata, qdb_meta.as_ref(), 0, 0, None)?;
+        let (parquet_meta_bytes, parquet_meta_file_size) = convert_from_parquet(
+            &metadata,
+            qdb_meta.as_ref(),
+            0,
+            0,
+            &NoBloomFilterSource,
+            None,
+        )?;
 
         Ok((parquet_buf, parquet_meta_bytes, parquet_meta_file_size))
     }
