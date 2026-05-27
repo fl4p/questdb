@@ -3040,6 +3040,13 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         }
     }
 
+    public void safeDeletePartitionDir(long timestamp, long partitionNameTxn) {
+        // Call O3 methods to remove check TxnScoreboard and remove partition directly
+        partitionRemoveCandidates.clear();
+        partitionRemoveCandidates.add(timestamp, partitionNameTxn);
+        processPartitionRemoveCandidates();
+    }
+
     @Override
     public void setColumnParquetEncoding(CharSequence columnName, int parquetEncodingConfig) {
         checkDistressed();
@@ -11585,13 +11592,6 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             throwDistressException(e2);
         }
         throw e;
-    }
-
-    private void safeDeletePartitionDir(long timestamp, long partitionNameTxn) {
-        // Call O3 methods to remove check TxnScoreboard and remove partition directly
-        partitionRemoveCandidates.clear();
-        partitionRemoveCandidates.add(timestamp, partitionNameTxn);
-        processPartitionRemoveCandidates();
     }
 
     private void scaleSymbolCapacities() {
