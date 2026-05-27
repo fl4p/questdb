@@ -84,7 +84,6 @@ fn make_pm_bytes(parquet_bytes: &[u8]) -> Vec<u8> {
         footer_length,
         &NoBloomFilterSource,
         None,
-        None,
     )
     .expect("convert_from_parquet");
     pm_bytes
