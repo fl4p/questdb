@@ -453,6 +453,12 @@ impl<'a> ParquetMetaUpdateWriter<'a> {
         self
     }
 
+    /// Explicit opt-in to keep `prior_seq_txn` unchanged on `finish()`.
+    pub fn inherit_seq_txn(&mut self) -> &mut Self {
+        self.seq_txn = self.prior_seq_txn;
+        self
+    }
+
     /// Replaces the scratchpad on the new footer. Empty `Vec` clears it.
     /// Skipping the setter silently inherits the prior footer's scratchpad.
     pub fn set_scratchpad_entries(&mut self, entries: Vec<(u32, Vec<u8>)>) -> &mut Self {
@@ -663,7 +669,7 @@ impl<'a> ParquetMetaUpdateWriter<'a> {
             None => {
                 debug_assert!(
                     self.prior_seq_txn.is_none(),
-                    "ParquetMetaUpdateWriter.finish: seq_txn not set but prior footer had SEQ_TXN_BIT={:?}; production paths must call .seq_txn(...) on every append",
+                    "ParquetMetaUpdateWriter.finish: seq_txn not set but prior footer had SEQ_TXN_BIT={:?}; production paths must call .seq_txn(new) to refresh it or .inherit_seq_txn() to keep the prior value",
                     self.prior_seq_txn
                 );
                 self.prior_seq_txn.unwrap_or(SeqTxn::UNSET)
@@ -1083,6 +1089,54 @@ mod tests {
         rg.set_num_rows(7);
         updater.add_row_group(rg);
         let _ = updater.finish();
+    }
+
+    #[test]
+    fn update_writer_inherits_seq_txn_when_opt_in_set() {
+        // Callers that legitimately keep the prior seq_txn (e.g. a
+        // scratchpad-only patch) call .inherit_seq_txn() to silence
+        // the debug_assert while still landing the prior value on the
+        // new footer.
+        let (original, existing_size) = make_file_with_seq_txn(SeqTxn::new(11));
+
+        let mut updater = ParquetMetaUpdateWriter::new(&original, existing_size).unwrap();
+        updater.inherit_seq_txn();
+        let mut rg = RowGroupBlockBuilder::new(1);
+        rg.set_num_rows(7);
+        updater.add_row_group(rg);
+        let (append_bytes, new_size) = updater.finish().unwrap();
+
+        let mut full = original.clone();
+        full.extend_from_slice(&append_bytes);
+        full[super::HEADER_PARQUET_META_FILE_SIZE_OFF
+            ..super::HEADER_PARQUET_META_FILE_SIZE_OFF + 8]
+            .copy_from_slice(&new_size.to_le_bytes());
+
+        let reader = ParquetMetaReader::from_file_size(&full, new_size).unwrap();
+        assert_eq!(reader.seq_txn(), Some(SeqTxn::new(11)));
+    }
+
+    #[test]
+    fn update_writer_inherit_seq_txn_on_empty_prior_lands_unset() {
+        // No prior seq_txn -> inherit opt-in is a no-op; the new
+        // footer omits the seq_txn section just as it would without
+        // the opt-in.
+        let (original, existing_size) = make_simple_file();
+        let mut updater = ParquetMetaUpdateWriter::new(&original, existing_size).unwrap();
+        updater.inherit_seq_txn();
+        let mut rg = RowGroupBlockBuilder::new(1);
+        rg.set_num_rows(7);
+        updater.add_row_group(rg);
+        let (append_bytes, new_size) = updater.finish().unwrap();
+
+        let mut full = original.clone();
+        full.extend_from_slice(&append_bytes);
+        full[super::HEADER_PARQUET_META_FILE_SIZE_OFF
+            ..super::HEADER_PARQUET_META_FILE_SIZE_OFF + 8]
+            .copy_from_slice(&new_size.to_le_bytes());
+
+        let reader = ParquetMetaReader::from_file_size(&full, new_size).unwrap();
+        assert_eq!(reader.seq_txn(), None);
     }
 
     fn make_file_with_scratchpad(entries: Vec<(u32, Vec<u8>)>) -> (Vec<u8>, u64) {

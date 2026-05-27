@@ -57,6 +57,8 @@ public class CairoException extends RuntimeException implements Sinkable, Flywei
     public static final int VIEW_DOES_NOT_EXIST = TABLE_DOES_NOT_EXIST - 1;
     public static final int MAT_VIEW_DOES_NOT_EXIST = VIEW_DOES_NOT_EXIST - 1;
     public static final int TXN_BLOCK_APPLY_FAILED = MAT_VIEW_DOES_NOT_EXIST - 1;
+    public static final int COLD_BUCKET_MUTATED = TXN_BLOCK_APPLY_FAILED - 1;
+    public static final int COLD_SNAPSHOT_ID_MISSING = COLD_BUCKET_MUTATED - 1;
     public static final int NON_CRITICAL = -1;
     private static final StackTraceElement[] EMPTY_STACK_TRACE = {};
     private static final ThreadLocal<CairoException> tlException = new ThreadLocal<>(CairoException::new);

@@ -26,10 +26,10 @@ pub use convert::{
     BloomFilterSource, NoBloomFilterSource, ParquetMetaColumnInfo, SliceBloomFilterSource,
     SortingCol, TsStatsBackfill,
 };
-pub use infer::infer_column_type;
 pub use error::{ParquetMetaError, ParquetMetaErrorKind, ParquetMetaResult};
 pub use footer::{Footer, FooterBuilder};
 pub use header::{ColumnDescriptorRaw, FileHeader, FileHeaderBuilder};
+pub use infer::infer_column_type;
 pub use qdb_meta::{
     extract_qdb_meta, ParquetFieldId, QdbMeta, QdbMetaCol, QdbMetaColFormat, QdbMetaSchema,
     QdbMetaV1, QDB_META_KEY,

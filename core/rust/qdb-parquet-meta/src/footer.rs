@@ -937,7 +937,7 @@ mod tests {
         buf.extend_from_slice(&0u64.to_le_bytes()); // prev_parquet_meta_file_size
         buf.extend_from_slice(&crate::types::FooterFeatureFlags::SCRATCHPAD_BIT.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes()); // entry_count = 1
-        // No entry header bytes follow; CRC sits right here.
+                                                    // No entry header bytes follow; CRC sits right here.
         buf.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder
         let footer_len = buf.len() as u32;
         buf.extend_from_slice(&footer_len.to_le_bytes());

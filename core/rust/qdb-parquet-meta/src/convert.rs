@@ -50,7 +50,9 @@ use crate::infer::infer_column_type;
 use crate::parquet_meta_err;
 use crate::qdb_meta::{QdbMeta, QdbMetaColFormat};
 use crate::row_group::RowGroupBlockBuilder;
-use crate::types::{encode_stat_sizes, Codec, ColumnFlags, EncodingMask, FieldRepetition, SeqTxn, StatFlags};
+use crate::types::{
+    encode_stat_sizes, Codec, ColumnFlags, EncodingMask, FieldRepetition, SeqTxn, StatFlags,
+};
 use crate::writer::ParquetMetaWriter;
 
 /// Column descriptor needed to build a `_pm` header. Callers build this from a
@@ -344,8 +346,8 @@ pub fn convert_from_parquet(
             infer_column_type(col_desc).map(|t| t.code()).unwrap_or(-1)
         };
 
-        let mut flags = ColumnFlags::new()
-            .with_repetition(FieldRepetition::from(field_info.repetition));
+        let mut flags =
+            ColumnFlags::new().with_repetition(FieldRepetition::from(field_info.repetition));
 
         if let Some(meta) = qdb_meta {
             let col_meta = &meta.schema[i];
@@ -433,8 +435,7 @@ pub fn convert_from_parquet(
                         if !has_min_inlined || !has_max_inlined {
                             let num_values = chunk.raw.num_values as usize;
                             let min_ts = backfill(rg_idx, 0, 1)?;
-                            let max_ts =
-                                backfill(rg_idx, num_values - 1, num_values)?;
+                            let max_ts = backfill(rg_idx, num_values - 1, num_values)?;
                             chunk.raw.min_stat = min_ts as u64;
                             chunk.raw.max_stat = max_ts as u64;
                             chunk.raw.stat_flags =
@@ -574,7 +575,11 @@ pub(crate) fn build_column_chunk(meta: &ColumnMetaData) -> ParquetMetaResult<Bui
 
     let (ool_min, ool_max) = apply_thrift_stats(&mut raw, meta.statistics.as_ref());
 
-    Ok(BuiltChunk { raw, ool_min, ool_max })
+    Ok(BuiltChunk {
+        raw,
+        ool_min,
+        ool_max,
+    })
 }
 
 /// Inserts a built column chunk into a row-group builder, appends any
@@ -683,4 +688,3 @@ fn apply_thrift_stats(
 
     (ool_min, ool_max)
 }
-
