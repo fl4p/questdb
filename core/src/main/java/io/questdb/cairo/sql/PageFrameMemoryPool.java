@@ -65,8 +65,6 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
     private final IntIntHashMap columnIdToParquetIdx;
     private final PageFrameMemoryImpl frameMemory;
     private final ObjList<ParquetBuffers> freeParquetBuffers;
-    // Contains parquet to query column index mapping.
-    private final IntList fromParquetColumnIndexes;
     private final ParquetFileDecoder legacyDecoder;
     private final int parquetCacheSize;
     // Contains [parquet_column_index, column_type] pairs.
@@ -97,7 +95,6 @@ public class PageFrameMemoryPool implements RecordRandomAccess, QuietCloseable, 
             parquetColumns = new DirectIntList(32, MemoryTag.NATIVE_DEFAULT, true);
             parquetMetaDecoder = ParquetPartitionDecoder.newInstance();
             parquetIdxToDecodeSlot = new IntIntHashMap(16);
-            parquetMetaDecoder = new ParquetPartitionDecoder();
             legacyDecoder = new ParquetFileDecoder();
         } catch (Throwable th) {
             close();
