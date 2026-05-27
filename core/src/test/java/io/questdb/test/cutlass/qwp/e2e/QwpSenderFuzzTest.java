@@ -65,15 +65,23 @@ import static io.questdb.cairo.ColumnType.*;
 
 public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
 
+    // QuestDB's base32 alphabet (matches io.questdb.cairo.GeoHashes#base32):
+    // skips 'a', 'i', 'l', 'o' versus straight 0-9a-z.
+    private static final char[] GEO_HASH_BASE32 = {
+            '0', '1', '2', '3', '4', '5', '6', '7',
+            '8', '9', 'b', 'c', 'd', 'e', 'f', 'g',
+            'h', 'j', 'k', 'm', 'n', 'p', 'q', 'r',
+            's', 't', 'u', 'v', 'w', 'x', 'y', 'z'
+    };
     // colNameBases / colTypes / colValueBases are partitioned: the first
     // LEGACY_COLUMN_COUNT entries are STRING/DOUBLE columns and participate
     // in the full skip / new-column-injection fuzz; the rest are typed
-    // columns (BYTE, SHORT, INT, FLOAT, CHAR, UUID, LONG256, TIMESTAMP_NANO)
-    // that are always set on every row and never auto-injected as extras.
-    // Reason: typed columns whose unset cells render differently from their
-    // type-default (e.g. BYTE 0 vs INT NULL) would clash with the oracle's
-    // single-default-per-column model once startAlterTableThread converts
-    // them across the integer family.
+    // columns (BYTE, SHORT, INT, FLOAT, CHAR, UUID, LONG256, TIMESTAMP_NANO,
+    // GEOHASH at four precisions) that are always set on every row and never
+    // auto-injected as extras. Reason: typed columns whose unset cells render
+    // differently from their type-default (e.g. BYTE 0 vs INT NULL) would
+    // clash with the oracle's single-default-per-column model once
+    // startAlterTableThread converts them across the integer family.
     private static final int LEGACY_COLUMN_COUNT = 6;
     private static final Log LOG = LogFactory.getLog(QwpSenderFuzzTest.class);
     private static final int MAX_NUM_OF_SKIPPED_COLS = 2;
@@ -96,23 +104,35 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
             {"flag_c", "FLAG_C", "Flag_C"},
             {"sensor_id_u", "SENSOR_ID_U", "Sensor_Id_U"},
             {"token_l256", "TOKEN_L256", "Token_L256"},
-            {"event_at_ns", "EVENT_AT_NS", "Event_At_Ns"}
+            {"event_at_ns", "EVENT_AT_NS", "Event_At_Ns"},
+            {"loc_g5", "LOC_G5", "Loc_G5"},
+            {"loc_g15", "LOC_G15", "Loc_G15"},
+            {"loc_g20", "LOC_G20", "Loc_G20"},
+            {"loc_g35", "LOC_G35", "Loc_G35"},
+            {"payload_bin", "PAYLOAD_BIN", "Payload_Bin"}
     };
     // New non-string/non-double types added to fuzz native wire-type emission
     // through the QWP sender. Their addColumnValue cases yield exactly the
     // text representation that CursorPrinter writes for each type so the
     // TableData oracle's two-pass assertion matches.
     // int[] (not short[]) because TIMESTAMP_NANO is an int sentinel
-    // (1 << 18 | TIMESTAMP) outside the short range.
+    // (1 << 18 | TIMESTAMP) outside the short range. GEOBYTE/GEOSHORT/GEOINT/
+    // GEOLONG act as storage-class discriminants; addColumnValue maps each to
+    // a fixed precision (5b / 15b / 20b / 35b — all multiples of 5 so the
+    // cursor renders bare base32, matching the yielded string verbatim).
     private final int[] colTypes = new int[]{STRING, DOUBLE, DOUBLE, DOUBLE, STRING, DOUBLE,
-            BYTE, SHORT, INT, FLOAT, CHAR, UUID, LONG256, TIMESTAMP_NANO};
+            BYTE, SHORT, INT, FLOAT, CHAR, UUID, LONG256, TIMESTAMP_NANO,
+            GEOBYTE, GEOSHORT, GEOINT, GEOLONG, BINARY};
     // Integer-family value bases (indices 6..9, for BYTE/SHORT/INT/FLOAT) are
     // capped so the *10 + d arithmetic stays within byte range. When the
     // alter-table thread narrows a column across the integer family (e.g.
     // INT -> BYTE), each previously-written value casts losslessly and the
     // oracle's stored yield still matches what the cursor renders.
+    // GEOHASH value bases are unused; the geohash cases generate random base32
+    // strings independent of valueBase.
     private final String[] colValueBases = new String[]{"europe", "8", "2", "1", "note", "6",
-            "5", "9", "11", "7", "M", "u", "l", "1700000000000000000"};
+            "5", "9", "11", "7", "M", "u", "l", "1700000000000000000",
+            "", "", "", "", ""};
     private final char[] nonAsciiChars = {'ó', 'í', 'Á', 'ч', 'Ъ', 'Ж', 'ю', 0x3000, 0x3080, 0x3a55};
     private final String[][] symbolNameBases = new String[][]{
             {"location", "Location", "LOCATION", "loCATion", "LocATioN"},
@@ -138,6 +158,7 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
     private volatile String errorMsg = null;
     private boolean exerciseSymbols = true;
     private int forceRecvFragmentationChunkSize = Integer.MAX_VALUE;
+    private int forceSendFragmentationChunkSize = Integer.MAX_VALUE;
     private int newColumnFactor = -1;
     private int nonAsciiValueFactor = -1;
     private int numOfIterations;
@@ -160,16 +181,22 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
     public void setUp() {
         super.setUp();
         random = TestUtils.generateRandom(LOG);
-        forceRecvFragmentationChunkSize = 10 + random.nextInt(Math.min(512, recvBufferSize) - 10);
+        forceRecvFragmentationChunkSize = 1 + random.nextInt(recvBufferSize);
+        // Matches DefaultIODispatcherConfiguration.getSendBufferSize(), the server
+        // default used here because runInContext does not override it.
+        int sendBufferSize = 131_072;
+        forceSendFragmentationChunkSize = 1 + random.nextInt(sendBufferSize);
         LOG.info().$("fragmentation params [recvBufferSize=").$(recvBufferSize)
+                .$(", sendBufferSize=").$(sendBufferSize)
                 .$(", forceRecvFragmentationChunkSize=").$(forceRecvFragmentationChunkSize)
+                .$(", forceSendFragmentationChunkSize=").$(forceSendFragmentationChunkSize)
                 .I$();
     }
 
     @Test
     public void testAddColumns() throws Exception {
         initLoadParameters(15 + random.nextInt(100), 5 + random.nextInt(5),
-                2 + random.nextInt(Os.isWindows() ? 5 : 20), 1 + random.nextInt(4),
+                2 + random.nextInt(Os.isLinux() ? 8 : 3), 1 + random.nextInt(4),
                 random.nextInt(75));
         initFuzzParameters(-1, 1, 1 + random.nextInt(3), 6, false, true, false, 0.1);
         runTest();
@@ -191,49 +218,49 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
 
     @Test
     public void testAllMixed() throws Exception {
-        initLoadParameters(50, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(50, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(3, 4, 5, 10, 5, true, true, true, 0.05);
         runTest();
     }
 
     @Test
     public void testAllMixedNoSymbols() throws Exception {
-        initLoadParameters(50, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(50, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(3, 4, 5, 10, 5, true, false, true, 0.05);
         runTest();
     }
 
     @Test
     public void testAllMixedSingleTable() throws Exception {
-        initLoadParameters(50, Os.isWindows() ? 3 : 5, 5, 1, 50);
+        initLoadParameters(50, Os.isLinux() ? 5 : 3, 5, 1, 50);
         initFuzzParameters(3, 4, 5, 10, 5, true, true, true, 0.05);
         runTest();
     }
 
     @Test
     public void testAllMixedSplitPart() throws Exception {
-        initLoadParameters(50, Os.isWindows() ? 3 : 5, 5, 1, 50);
+        initLoadParameters(50, Os.isLinux() ? 5 : 3, 5, 1, 50);
         initFuzzParameters(-1, -1, -1, 10, -1, false, true, false, 0.05);
         runTest();
     }
 
     @Test
     public void testCaseVariationReorderingColumns() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, -1, 2, -1, true, true, false);
         runTest();
     }
 
     @Test
     public void testCaseVariationReorderingColumnsNoSymbols() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, -1, -1, -1, true, false, false);
         runTest();
     }
 
     @Test
     public void testCaseVariationReorderingColumnsSendSymbolsWithSpace() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, -1, 3, -1, true, true, true);
         // Same wide-batch-vs-default-recv-buffer issue as testLoadSendSymbolsWithSpace.
         clientAutoFlushRows = 5;
@@ -242,47 +269,47 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
 
     @Test
     public void testDuplicatesReorderingColumns() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, 4, -1, -1, -1, true, true, false, 0.05);
         runTest();
     }
 
     @Test
     public void testDuplicatesReorderingColumnsNoSymbols() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, 4, -1, -1, -1, true, false, false, 0.05);
         runTest();
     }
 
     @Test
     public void testDuplicatesReorderingColumnsSendSymbolsWithSpace() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, 4, -1, -1, -1, true, true, true, 0.05);
         runTest();
     }
 
     @Test
     public void testLoad() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 7, 12, 20);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 7, 12, 20);
         runTest();
     }
 
     @Test
     public void testLoadLargePayload() throws Exception {
-        initLoadParameters(500, Os.isWindows() ? 3 : 5, 5, 5, 10);
+        initLoadParameters(500, Os.isLinux() ? 5 : 3, 5, 5, 10);
         runTest();
     }
 
     @Test
     public void testLoadNoSymbols() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 7, 12, 20);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 7, 12, 20);
         initFuzzParameters(-1, -1, -1, 5, true, false, false, 0.05);
         runTest();
     }
 
     @Test
     public void testLoadSendSymbolsWithSpace() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 4, 8, 20);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 4, 8, 20);
         initFuzzParameters(-1, -1, 2, -1, false, true, true);
         // Frequent new-column injection (newColumnFactor=2) plus 8
         // interleaved tables and symbols with embedded spaces inflates
@@ -301,34 +328,34 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
         // interleaved per batch and full schema headers, ~3 rows yields
         // a wire frame around 1KB, comfortably under 2048.
         clientAutoFlushRows = 3;
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 20);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 20);
         runTest();
     }
 
     @Test
     public void testNonAsciiValues() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(-1, -1, 3, 4, false, true, false);
         runTest();
     }
 
     @Test
     public void testNonAsciiValuesNoSymbols() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(-1, -1, -1, 4, false, false, false);
         runTest();
     }
 
     @Test
     public void testReorderingColumns() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, -1, -1, 8, false, true, true, 0.05);
         runTest();
     }
 
     @Test
     public void testReorderingColumnsNoSymbols() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, -1, -1, -1, true, false, false, 0.05);
         runTest();
     }
@@ -336,7 +363,7 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
     @Test
     public void testReorderingManyThreads() throws Exception {
         initLoadParameters(15 + random.nextInt(100), 5 + random.nextInt(5),
-                2 + random.nextInt(Os.isWindows() ? 5 : 20), 1 + random.nextInt(4),
+                2 + random.nextInt(Os.isLinux() ? 8 : 3), 1 + random.nextInt(4),
                 random.nextInt(75));
         initFuzzParameters(3, -1, 1 + random.nextInt(3), -1, false, true, false);
         runTest();
@@ -344,35 +371,35 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
 
     @Test
     public void testReorderingNonAscii() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, -1, 2, 4, false, true, false);
         runTest();
     }
 
     @Test
     public void testReorderingSkipColumnsWithNonAscii() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, 4, 2, 4, true, true, false);
         runTest();
     }
 
     @Test
     public void testReorderingSkipColumnsWithNonAsciiNoSymbols() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, 4, -1, 4, true, false, false);
         runTest();
     }
 
     @Test
     public void testReorderingSkipDuplicateColumnsWithNonAscii() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, 4, 4, -1, 4, true, true, false, 0.05);
         runTest();
     }
 
     @Test
     public void testReorderingSkipDuplicateColumnsWithNonAsciiNoSymbols() throws Exception {
-        initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
+        initLoadParameters(100, Os.isLinux() ? 5 : 3, 5, 5, 50);
         initFuzzParameters(4, 4, 4, -1, 4, true, false, false, 0.05);
         runTest();
     }
@@ -498,6 +525,11 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
                 NanosFormatUtils.appendDateTimeNSec(sink, nanos);
                 yield sink.toString();
             }
+            case GEOBYTE -> randomGeoHash(sender, colName, 1, rnd);   // GEOHASH(5b)
+            case GEOSHORT -> randomGeoHash(sender, colName, 3, rnd);  // GEOHASH(15b)
+            case GEOINT -> randomGeoHash(sender, colName, 4, rnd);    // GEOHASH(20b)
+            case GEOLONG -> randomGeoHash(sender, colName, 7, rnd);   // GEOHASH(35b)
+            case BINARY -> randomBinaryOneByte(sender, colName, rnd);
             default -> {
                 sender.stringColumn(colName, valueBase);
                 yield valueBase;
@@ -716,6 +748,37 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
         return tableName + rnd.nextInt(numOfTables);
     }
 
+    /**
+     * Emit a BINARY column with a random 1-byte payload and yield the exact
+     * text that {@code CursorPrinter} -> {@code Chars.toSink(BinarySequence,...)}
+     * produces for that payload: an 8-digit hex offset, a space, then the
+     * lowercase hex of the byte. Single-byte payloads keep the render to one
+     * line; multi-byte payloads would need to reproduce the 16-byte wrap rule.
+     */
+    private String randomBinaryOneByte(QwpWebSocketSender sender, CharSequence colName, Rnd rnd) {
+        byte b = (byte) rnd.nextInt(256);
+        sender.binaryColumn(colName, new byte[]{b});
+        char[] hex = io.questdb.std.Numbers.hexDigits;
+        int v = b & 0xFF;
+        return "00000000 " + hex[v >>> 4] + hex[v & 0xF];
+    }
+
+    /**
+     * Emit a GEOHASH column from a random {@code chars}-char base32 string and
+     * yield the same string back. With precisions that are multiples of 5
+     * CursorPrinter renders the stored value as bare base32 (no '#' prefix),
+     * so the yield matches what the oracle reads back verbatim.
+     */
+    private String randomGeoHash(QwpWebSocketSender sender, CharSequence colName, int chars, Rnd rnd) {
+        char[] buf = new char[chars];
+        for (int i = 0; i < chars; i++) {
+            buf[i] = GEO_HASH_BASE32[rnd.nextInt(GEO_HASH_BASE32.length)];
+        }
+        String hash = new String(buf);
+        sender.geoHashColumn(colName, hash);
+        return hash;
+    }
+
     private void runTest() throws Exception {
 
         Assert.assertEquals(0, tables.size());
@@ -752,7 +815,7 @@ public class QwpSenderFuzzTest extends AbstractQwpWebSocketTest {
                     assertTable(table, tableName);
                 }
             }
-        }, recvBufferSize, forceRecvFragmentationChunkSize);
+        }, recvBufferSize, forceRecvFragmentationChunkSize, forceSendFragmentationChunkSize);
 
         if (errorMsg != null) {
             Assert.fail(errorMsg);

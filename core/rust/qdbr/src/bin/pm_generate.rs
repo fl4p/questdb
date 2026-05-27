@@ -89,6 +89,7 @@ fn generate(
         footer_length,
         &bloom_source,
         None,
+        None,
     )
     .map_err(|e| format!("failed to convert: {}", e))?;
 

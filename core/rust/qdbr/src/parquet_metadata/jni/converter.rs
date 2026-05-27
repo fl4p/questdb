@@ -195,7 +195,7 @@ fn generate_parquet_meta(
 
 /// Decode a single i64 timestamp value from a parquet column chunk using
 /// `FileMetaData`. Mirrors `decode_single_ts_from_pm` but reads from parquet
-/// metadata directly, so it is callable from Mig940 before any `_pm` exists.
+/// metadata directly, so it is callable from Mig941 before any `_pm` exists.
 pub(crate) fn decode_single_ts_value_from_parquet(
     allocator: *const QdbAllocator,
     file_data: &[u8],
