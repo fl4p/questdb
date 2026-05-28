@@ -872,6 +872,8 @@ impl ParquetUpdater {
             meta
         };
 
+        qdb_meta.seq_txn = self.seq_txn.get();
+
         // Emit the VARCHAR column-level ascii flag from the tracker built
         // during writes. Each tracker entry started life as `true` for an
         // old column whose old.ascii was Some(true) or for a fresh ADD

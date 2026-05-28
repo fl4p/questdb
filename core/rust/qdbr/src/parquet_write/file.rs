@@ -83,8 +83,8 @@ pub struct ParquetWriter<W: Write> {
     min_compression_ratio: f64,
     /// Partition squash tracker value to embed in QdbMeta footer (-1 = not set)
     squash_tracker: i64,
-    /// Apply-time `seqTxn` embedded in QdbMeta and as the `questdb.seqtxn`
-    /// parquet footer KV (-1 = not set).
+    /// Apply-time `seqTxn` embedded in the `questdb` parquet footer KV's
+    /// QdbMeta blob (-1 = not set). There is no separate `questdb.seqtxn` KV.
     seq_txn: i64,
 }
 
