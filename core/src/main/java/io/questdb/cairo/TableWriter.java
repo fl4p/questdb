@@ -2461,6 +2461,14 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         return symbolMapWriters.getQuick(columnIndex).isCached();
     }
 
+    public void linkPartitionIndexFiles(long partitionTimestamp, long oldPartitionNameTxn, long newPartitionNameTxn) {
+        setPathForNativePartition(path.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, oldPartitionNameTxn);
+        final int partitionDirLen = path.size();
+        setPathForNativePartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, newPartitionNameTxn);
+        final int newPartitionDirLen = other.size();
+        linkPartitionIndexFiles(partitionTimestamp, partitionDirLen, newPartitionDirLen);
+    }
+
     public void markDistressed() {
         this.distressed = true;
     }
