@@ -608,6 +608,9 @@ pub fn to_compressions(partition: &Partition) -> Vec<Option<CompressionOptions>>
 /// - Bits 16-23: compression level
 /// - Bit 24: explicit flag (1 = user-specified override, 0 = use defaults)
 /// - Bit 25: bloom filter flag (1 = column should have a bloom filter)
+/// - Bits 26-31: lossy float rounding — mantissa bits to keep (0 = no rounding).
+///   Read independently of the explicit flag so lossy precision composes with
+///   default encoding/compression. Only meaningful for FLOAT/DOUBLE columns.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ParquetEncodingConfig(i32);
 
@@ -617,6 +620,8 @@ const COMPRESSION_MASK: u32 = 0xFF;
 const LEVEL_SHIFT: u32 = 16;
 const LEVEL_MASK: u32 = 0xFF;
 const EXPLICIT_FLAG: u32 = 1 << 24;
+const LOSSY_KEEP_BITS_SHIFT: u32 = 26;
+const LOSSY_KEEP_BITS_MASK: u32 = 0x3F;
 
 impl ParquetEncodingConfig {
     /// Create a config from the raw packed i32 received from JNI.
@@ -646,6 +651,26 @@ impl ParquetEncodingConfig {
     /// Whether the config was explicitly set by the user.
     pub fn is_explicit(self) -> bool {
         (self.0 as u32 & EXPLICIT_FLAG) != 0
+    }
+
+    /// Number of mantissa bits to keep for lossy float rounding (Tier A), or
+    /// None when rounding is disabled. Read independently of the explicit flag,
+    /// so lossy precision composes with default encoding and compression. The
+    /// caller applies this only to FLOAT/DOUBLE columns; other types ignore it.
+    pub fn lossy_keep_bits(self) -> Option<u32> {
+        let keep = (self.0 as u32 >> LOSSY_KEEP_BITS_SHIFT) & LOSSY_KEEP_BITS_MASK;
+        if keep == 0 {
+            None
+        } else {
+            Some(keep)
+        }
+    }
+
+    /// Pack lossy keep-bits into an existing config. Test-only helper.
+    #[cfg(test)]
+    pub fn with_lossy_keep_bits(self, keep: u32) -> Self {
+        let cleared = self.0 as u32 & !(LOSSY_KEEP_BITS_MASK << LOSSY_KEEP_BITS_SHIFT);
+        Self((cleared | ((keep & LOSSY_KEEP_BITS_MASK) << LOSSY_KEEP_BITS_SHIFT)) as i32)
     }
 
     /// Extract per-column encoding override.

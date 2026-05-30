@@ -2,12 +2,15 @@ use num_traits::AsPrimitive;
 use qdb_core::col_type::nulls;
 
 pub mod array;
+#[cfg(test)]
+mod bench_codecs;
 pub(crate) mod decimal;
 pub(crate) mod encode;
 pub(crate) mod encoders;
 pub(crate) mod file;
 pub use file::ParquetWriter;
 mod jni;
+pub(crate) mod lossy;
 pub mod schema;
 pub mod simd;
 mod update;
@@ -1115,6 +1118,78 @@ mod tests {
             }
         }
         assert_eq!(idx, 1000, "expected 1000 rows back");
+    }
+
+    #[test]
+    fn test_lossy_rounding_double_roundtrip() {
+        // A Double column configured with lossy keep-bits must come back rounded:
+        // every decoded value equals round_f64(original, keep) exactly, and the
+        // relative error stays within the 2^-(keep+1) bound. Encoding is
+        // BYTE_STREAM_SPLIT (the intended lossy pairing); compression left default.
+        let keep = 10u32;
+        let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+        let col_data: Vec<f64> = (0..1000).map(|i| (i as f64) * 0.1 + 1.0).collect();
+        // encoding=5 (byte_stream_split), compression=0 (default), plus keep-bits.
+        let config = schema::ParquetEncodingConfig::new(5, 0, -1)
+            .with_lossy_keep_bits(keep)
+            .raw();
+
+        let col = Column::from_raw_data(
+            0,
+            "lossy_double",
+            ColumnTypeTag::Double.into_type().code(),
+            0,
+            1000,
+            col_data.as_ptr() as *const u8,
+            col_data.len() * size_of::<f64>(),
+            null(),
+            0,
+            null(),
+            0,
+            false,
+            false,
+            config,
+        )
+        .unwrap();
+
+        let partition = Partition { table: "t".to_string(), columns: vec![col] };
+        ParquetWriter::new(&mut buf)
+            .with_statistics(true)
+            .finish(partition)
+            .expect("parquet writer");
+
+        buf.set_position(0);
+        let bytes: Bytes = buf.into_inner().into();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("reader")
+            .with_batch_size(8192)
+            .build()
+            .expect("builder");
+
+        let bound = 2f64.powi(-(keep as i32 + 1)) * 1.000_001;
+        let mut idx = 0usize;
+        let mut any_changed = false;
+        for batch in reader.flatten() {
+            let arr = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("downcast");
+            for i in 0..arr.len() {
+                let original = idx as f64 * 0.1 + 1.0;
+                let expected = crate::parquet_write::lossy::round_f64(original, keep);
+                assert_eq!(arr.value(i), expected, "row {idx} not rounded as expected");
+                let rel = ((arr.value(i) - original) / original).abs();
+                assert!(rel <= bound, "row {idx} rel err {rel} exceeds {bound}");
+                if arr.value(i) != original {
+                    any_changed = true;
+                }
+                idx += 1;
+            }
+        }
+        assert_eq!(idx, 1000, "expected 1000 rows back");
+        assert!(any_changed, "rounding had no effect; wiring not applied");
     }
 
     /// Helper: pack RleDictionary encoding config (encoding=2, explicit flag set)

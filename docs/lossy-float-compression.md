@@ -285,12 +285,51 @@ Self-contained and useful on its own, independent of any lossy work:
 
 ### PR 2 — Tier A: mantissa bit-rounding
 
-- Add a lossy codec id + precision (kept-mantissa-bits or accepted rtol) to the
-  packed per-column config.
-- In the Rust encoder, apply the rounding pass to `Double`/`Float` columns before
-  encoding; the output remains a valid double, so the read path is untouched.
-- Pair with `BYTE_STREAM_SPLIT` + ZSTD from PR 1.
-- DDL `WITH (... LOSSY ...)` parsing.
+Engine mechanism (done):
+
+- Precision lives in the spare high bits (26-31) of the persisted per-column
+  `ParquetEncodingConfig` as "mantissa bits to keep" (0 = no rounding). Read via
+  `lossy_keep_bits()`, independent of the explicit flag, so lossy precision
+  composes with default encoding/compression. Additive and backward-compatible
+  (old configs have 0 in those bits).
+- `parquet_write::lossy` (`round_f64`/`round_f32`, byte-buffer variants) does
+  round-to-nearest-ties-to-even on the magnitude; NaN (the null sentinel),
+  infinity and signed zero pass through unchanged. Max relative error
+  `2^-(keep+1)`.
+- `encode_column_chunk` rounds `Float`/`Double` column data into owned buffers up
+  front when keep-bits are set, so every downstream path (definition levels,
+  statistics, value encoding) sees the reduced-precision data. The output is a
+  valid double, so the read path is untouched. Composes with `BYTE_STREAM_SPLIT`.
+- Tests: scalar and byte-buffer rounding (error bound, ties-to-even, dropped-bit
+  clearing, NaN/inf/zero); an end-to-end write-then-read (arrow) confirming
+  decoded values equal `round_f64(original, keep)` within the bound.
+
+Remaining (separate, not done): the SQL/DDL surface to set the precision — e.g.
+`WITH (col LOSSY <rtol|bits>)` on `CONVERT PARTITION TO PARQUET` and/or a
+`cairo.partition.encoder.parquet.*` default — plus the Java-side packing into the
+config word. Until then the keep-bits are only reachable from the Rust layer.
+
+### Codec choice (benchmark-driven)
+
+A benchmark over 1M f64 values (price-like random walk and noisy quantity-like
+series) through the real pipeline, release build, compared lz4_raw / zstd / gzip /
+brotli across rounding levels. Key findings:
+
+- Rounding, not the codec, unlocks compression. BYTE_STREAM_SPLIT alone reaches
+  only ~1.1-1.4x because mantissa bits are effectively random; once rounding
+  zeroes the low bytes, BSS lines them into runs and ratios jump (price-like at
+  keep=10 / ~5e-4 rtol: 16-31x; noisy qty-like: ~3-4x). Realized error stayed
+  under the `2^-(keep+1)` bound in every cell.
+- zstd is the recommended default: it encodes about as fast as lz4_raw, compresses
+  noticeably better, and decodes fastest of the real codecs (fewer bytes to read).
+- gzip gives the best ratio (5-20% smaller than zstd) but at a heavy one-time
+  encode cost; appropriate only for write-once/read-rarely archival.
+- lz4_raw gives up too much ratio; brotli costs more CPU than zstd for no size
+  win. Neither is worth surfacing as a lossy preset.
+
+Codec and precision stay orthogonal knobs (no auto-switching the codec when lossy
+is enabled). The default codec recommendation maps onto possible named presets
+later: `balanced` = zstd, `archive` = gzip.
 
 ### PR 3 — Tier B: mu-law companded narrow-int codec
 

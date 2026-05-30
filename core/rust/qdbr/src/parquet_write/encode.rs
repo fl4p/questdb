@@ -38,6 +38,7 @@ use crate::parquet_write::encoders::{
     delta_binary_packed, delta_length_array, plain, rle_dictionary, symbol,
 };
 use crate::parquet_write::file::WriteOptions;
+use crate::parquet_write::lossy;
 use crate::parquet_write::schema::Column;
 use crate::parquet_write::util::transmute_slice;
 use crate::parquet_write::{GeoByte, GeoInt, GeoLong, GeoShort, IPv4};
@@ -67,6 +68,45 @@ pub fn encode_column_chunk(
     }
 
     let column_tag = columns[0].data_type.tag();
+
+    // Tier A lossy rounding: when a FLOAT/DOUBLE column carries lossy keep-bits,
+    // round each value into an owned buffer up front so every downstream path
+    // (definition levels, statistics, value encoding) sees the reduced-precision
+    // data. round_*_bytes preserves NaN (the null sentinel) and signed zero, so
+    // null handling is unaffected.
+    let mut rounded_buffers: Vec<Vec<u8>> = Vec::new();
+    let mut rounded_columns: Vec<Column> = Vec::new();
+    let columns: &[Column] = match parquet_type {
+        ParquetType::PrimitiveType(pt)
+            if matches!(pt.physical_type, PhysicalType::Float | PhysicalType::Double) =>
+        {
+            match columns[0].parquet_encoding_config.lossy_keep_bits() {
+                Some(keep) => {
+                    let is_double = pt.physical_type == PhysicalType::Double;
+                    for c in columns {
+                        rounded_buffers.push(if is_double {
+                            lossy::round_f64_bytes(c.primary_data, keep)
+                        } else {
+                            lossy::round_f32_bytes(c.primary_data, keep)
+                        });
+                    }
+                    for (c, buf) in columns.iter().zip(rounded_buffers.iter()) {
+                        let mut nc = *c;
+                        // SAFETY: `buf` lives in `rounded_buffers` for the rest of
+                        // this function, which fully consumes `columns` before it
+                        // returns. This mirrors the 'static treatment of the JNI
+                        // buffers the original columns point into.
+                        nc.primary_data =
+                            unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+                        rounded_columns.push(nc);
+                    }
+                    &rounded_columns
+                }
+                None => columns,
+            }
+        }
+        _ => columns,
+    };
 
     match parquet_type {
         ParquetType::PrimitiveType(pt) => match pt.physical_type {
