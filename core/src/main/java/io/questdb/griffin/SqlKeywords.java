@@ -1282,6 +1282,15 @@ public class SqlKeywords {
                 && (tok.charAt(3) | 32) == 'k';
     }
 
+    public static boolean isLossyKeyword(CharSequence tok) {
+        return tok.length() == 5
+                && (tok.charAt(0) | 32) == 'l'
+                && (tok.charAt(1) | 32) == 'o'
+                && (tok.charAt(2) | 32) == 's'
+                && (tok.charAt(3) | 32) == 's'
+                && (tok.charAt(4) | 32) == 'y';
+    }
+
     public static boolean isManualKeyword(CharSequence tok) {
         return tok.length() == 6
                 && (tok.charAt(0) | 32) == 'm'

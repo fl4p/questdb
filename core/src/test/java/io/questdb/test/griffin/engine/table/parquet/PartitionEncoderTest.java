@@ -25,6 +25,9 @@
 package io.questdb.test.griffin.engine.table.parquet;
 
 import io.questdb.cairo.TableReader;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.engine.table.parquet.ParquetCompression;
 import io.questdb.griffin.engine.table.parquet.ParquetEncoding;
 import io.questdb.griffin.engine.table.parquet.ParquetVersion;
@@ -254,6 +257,59 @@ public class PartitionEncoderTest extends AbstractCairoTest {
                         ParquetEncoding.ENCODING_DELTA_BINARY_PACKED,
                         0 // a_long stays PLAIN
                 );
+            }
+        });
+    }
+
+    @Test
+    public void testLossyRoundingRoundTrip() throws Exception {
+        // End-to-end: a DOUBLE column declared with PARQUET(..., LOSSY(10)) must come
+        // back rounded after conversion. Every read value has its low 42 mantissa bits
+        // cleared and stays within the 2^-(10+1) relative error bound. This exercises
+        // the full DDL -> packed config -> TableColumnMetadata -> JNI -> Rust path.
+        assertMemoryLeak(() -> {
+            inputRoot = root;
+            execute("CREATE TABLE x (" +
+                    " px DOUBLE PARQUET(BYTE_STREAM_SPLIT, ZSTD, LOSSY(10))," +
+                    " ts TIMESTAMP" +
+                    ") TIMESTAMP(ts) PARTITION BY MONTH");
+            execute("INSERT INTO x SELECT" +
+                    " x * 0.1 + 1.0," +
+                    " timestamp_sequence('2015-01-01', 1_000_000)" +
+                    " FROM long_sequence(1000)");
+
+            try (
+                    Path path = new Path();
+                    PartitionDescriptor partitionDescriptor = new PartitionDescriptor();
+                    TableReader reader = engine.getReader("x")
+            ) {
+                path.of(root).concat("x.parquet").$();
+                PartitionEncoder.populateFromTableReader(reader, partitionDescriptor, 0);
+                PartitionEncoder.encode(partitionDescriptor, path);
+
+                final double bound = Math.pow(2, -(10 + 1)) * 1.000_001;
+                final long dropMask = (1L << (52 - 10)) - 1;
+                boolean anyChanged = false;
+                int n = 0;
+                try (
+                        RecordCursorFactory factory = select("SELECT px FROM read_parquet('x.parquet')", sqlExecutionContext);
+                        RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+                ) {
+                    final Record rec = cursor.getRecord();
+                    while (cursor.hasNext()) {
+                        double got = rec.getDouble(0);
+                        double orig = (n + 1) * 0.1 + 1.0;
+                        Assert.assertEquals("low mantissa bits not cleared at row " + n, 0L, Double.doubleToLongBits(got) & dropMask);
+                        double rel = Math.abs((got - orig) / orig);
+                        Assert.assertTrue("rel err " + rel + " exceeds " + bound + " at row " + n, rel <= bound);
+                        if (got != orig) {
+                            anyChanged = true;
+                        }
+                        n++;
+                    }
+                }
+                Assert.assertEquals(1000, n);
+                Assert.assertTrue("rounding had no effect; config did not reach the encoder", anyChanged);
             }
         });
     }

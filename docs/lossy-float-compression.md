@@ -304,10 +304,31 @@ Engine mechanism (done):
   clearing, NaN/inf/zero); an end-to-end write-then-read (arrow) confirming
   decoded values equal `round_f64(original, keep)` within the bound.
 
-Remaining (separate, not done): the SQL/DDL surface to set the precision — e.g.
-`WITH (col LOSSY <rtol|bits>)` on `CONVERT PARTITION TO PARQUET` and/or a
-`cairo.partition.encoder.parquet.*` default — plus the Java-side packing into the
-config word. Until then the keep-bits are only reachable from the Rust layer.
+SQL/DDL surface (done): the precision is set per column inside the existing
+`PARQUET(...)` column option as `LOSSY(<keep_bits>)`, where `<keep_bits>` is the
+number of mantissa bits to retain (relative error `2^-(keep+1)`). It composes
+with the encoding and codec, in any order, and also stands alone:
+
+```sql
+CREATE TABLE trades (
+  price DOUBLE PARQUET(BYTE_STREAM_SPLIT, ZSTD(9), LOSSY(12)),  -- ~1 bp
+  size  DOUBLE PARQUET(LOSSY(10)),                              -- ~5 bp, default encoding/codec
+  ts    TIMESTAMP
+) TIMESTAMP(ts) PARTITION BY DAY;
+```
+
+`SqlUtil.parseParquetConfig` parses it, validates `LOSSY` is only allowed on
+FLOAT/DOUBLE and that keep-bits are in `[1, 52]` (DOUBLE) or `[1, 23]` (FLOAT),
+and packs keep-bits into bits 26-31 via `TableUtils.packParquetConfig`. The value
+flows through `CreateTableColumnModel` -> `TableColumnMetadata` -> `PartitionEncoder`
+-> JNI -> the Rust encoder unchanged, and `SHOW CREATE TABLE` reconstructs the
+`LOSSY(...)` clause. Encoding and codec stay orthogonal to precision; there is no
+auto-switching of the codec when lossy is enabled (the benchmark recommends ZSTD,
+documented, not forced).
+
+Keep-bits chosen rather than a relative-tolerance unit for an unambiguous, exact
+mapping to the engine; a tolerance unit (e.g. `LOSSY('1bp')`) could be added later
+as sugar over the same field.
 
 ### Codec choice (benchmark-driven)
 

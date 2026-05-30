@@ -4267,6 +4267,93 @@ public class SqlParserTest extends AbstractSqlParserTest {
     }
 
     @Test
+    public void testCreateTableParquetLossy() throws SqlException {
+        assertCreateTable(
+                "create atomic table x (" +
+                        "a DOUBLE parquet(byte_stream_split, zstd(9), lossy(10))," +
+                        " t TIMESTAMP)" +
+                        " timestamp(t)" +
+                        " partition by DAY",
+                "create table x (" +
+                        "a DOUBLE PARQUET(BYTE_STREAM_SPLIT, ZSTD(9), LOSSY(10)), " +
+                        "t TIMESTAMP) " +
+                        "timestamp(t) " +
+                        "partition by DAY"
+        );
+    }
+
+    @Test
+    public void testCreateTableParquetLossyFloat() throws SqlException {
+        assertCreateTable(
+                "create atomic table x (" +
+                        "a FLOAT parquet(lossy(15))," +
+                        " t TIMESTAMP)" +
+                        " timestamp(t)" +
+                        " partition by DAY",
+                "create table x (" +
+                        "a FLOAT PARQUET(LOSSY(15)), " +
+                        "t TIMESTAMP) " +
+                        "timestamp(t) " +
+                        "partition by DAY"
+        );
+    }
+
+    @Test
+    public void testCreateTableParquetLossyFloatOutOfRange() throws Exception {
+        assertSyntaxError(
+                "create table x (" +
+                        "a FLOAT PARQUET(LOSSY(30)), " +
+                        "t TIMESTAMP) " +
+                        "timestamp(t) " +
+                        "partition by DAY",
+                38,
+                "LOSSY mantissa bits must be between 1 and 23"
+        );
+    }
+
+    @Test
+    public void testCreateTableParquetLossyInvalidForType() throws Exception {
+        assertSyntaxError(
+                "create table x (" +
+                        "a INT PARQUET(LOSSY(10)), " +
+                        "t TIMESTAMP) " +
+                        "timestamp(t) " +
+                        "partition by DAY",
+                30,
+                "LOSSY is only supported for FLOAT and DOUBLE columns"
+        );
+    }
+
+    @Test
+    public void testCreateTableParquetLossyOutOfRange() throws Exception {
+        assertSyntaxError(
+                "create table x (" +
+                        "a DOUBLE PARQUET(LOSSY(99)), " +
+                        "t TIMESTAMP) " +
+                        "timestamp(t) " +
+                        "partition by DAY",
+                39,
+                "LOSSY mantissa bits must be between 1 and 52"
+        );
+    }
+
+    @Test
+    public void testCreateTableParquetLossyStandalone() throws SqlException {
+        assertCreateTable(
+                "create atomic table x (" +
+                        "a DOUBLE parquet(lossy(12))," +
+                        " t TIMESTAMP)" +
+                        " timestamp(t)" +
+                        " partition by DAY",
+                "create table x (" +
+                        "a DOUBLE PARQUET(LOSSY(12)), " +
+                        "t TIMESTAMP) " +
+                        "timestamp(t) " +
+                        "partition by DAY"
+        );
+    }
+
+    @Test
     public void testCreateTableParquetEncodingDeltaBinaryPacked() throws SqlException {
         assertCreateTable(
                 "create atomic table x (" +

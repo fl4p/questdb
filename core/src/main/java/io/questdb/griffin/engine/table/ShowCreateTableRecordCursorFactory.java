@@ -289,7 +289,9 @@ public class ShowCreateTableRecordCursorFactory extends AbstractRecordCursorFact
                 int compression = TableUtils.getParquetConfigCompression(parquetConfig);
                 int level = TableUtils.getParquetConfigCompressionLevel(parquetConfig);
                 boolean hasBloomFilter = TableUtils.isParquetConfigBloomFilter(parquetConfig);
+                int lossyKeepBits = TableUtils.getParquetConfigLossyKeepBits(parquetConfig);
                 sink.putAscii(" PARQUET(");
+                boolean wrote = false;
                 if (encoding > 0 || compression > 0) {
                     if (encoding > 0) {
                         sink.put(ParquetEncoding.getEncodingName(encoding));
@@ -302,12 +304,20 @@ public class ShowCreateTableRecordCursorFactory extends AbstractRecordCursorFact
                             sink.putAscii('(').put(level - 1).putAscii(')');
                         }
                     }
-                    if (hasBloomFilter) {
-                        sink.putAscii(", bloom_filter");
+                    wrote = true;
+                }
+                if (hasBloomFilter) {
+                    sink.putAscii(wrote ? ", bloom_filter" : "bloom_filter");
+                    wrote = true;
+                }
+                if (lossyKeepBits > 0) {
+                    if (wrote) {
+                        sink.putAscii(", ");
                     }
-                } else if (hasBloomFilter) {
-                    sink.putAscii("bloom_filter");
-                } else {
+                    sink.putAscii("lossy(").put(lossyKeepBits).putAscii(')');
+                    wrote = true;
+                }
+                if (!wrote) {
                     sink.putAscii("default");
                 }
                 sink.putAscii(')');

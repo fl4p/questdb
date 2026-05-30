@@ -420,24 +420,37 @@ public class CreateTableOperationBuilderImpl implements CreateTableOperationBuil
     private static void parquetClauseToSink(@NotNull CharSink<?> sink, CreateTableColumnModel model) {
         int encoding = model.getParquetEncoding();
         int compression = model.getParquetCompression();
-        if (encoding < 0 && compression < 0) {
+        int lossyKeepBits = model.getParquetLossyKeepBits();
+        if (encoding < 0 && compression < 0 && lossyKeepBits < 0) {
             return;
         }
         sink.putAscii(" parquet(");
-        if (encoding >= 0) {
-            sink.put(ParquetEncoding.getEncodingName(encoding));
-        } else {
-            sink.putAscii("default");
-        }
-        if (compression >= 0) {
-            sink.putAscii(", ");
-            sink.put(ParquetCompression.getCompressionName(compression));
-            int level = model.getParquetCompressionLevel();
-            if (level >= 0) {
-                sink.putAscii('(');
-                sink.put(level);
-                sink.putAscii(')');
+        boolean wrote = false;
+        if (encoding >= 0 || compression >= 0) {
+            if (encoding >= 0) {
+                sink.put(ParquetEncoding.getEncodingName(encoding));
+            } else {
+                sink.putAscii("default");
             }
+            if (compression >= 0) {
+                sink.putAscii(", ");
+                sink.put(ParquetCompression.getCompressionName(compression));
+                int level = model.getParquetCompressionLevel();
+                if (level >= 0) {
+                    sink.putAscii('(');
+                    sink.put(level);
+                    sink.putAscii(')');
+                }
+            }
+            wrote = true;
+        }
+        if (lossyKeepBits >= 0) {
+            if (wrote) {
+                sink.putAscii(", ");
+            }
+            sink.putAscii("lossy(");
+            sink.put(lossyKeepBits);
+            sink.putAscii(')');
         }
         sink.putAscii(')');
     }

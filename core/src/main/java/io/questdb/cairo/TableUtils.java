@@ -253,6 +253,9 @@ public final class TableUtils {
     private static final int PARQUET_CONFIG_EXPLICIT_FLAG = 1 << 24;
     private static final int PARQUET_CONFIG_LEVEL_MASK = 0xFF;
     private static final int PARQUET_CONFIG_LEVEL_SHIFT = 16;
+    // Lossy float rounding: mantissa bits to keep, bits 26-31 (0 = no rounding).
+    private static final int PARQUET_CONFIG_LOSSY_KEEP_BITS_MASK = 0x3F;
+    private static final int PARQUET_CONFIG_LOSSY_KEEP_BITS_SHIFT = 26;
 
     private TableUtils() {
     }
@@ -965,6 +968,15 @@ public final class TableUtils {
     }
 
     /**
+     * Extracts the lossy float rounding precision (bits 26-31) from a packed Parquet
+     * config: the number of mantissa bits to keep, or 0 when rounding is disabled.
+     * Only meaningful for FLOAT/DOUBLE columns.
+     */
+    public static int getParquetConfigLossyKeepBits(int packed) {
+        return (packed >> PARQUET_CONFIG_LOSSY_KEEP_BITS_SHIFT) & PARQUET_CONFIG_LOSSY_KEEP_BITS_MASK;
+    }
+
+    /**
      * Reads the packed Parquet encoding config for a column from table metadata memory.
      * See {@link #packParquetConfig(int, int, int, boolean)} for the bit layout.
      */
@@ -1666,9 +1678,14 @@ public final class TableUtils {
      * while still allowing the user to specify level 0 (e.g., gzip store mode).
      */
     public static int packParquetConfig(int encoding, int compression, int level, boolean bloomFilter) {
+        return packParquetConfig(encoding, compression, level, bloomFilter, 0);
+    }
+
+    public static int packParquetConfig(int encoding, int compression, int level, boolean bloomFilter, int lossyKeepBits) {
         int config = (encoding & PARQUET_CONFIG_ENCODING_MASK)
                 | ((compression & PARQUET_CONFIG_COMPRESSION_MASK) << PARQUET_CONFIG_COMPRESSION_SHIFT)
                 | ((level & PARQUET_CONFIG_LEVEL_MASK) << PARQUET_CONFIG_LEVEL_SHIFT)
+                | ((lossyKeepBits & PARQUET_CONFIG_LOSSY_KEEP_BITS_MASK) << PARQUET_CONFIG_LOSSY_KEEP_BITS_SHIFT)
                 | PARQUET_CONFIG_EXPLICIT_FLAG;
         if (bloomFilter) {
             config |= PARQUET_CONFIG_BLOOM_FILTER_FLAG;

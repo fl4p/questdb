@@ -49,6 +49,7 @@ public class CreateTableColumnModel implements Mutable {
     private int parquetCompression = -1;
     private int parquetCompressionLevel = -1;
     private int parquetEncoding = -1;
+    private int parquetLossyKeepBits = -1;
     private boolean symbolCacheFlag;
     private int symbolCapacity = -1;
 
@@ -73,6 +74,7 @@ public class CreateTableColumnModel implements Mutable {
         parquetCompression = -1;
         parquetCompressionLevel = -1;
         parquetEncoding = -1;
+        parquetLossyKeepBits = -1;
         symbolCacheFlag = false;
         symbolCapacity = -1;
     }
@@ -134,8 +136,12 @@ public class CreateTableColumnModel implements Mutable {
         return parquetEncoding;
     }
 
+    public int getParquetLossyKeepBits() {
+        return parquetLossyKeepBits;
+    }
+
     public int getParquetEncodingConfig() {
-        if (parquetEncoding < 0 && parquetCompression < 0 && !parquetBloomFilter) {
+        if (parquetEncoding < 0 && parquetCompression < 0 && !parquetBloomFilter && parquetLossyKeepBits < 0) {
             return 0;
         }
         // In packed form, compression is shifted +1 (0=default, 1=uncompressed, 2=snappy, etc.)
@@ -144,11 +150,15 @@ public class CreateTableColumnModel implements Mutable {
         // Level is also shifted +1 (0=not set, 1=level 0, 2=level 1, etc.)
         // to distinguish "not set" from "level 0" (e.g., gzip store mode).
         int packedLevel = parquetCompressionLevel >= 0 ? parquetCompressionLevel + 1 : 0;
+        // Lossy keep-bits use 0 as the "no rounding" sentinel directly (a meaningful
+        // setting keeps at least 1 mantissa bit), so no +1 shift is needed.
+        int lossyKeepBits = parquetLossyKeepBits >= 0 ? parquetLossyKeepBits : 0;
         return TableUtils.packParquetConfig(
                 Math.max(parquetEncoding, 0),
                 packedCompression,
                 packedLevel,
-                parquetBloomFilter
+                parquetBloomFilter,
+                lossyKeepBits
         );
     }
 
@@ -214,9 +224,9 @@ public class CreateTableColumnModel implements Mutable {
 
     /**
      * Sets all parquet properties from a packed config int produced by
-     * {@link TableUtils#packParquetConfig(int, int, int, boolean)}.
-     * Unpacks encoding, compression (+1 encoded), level (+1 encoded), and bloom filter flag
-     * into the individual fields.
+     * {@link TableUtils#packParquetConfig(int, int, int, boolean, int)}.
+     * Unpacks encoding, compression (+1 encoded), level (+1 encoded), bloom filter flag,
+     * and lossy keep-bits into the individual fields.
      */
     public void setParquetEncodingConfig(int packed) {
         int enc = TableUtils.getParquetConfigEncoding(packed);
@@ -226,6 +236,12 @@ public class CreateTableColumnModel implements Mutable {
         int lvl = TableUtils.getParquetConfigCompressionLevel(packed);
         this.parquetCompressionLevel = lvl > 0 ? lvl - 1 : -1;
         this.parquetBloomFilter = TableUtils.isParquetConfigBloomFilter(packed);
+        int keep = TableUtils.getParquetConfigLossyKeepBits(packed);
+        this.parquetLossyKeepBits = keep > 0 ? keep : -1;
+    }
+
+    public void setParquetLossyKeepBits(int parquetLossyKeepBits) {
+        this.parquetLossyKeepBits = parquetLossyKeepBits;
     }
 
     public void setSymbolCacheFlag(boolean symbolCacheFlag) {

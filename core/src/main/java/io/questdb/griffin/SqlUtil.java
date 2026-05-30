@@ -1361,106 +1361,163 @@ public class SqlUtil {
         int packedCompression = 0;
         int packedLevel = 0;
         boolean bloomFilter = false;
+        int lossyKeepBits = 0;
 
         tok = fetchNext(lexer);
         if (tok == null) {
             throw SqlException.position(lexer.getPosition()).put("encoding name or BLOOM_FILTER expected");
         }
 
-        // PARQUET(BLOOM_FILTER) shorthand
-        if (SqlKeywords.isBloomFilterKeyword(tok)) {
-            bloomFilter = true;
-            tok = fetchNext(lexer);
-            if (tok == null || !Chars.equals(tok, ')')) {
-                throw SqlException.position(lexer.lastTokenPosition()).put("')' expected");
-            }
-            return TableUtils.packParquetConfig(encoding, packedCompression, packedLevel, bloomFilter);
-        }
-
-        int encodingPos = lexer.lastTokenPosition();
-        encoding = ParquetEncoding.getEncoding(tok);
-        if (encoding < 0) {
-            SqlException e = SqlException.$(encodingPos, "invalid parquet encoding '").put(tok).put("', supported values: ");
-            ParquetEncoding.addValidEncodingNamesForType(e, columnType);
-            throw e;
-        }
-        if (encoding != ParquetEncoding.ENCODING_DEFAULT && !ParquetEncoding.isValidForColumnType(encoding, columnType)) {
-            SqlException e = SqlException.$(encodingPos, "encoding '").put(tok).put("' is not valid for column type ").put(ColumnType.nameOf(columnType))
-                    .put(", supported encodings for this type: ");
-            ParquetEncoding.addValidEncodingNamesForType(e, columnType);
-            throw e;
-        }
-
-        tok = fetchNext(lexer);
-        if (tok == null) {
-            throw SqlException.position(lexer.getPosition()).put("',' or ')' expected");
-        }
-
-        if (Chars.equals(tok, ',')) {
-            tok = fetchNext(lexer);
-            if (tok == null) {
-                throw SqlException.position(lexer.getPosition()).put("compression codec name or BLOOM_FILTER expected");
-            }
-
-            // PARQUET(encoding, BLOOM_FILTER)
-            if (SqlKeywords.isBloomFilterKeyword(tok)) {
-                bloomFilter = true;
-                tok = fetchNext(lexer);
-                if (tok == null || !Chars.equals(tok, ')')) {
-                    throw SqlException.position(lexer.lastTokenPosition()).put("')' expected");
-                }
-                return TableUtils.packParquetConfig(encoding, packedCompression, packedLevel, bloomFilter);
-            }
-
-            int codecPos = lexer.lastTokenPosition();
-            int compression = ParquetCompression.getCompressionCodec(tok);
-            if (compression < 0) {
-                SqlException e = SqlException.$(codecPos, "invalid parquet compression codec '").put(tok).put("', supported values: ");
-                ParquetCompression.addCodecNamesToException(e);
+        // A leading token that is not a standalone modifier keyword is the encoding name;
+        // BLOOM_FILTER / LOSSY may also stand alone (e.g. PARQUET(LOSSY(10))).
+        if (!SqlKeywords.isBloomFilterKeyword(tok) && !SqlKeywords.isLossyKeyword(tok)) {
+            int encodingPos = lexer.lastTokenPosition();
+            encoding = ParquetEncoding.getEncoding(tok);
+            if (encoding < 0) {
+                SqlException e = SqlException.$(encodingPos, "invalid parquet encoding '").put(tok).put("', supported values: ");
+                ParquetEncoding.addValidEncodingNamesForType(e, columnType);
                 throw e;
             }
-            packedCompression = compression + 1;
+            if (encoding != ParquetEncoding.ENCODING_DEFAULT && !ParquetEncoding.isValidForColumnType(encoding, columnType)) {
+                SqlException e = SqlException.$(encodingPos, "encoding '").put(tok).put("' is not valid for column type ").put(ColumnType.nameOf(columnType))
+                        .put(", supported encodings for this type: ");
+                ParquetEncoding.addValidEncodingNamesForType(e, columnType);
+                throw e;
+            }
 
             tok = fetchNext(lexer);
-            if (tok != null && Chars.equals(tok, '(')) {
-                tok = fetchNext(lexer);
-                if (tok == null) {
-                    throw SqlException.position(lexer.getPosition()).put("compression level expected");
-                }
-                int levelPos = lexer.lastTokenPosition();
-                try {
-                    int level = Numbers.parseInt(tok);
-                    ParquetCompression.validateCompressionLevel(compression, level, levelPos);
-                    packedLevel = level + 1;
-                } catch (NumericException e) {
-                    throw SqlException.$(levelPos, "compression level must be a number");
-                }
-                tok = fetchNext(lexer);
-                if (tok == null || !Chars.equals(tok, ')')) {
-                    throw SqlException.position(lexer.lastTokenPosition()).put("')' expected");
-                }
-                tok = fetchNext(lexer);
+            if (tok == null) {
+                throw SqlException.position(lexer.getPosition()).put("',' or ')' expected");
             }
 
-            // PARQUET(encoding, compression[(level)], BLOOM_FILTER)
+            if (Chars.equals(tok, ',')) {
+                tok = fetchNext(lexer);
+                if (tok == null) {
+                    throw SqlException.position(lexer.getPosition()).put("compression codec name or BLOOM_FILTER expected");
+                }
+
+                // A compression codec, if present, comes immediately after the encoding.
+                if (!SqlKeywords.isBloomFilterKeyword(tok) && !SqlKeywords.isLossyKeyword(tok)) {
+                    int codecPos = lexer.lastTokenPosition();
+                    int compression = ParquetCompression.getCompressionCodec(tok);
+                    if (compression < 0) {
+                        SqlException e = SqlException.$(codecPos, "invalid parquet compression codec '").put(tok).put("', supported values: ");
+                        ParquetCompression.addCodecNamesToException(e);
+                        throw e;
+                    }
+                    packedCompression = compression + 1;
+
+                    tok = fetchNext(lexer);
+                    if (tok != null && Chars.equals(tok, '(')) {
+                        tok = fetchNext(lexer);
+                        if (tok == null) {
+                            throw SqlException.position(lexer.getPosition()).put("compression level expected");
+                        }
+                        int levelPos = lexer.lastTokenPosition();
+                        try {
+                            int level = Numbers.parseInt(tok);
+                            ParquetCompression.validateCompressionLevel(compression, level, levelPos);
+                            packedLevel = level + 1;
+                        } catch (NumericException e) {
+                            throw SqlException.$(levelPos, "compression level must be a number");
+                        }
+                        tok = fetchNext(lexer);
+                        if (tok == null || !Chars.equals(tok, ')')) {
+                            throw SqlException.position(lexer.lastTokenPosition()).put("')' expected");
+                        }
+                        tok = fetchNext(lexer);
+                    }
+
+                    if (tok != null && Chars.equals(tok, ',')) {
+                        // More items follow the compression codec: only modifiers are allowed.
+                        tok = fetchNext(lexer);
+                    } else {
+                        if (tok == null || !Chars.equals(tok, ')')) {
+                            throw SqlException.position(lexer.lastTokenPosition()).put("')' expected");
+                        }
+                        return packParquetConfigOrZero(encoding, packedCompression, packedLevel, bloomFilter, lossyKeepBits);
+                    }
+                }
+                // tok now points at the first modifier keyword (BLOOM_FILTER / LOSSY).
+            } else {
+                if (!Chars.equals(tok, ')')) {
+                    throw SqlException.position(lexer.lastTokenPosition()).put("')' expected");
+                }
+                return packParquetConfigOrZero(encoding, packedCompression, packedLevel, bloomFilter, lossyKeepBits);
+            }
+        }
+
+        // Trailing modifiers: BLOOM_FILTER and LOSSY(n), comma-separated, in any order.
+        for (; ; ) {
+            if (tok == null) {
+                throw SqlException.position(lexer.getPosition()).put("BLOOM_FILTER or LOSSY expected");
+            }
+            if (SqlKeywords.isBloomFilterKeyword(tok)) {
+                bloomFilter = true;
+            } else if (SqlKeywords.isLossyKeyword(tok)) {
+                lossyKeepBits = parseLossyKeepBits(lexer, columnType, lexer.lastTokenPosition());
+            } else {
+                throw SqlException.position(lexer.lastTokenPosition()).put("BLOOM_FILTER or LOSSY expected");
+            }
+            tok = fetchNext(lexer);
             if (tok != null && Chars.equals(tok, ',')) {
                 tok = fetchNext(lexer);
-                if (tok == null || !SqlKeywords.isBloomFilterKeyword(tok)) {
-                    throw SqlException.position(lexer.lastTokenPosition()).put("BLOOM_FILTER expected");
-                }
-                bloomFilter = true;
-                tok = fetchNext(lexer);
+                continue;
             }
+            break;
         }
 
         if (tok == null || !Chars.equals(tok, ')')) {
             throw SqlException.position(lexer.lastTokenPosition()).put("')' expected");
         }
+        return packParquetConfigOrZero(encoding, packedCompression, packedLevel, bloomFilter, lossyKeepBits);
+    }
 
-        if (encoding == 0 && packedCompression == 0 && !bloomFilter) {
+    private static int packParquetConfigOrZero(int encoding, int packedCompression, int packedLevel, boolean bloomFilter, int lossyKeepBits) {
+        if (encoding == 0 && packedCompression == 0 && !bloomFilter && lossyKeepBits == 0) {
             return 0;
         }
-        return TableUtils.packParquetConfig(encoding, packedCompression, packedLevel, bloomFilter);
+        return TableUtils.packParquetConfig(encoding, packedCompression, packedLevel, bloomFilter, lossyKeepBits);
+    }
+
+    // Parses `(<keep>)` after the LOSSY keyword and validates it. `keep` is the number of
+    // mantissa bits to retain; lossy rounding applies only to FLOAT/DOUBLE columns.
+    private static int parseLossyKeepBits(GenericLexer lexer, int columnType, int lossyPos) throws SqlException {
+        final int maxBits;
+        switch (ColumnType.tagOf(columnType)) {
+            case ColumnType.DOUBLE:
+                maxBits = 52;
+                break;
+            case ColumnType.FLOAT:
+                maxBits = 23;
+                break;
+            default:
+                throw SqlException.$(lossyPos, "LOSSY is only supported for FLOAT and DOUBLE columns");
+        }
+        CharSequence tok = fetchNext(lexer);
+        if (tok == null || !Chars.equals(tok, '(')) {
+            throw SqlException.position(lexer.lastTokenPosition()).put("'(' expected");
+        }
+        tok = fetchNext(lexer);
+        if (tok == null) {
+            throw SqlException.position(lexer.getPosition()).put("mantissa bits to keep expected");
+        }
+        int keepPos = lexer.lastTokenPosition();
+        final int keep;
+        try {
+            keep = Numbers.parseInt(tok);
+        } catch (NumericException e) {
+            throw SqlException.$(keepPos, "LOSSY mantissa bits must be a number");
+        }
+        if (keep < 1 || keep > maxBits) {
+            throw SqlException.$(keepPos, "LOSSY mantissa bits must be between 1 and ").put(maxBits)
+                    .put(" for ").put(ColumnType.nameOf(columnType));
+        }
+        tok = fetchNext(lexer);
+        if (tok == null || !Chars.equals(tok, ')')) {
+            throw SqlException.position(lexer.lastTokenPosition()).put("')' expected");
+        }
+        return keep;
     }
 
     public static int toPersistedType(@NotNull CharSequence tok, int tokPosition) throws SqlException {
