@@ -180,7 +180,7 @@ public class ReadOnlySecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeMatViewCreate() {
+    public void authorizeMatViewCreate(CharSequence matViewName) {
         throw CairoException.authorization().put("Write permission denied").setCacheable(true);
     }
 
@@ -231,7 +231,7 @@ public class ReadOnlySecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeTableCreate() {
+    public void authorizeTableCreate(CharSequence tableName) {
         throw CairoException.authorization().put("Write permission denied").setCacheable(true);
     }
 
@@ -271,7 +271,7 @@ public class ReadOnlySecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeViewCreate() {
+    public void authorizeViewCreate(CharSequence viewName) {
         throw CairoException.authorization().put("Write permission denied").setCacheable(true);
     }
 

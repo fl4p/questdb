@@ -28,6 +28,7 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.view.ViewDefinition;
+import io.questdb.std.Chars;
 import io.questdb.std.ObjList;
 import org.jetbrains.annotations.NotNull;
 
@@ -193,8 +194,8 @@ public class PrefixAwareSecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeMatViewCreate() {
-        checkCreate();
+    public void authorizeMatViewCreate(CharSequence matViewName) {
+        checkCreate(matViewName);
     }
 
     @Override
@@ -246,8 +247,8 @@ public class PrefixAwareSecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeTableCreate() {
-        checkCreate();
+    public void authorizeTableCreate(CharSequence tableName) {
+        checkCreate(tableName);
     }
 
     @Override
@@ -286,8 +287,8 @@ public class PrefixAwareSecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeViewCreate() {
-        checkCreate();
+    public void authorizeViewCreate(CharSequence viewName) {
+        checkCreate(viewName);
     }
 
     @Override
@@ -319,9 +320,14 @@ public class PrefixAwareSecurityContext implements SecurityContext {
         return false;
     }
 
-    private void checkCreate() {
+    private void checkCreate(CharSequence name) {
         if (readOnly) {
             throw CairoException.authorization().put("Write permission denied").setCacheable(true);
+        }
+        // A prefix-scoped user may only create objects whose name falls within its prefix;
+        // otherwise it could squat names in another tenant's namespace.
+        if (prefix != null && !Chars.startsWith(name, prefix)) {
+            throw CairoException.authorization().put("Access denied [table=").put(name).put(']').setCacheable(true);
         }
     }
 

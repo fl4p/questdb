@@ -155,7 +155,7 @@ public class AllowAllSecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeMatViewCreate() {
+    public void authorizeMatViewCreate(CharSequence matViewName) {
     }
 
     @Override
@@ -202,7 +202,7 @@ public class AllowAllSecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeTableCreate() {
+    public void authorizeTableCreate(CharSequence tableName) {
     }
 
     @Override
@@ -234,7 +234,7 @@ public class AllowAllSecurityContext implements SecurityContext {
     }
 
     @Override
-    public void authorizeViewCreate() {
+    public void authorizeViewCreate(CharSequence viewName) {
     }
 
     @Override

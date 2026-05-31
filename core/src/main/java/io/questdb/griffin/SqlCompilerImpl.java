@@ -3007,16 +3007,16 @@ public class SqlCompilerImpl implements SqlCompiler, Closeable, SqlParserCallbac
         // directly compiled into a factory, so we need to optimize it before proceeding.
         switch (model.getModelType()) {
             case ExecutionModel.CREATE_TABLE:
-                executionContext.getSecurityContext().authorizeTableCreate();
                 final CreateTableOperationBuilder createTableBuilder = (CreateTableOperationBuilder) model;
+                executionContext.getSecurityContext().authorizeTableCreate(createTableBuilder.getTableName());
                 if (createTableBuilder.getQueryModel() != null) {
                     final IQueryModel selectModel = optimiser.optimise(createTableBuilder.getQueryModel(), executionContext, this);
                     createTableBuilder.setSelectModel(selectModel);
                 }
                 return model;
             case ExecutionModel.CREATE_MAT_VIEW:
-                executionContext.getSecurityContext().authorizeMatViewCreate();
                 final CreateMatViewOperationBuilder createMatViewBuilder = (CreateMatViewOperationBuilder) model;
+                executionContext.getSecurityContext().authorizeMatViewCreate(createMatViewBuilder.getTableName());
                 if (createMatViewBuilder.getQueryModel() != null) {
                     final IQueryModel selectModel = optimiser.optimise(createMatViewBuilder.getQueryModel(), executionContext, this);
                     createMatViewBuilder.setSelectModel(selectModel);

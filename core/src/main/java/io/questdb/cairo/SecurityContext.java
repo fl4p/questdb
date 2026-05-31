@@ -107,7 +107,7 @@ public interface SecurityContext extends Mutable {
 
     void authorizeLineTcp();
 
-    void authorizeMatViewCreate();
+    void authorizeMatViewCreate(CharSequence matViewName);
 
     void authorizeMatViewDrop(TableToken tableToken);
 
@@ -129,12 +129,12 @@ public interface SecurityContext extends Mutable {
 
     void authorizeSystemAdmin();
 
-    void authorizeTableCreate();
+    void authorizeTableCreate(CharSequence tableName);
 
-    default void authorizeTableCreate(int tableKind) {
+    default void authorizeTableCreate(CharSequence tableName, int tableKind) {
         switch (tableKind) {
             case TableUtils.TABLE_KIND_REGULAR_TABLE:
-                authorizeTableCreate();
+                authorizeTableCreate(tableName);
                 break;
             case TableUtils.TABLE_KIND_TEMP_PARQUET_EXPORT:
                 // Allowed even in read-only mode
@@ -160,7 +160,7 @@ public interface SecurityContext extends Mutable {
 
     void authorizeViewCompile(TableToken tableToken);
 
-    void authorizeViewCreate();
+    void authorizeViewCreate(CharSequence viewName);
 
     void authorizeViewDrop(TableToken tableToken);
 

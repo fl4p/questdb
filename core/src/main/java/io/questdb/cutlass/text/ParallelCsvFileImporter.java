@@ -306,7 +306,7 @@ public class ParallelCsvFileImporter implements Closeable, Mutable {
                         throw CairoException.critical(ff.errno()).put("could not overwrite [tableName=").put(tableName).put("]");
                     }
                 case TableUtils.TABLE_DOES_NOT_EXIST:
-                    securityContext.authorizeTableCreate();
+                    securityContext.authorizeTableCreate(tableName);
                     try (MemoryMARW memory = Vm.getCMARWInstance()) {
                         TableUtils.createTable(
                                 ff,

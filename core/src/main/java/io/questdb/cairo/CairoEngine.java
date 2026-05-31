@@ -623,7 +623,7 @@ public class CairoEngine implements Closeable, WriterSource {
             boolean keepLock,
             boolean inVolume
     ) {
-        securityContext.authorizeMatViewCreate();
+        securityContext.authorizeMatViewCreate(operation.getTableName());
         final TableToken matViewToken = createTableOrViewOrMatViewUnsecure(securityContext, mem, blockFileWriter, path, ifNotExists, operation, keepLock, inVolume, TableUtils.TABLE_KIND_REGULAR_TABLE);
         final MatViewDefinition matViewDefinition = operation.getMatViewDefinition();
         try {
@@ -678,7 +678,7 @@ public class CairoEngine implements Closeable, WriterSource {
                     .put(", parquetExportPrefix=").put(configuration.getParquetExportTableNamePrefix())
                     .put(']');
         }
-        securityContext.authorizeTableCreate(tableKind);
+        securityContext.authorizeTableCreate(struct.getTableName(), tableKind);
         return createTableOrViewOrMatViewUnsecure(securityContext, mem, null, path, ifNotExists, struct, keepLock, inVolume, tableKind);
     }
 
@@ -691,7 +691,7 @@ public class CairoEngine implements Closeable, WriterSource {
             CreateViewOperation operation,
             @Nullable RecordMetadata metadata
     ) {
-        securityContext.authorizeViewCreate();
+        securityContext.authorizeViewCreate(operation.getTableName());
         final TableToken viewToken = createTableOrViewOrMatViewUnsecure(securityContext, mem, blockFileWriter, path, ifNotExists, operation, false, false, TableUtils.TABLE_KIND_REGULAR_TABLE);
         final ViewDefinition viewDefinition = operation.getViewDefinition();
         try {
