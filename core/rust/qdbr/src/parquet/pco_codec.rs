@@ -18,13 +18,9 @@ use crate::parquet::error::{fmt_err, ParquetResult};
 
 /// pco compression level. Level 8 is pco's default and the ratio/speed sweet
 /// spot in the float-compression benchmark; higher levels add little.
-// TODO(pco-integration): drop the `allow(dead_code)` once the write/read paths
-// call these. They are exercised by the unit tests below in the meantime.
-#[allow(dead_code)]
 pub const PCO_COMPRESSION_LEVEL: usize = 8;
 
 /// Compress a slice of numbers into a self-describing pco blob.
-#[allow(dead_code)]
 pub fn compress<T: Number>(values: &[T]) -> ParquetResult<Vec<u8>> {
     let config = ChunkConfig::default().with_compression_level(PCO_COMPRESSION_LEVEL);
     simple_compress(values, &config).map_err(|e| fmt_err!(Unsupported, "pco compress failed: {e}"))
@@ -33,7 +29,6 @@ pub fn compress<T: Number>(values: &[T]) -> ParquetResult<Vec<u8>> {
 /// Decompress a pco blob produced by [`compress`] back into a vector of numbers.
 ///
 /// Returns an error (never panics) when `src` is not a valid pco blob.
-#[allow(dead_code)]
 pub fn decompress<T: Number>(src: &[u8]) -> ParquetResult<Vec<T>> {
     simple_decompress(src).map_err(|e| fmt_err!(InvalidLayout, "pco decompress failed: {e}"))
 }

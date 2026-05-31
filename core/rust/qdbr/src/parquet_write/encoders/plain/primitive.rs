@@ -6,7 +6,7 @@ use parquet2::bloom_filter::hash_native;
 use parquet2::encoding::hybrid_rle::bitpacked_encode;
 use parquet2::encoding::Encoding;
 use parquet2::page::Page;
-use parquet2::schema::types::PrimitiveType;
+use parquet2::schema::types::{PhysicalType, PrimitiveType};
 use parquet2::schema::Repetition;
 use parquet2::statistics::{
     serialize_statistics, BooleanStatistics, FixedLenStatistics, ParquetStatistics, Statistics,
@@ -252,6 +252,14 @@ fn simd_segments_to_page<T: SimdEncodable>(
 ) -> ParquetResult<Page> {
     assert_eq!(primitive_type.field_info.repetition, Repetition::Optional);
 
+    // pco is the default back end for the lossy float path. Only FLOAT/DOUBLE
+    // columns can request it; the physical-type guard keeps the int/timestamp
+    // callers that share this code on their standard encodings.
+    let use_pco = matches!(
+        primitive_type.physical_type,
+        PhysicalType::Float | PhysicalType::Double
+    ) && columns[0].parquet_encoding_config.is_pco();
+
     // SAFETY: Column data originates from JNI/Java memory-mapped buffers.
     let mut views = unsafe {
         page_chunk_views::<T>(columns, first_partition_start, last_partition_end, window)
@@ -261,7 +269,14 @@ fn simd_segments_to_page<T: SimdEncodable>(
     match views.next() {
         None => {
             // Single view: use SIMD-accelerated path (fused def levels + stats + bloom).
-            simd_single_view_page(first, options, primitive_type, bloom_hashes, encoding)
+            simd_single_view_page(
+                first,
+                options,
+                primitive_type,
+                bloom_hashes,
+                encoding,
+                use_pco,
+            )
         }
         Some(second) => {
             // Multiple views: scalar single-pass fallback.
@@ -273,6 +288,7 @@ fn simd_segments_to_page<T: SimdEncodable>(
                 primitive_type,
                 bloom_hashes,
                 encoding,
+                use_pco,
             )
         }
     }
@@ -285,6 +301,7 @@ fn simd_single_view_page<T: SimdEncodable>(
     primitive_type: PrimitiveType,
     bloom_hashes: Option<&mut HashSet<u64>>,
     encoding: Encoding,
+    use_pco: bool,
 ) -> ParquetResult<Page> {
     let num_rows = view.num_rows();
     let mut buffer = Vec::new();
@@ -319,7 +336,22 @@ fn simd_single_view_page<T: SimdEncodable>(
     let definition_levels_byte_length = buffer.len();
     let null_count = view.adjusted_column_top + result.null_count;
 
-    let buffer = T::encode_data(view.slice, result.null_count, encoding, buffer)?;
+    // pco columns store a single blob of the present values (page header still
+    // reads PLAIN); a `QdbMetaColFormat::PcoEncoded` marker tells the reader to
+    // pco-decode. Otherwise encode the values with the chosen Parquet encoding.
+    let buffer = if use_pco {
+        let mut buffer = buffer;
+        let non_null: Vec<T> = view
+            .slice
+            .iter()
+            .copied()
+            .filter(|v| !v.is_null())
+            .collect();
+        T::encode_pco(&non_null, &mut buffer)?;
+        buffer
+    } else {
+        T::encode_data(view.slice, result.null_count, encoding, buffer)?
+    };
 
     let statistics = if options.write_statistics {
         Some(build_statistics(
@@ -355,6 +387,7 @@ fn simd_multi_view_page<'a, T: SimdEncodable>(
     primitive_type: PrimitiveType,
     mut bloom_hashes: Option<&mut HashSet<u64>>,
     encoding: Encoding,
+    use_pco: bool,
 ) -> ParquetResult<Page> {
     let num_rows = window.row_count;
     let mut validity = FlatValidity::new();
@@ -397,11 +430,21 @@ fn simd_multi_view_page<'a, T: SimdEncodable>(
                 if let Some(ref mut h) = bloom_hashes {
                     h.insert(hash_native(value));
                 }
-                if encoding == Encoding::Plain {
+                if encoding == Encoding::Plain && !use_pco {
                     buffer.extend_from_slice(value.to_bytes().as_ref());
                 }
             }
         }
+    }
+
+    // pco columns (page header reads PLAIN) store one blob of the present values
+    // across all views; the reader pco-decodes it. See `QdbMetaColFormat`.
+    if use_pco {
+        let mut non_null: Vec<T> = Vec::with_capacity(num_rows - null_count);
+        for view in &views {
+            non_null.extend(view.slice.iter().copied().filter(|v| !v.is_null()));
+        }
+        T::encode_pco(&non_null, &mut buffer)?;
     }
 
     // BYTE_STREAM_SPLIT writes K per-byte streams instead of contiguous values:

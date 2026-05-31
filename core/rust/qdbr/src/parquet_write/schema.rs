@@ -450,6 +450,14 @@ pub fn to_parquet_schema(
     for column in partition.columns.iter() {
         let format = if column.data_type.tag() == ColumnTypeTag::Symbol {
             Some(QdbMetaColFormat::LocalKeyIsGlobal)
+        } else if matches!(
+            column.data_type.tag(),
+            ColumnTypeTag::Float | ColumnTypeTag::Double
+        ) && column.parquet_encoding_config.is_pco()
+        {
+            // The data pages hold a pco blob written as PLAIN; the reader must
+            // pco-decode them. See `parquet_read::decode` and `pco_codec`.
+            Some(QdbMetaColFormat::PcoEncoded)
         } else {
             None
         };
@@ -596,7 +604,19 @@ pub fn to_compressions(partition: &Partition) -> Vec<Option<CompressionOptions>>
     partition
         .columns
         .iter()
-        .map(|c| c.parquet_encoding_config.compression())
+        .map(|c| {
+            // pco pages are already entropy-coded; a Parquet codec on top only
+            // wastes CPU and can grow the page, so force Uncompressed for them.
+            if matches!(
+                c.data_type.tag(),
+                ColumnTypeTag::Float | ColumnTypeTag::Double
+            ) && c.parquet_encoding_config.is_pco()
+            {
+                Some(CompressionOptions::Uncompressed)
+            } else {
+                c.parquet_encoding_config.compression()
+            }
+        })
         .collect()
 }
 
@@ -664,6 +684,17 @@ impl ParquetEncodingConfig {
         } else {
             Some(keep)
         }
+    }
+
+    /// Whether a FLOAT/DOUBLE column should use the pco numeric codec rather
+    /// than a standard Parquet encoding. pco is the default back end for the
+    /// lossy float path: it applies when lossy rounding is requested and the
+    /// user has not pinned a standard encoding. Pinning one (e.g.
+    /// `BYTE_STREAM_SPLIT`) is the escape hatch for callers that need the file
+    /// to stay readable by external Parquet tools. The caller applies this only
+    /// to FLOAT/DOUBLE columns; other types ignore it.
+    pub fn is_pco(self) -> bool {
+        self.lossy_keep_bits().is_some() && self.encoding().is_none()
     }
 
     /// Pack lossy keep-bits into an existing config. Test-only helper.

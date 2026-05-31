@@ -437,7 +437,11 @@ fn run_real_dataset(name: &str, data: &[f32]) {
     for keep in [23u32, 12, 11] {
         let rounded: Vec<f32> = data.iter().map(|&x| round_f32(x, keep)).collect();
         let (rmax, _) = rel_error_f32(data, &rounded);
-        let keep_disp = if keep >= 23 { "full".to_string() } else { keep.to_string() };
+        let keep_disp = if keep >= 23 {
+            "full".to_string()
+        } else {
+            keep.to_string()
+        };
 
         // round -> BYTE_STREAM_SPLIT -> zstd (the shipped lossy path).
         let mut enc = 0.0;

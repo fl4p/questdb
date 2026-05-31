@@ -242,6 +242,9 @@ fn decode_page_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
 ) -> ParquetResult<()> {
     let (_rep_levels, _, values_buffer) = split_buffer(page)?;
     let column_type = col_info.column_type;
+    // A pco-encoded FLOAT/DOUBLE column writes its values as a pco blob behind a
+    // PLAIN page header; the marker tells the decoder to pco-decode instead.
+    let is_pco = col_info.format == Some(QdbMetaColFormat::PcoEncoded);
 
     let primitive_type = &page.descriptor.primitive_type;
     let supported = match primitive_type.physical_type {
@@ -293,6 +296,7 @@ fn decode_page_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
             values_buffer,
             bufs,
             column_type,
+            is_pco,
             mode,
         ),
         typ => decode_other_fixed_dispatch::<FILTERED, FILL_NULLS>(
@@ -302,6 +306,7 @@ fn decode_page_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
             bufs,
             column_type,
             typ,
+            is_pco,
             mode,
         ),
     }?;
@@ -1396,6 +1401,21 @@ fn decode_int96_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
 /// every value; this interleaves them: out[j*elem_size + k] = data[k*n + j],
 /// with n the number of values. The reconstructed buffer is then handed to the
 /// ordinary Plain decoder, so null handling and filtering stay shared.
+/// Decode a pco blob into the PLAIN little-endian value bytes the primitive
+/// decoder expects. The blob holds only the present (non-null) values; the
+/// caller's definition-level handling scatters them back into null positions.
+fn pco_decode_to_value_bytes<T: pco::data_types::Number>(
+    values_buffer: &[u8],
+) -> ParquetResult<Vec<u8>> {
+    let values: Vec<T> = crate::parquet::pco_codec::decompress(values_buffer)?;
+    let byte_len = std::mem::size_of_val(values.as_slice());
+    // SAFETY: T is a plain numeric type with no padding; reinterpreting its
+    // contiguous storage as bytes is valid and u8 has no alignment requirement.
+    // QuestDB targets are little-endian, matching the Parquet PLAIN layout.
+    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
+    Ok(bytes.to_vec())
+}
+
 fn byte_stream_split_to_plain(data: &[u8], elem_size: usize) -> ParquetResult<Vec<u8>> {
     if elem_size == 0 || !data.len().is_multiple_of(elem_size) {
         return Err(fmt_err!(
@@ -1422,10 +1442,22 @@ fn decode_double_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
     values_buffer: &[u8],
     bufs: &mut ColumnChunkBuffers,
     column_type: ColumnType,
+    is_pco: bool,
     mode: DecodeModeContext<'_>,
 ) -> ParquetResult<bool> {
     let row_hi = mode.source_row_count();
     let row_count = mode.sliced_row_count();
+
+    if is_pco && column_type.tag() == ColumnTypeTag::Double {
+        clear_aux_buffers(bufs);
+        let reconstructed = pco_decode_to_value_bytes::<f64>(values_buffer)?;
+        decode_page0_mode::<_, FILTERED, FILL_NULLS>(
+            page,
+            mode,
+            &mut PlainPrimitiveDecoder::<f64>::new(&reconstructed, bufs, f64::NAN),
+        )?;
+        return Ok(true);
+    }
 
     match (page.encoding(), dict, column_type.tag()) {
         (Encoding::Plain, _, ColumnTypeTag::Double) => {
@@ -1490,6 +1522,7 @@ fn decode_double_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_other_fixed_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
     page: &DataPage,
     dict: Option<&DictPage>,
@@ -1497,10 +1530,22 @@ fn decode_other_fixed_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
     bufs: &mut ColumnChunkBuffers,
     column_type: ColumnType,
     typ: PhysicalType,
+    is_pco: bool,
     mode: DecodeModeContext<'_>,
 ) -> ParquetResult<bool> {
     let row_hi = mode.source_row_count();
     clear_aux_buffers(bufs);
+
+    if is_pco && typ == PhysicalType::Float && column_type.tag() == ColumnTypeTag::Float {
+        let reconstructed = pco_decode_to_value_bytes::<f32>(values_buffer)?;
+        decode_page0_mode::<_, FILTERED, FILL_NULLS>(
+            page,
+            mode,
+            &mut PlainPrimitiveDecoder::<f32>::new(&reconstructed, bufs, f32::NAN),
+        )?;
+        return Ok(true);
+    }
+
     match (page.encoding(), dict, typ, column_type.tag()) {
         (
             Encoding::RleDictionary | Encoding::PlainDictionary,
@@ -2304,7 +2349,7 @@ pub(super) fn page_row_count(page: &DataPage, column_type: ColumnType) -> Parque
 mod tests {
     use super::{decode_page, decode_page_filtered};
     use crate::allocator::{AcVec, TestAllocatorState};
-    use crate::parquet::qdb_metadata::{QdbMetaCol, QdbMetaColFormat};
+    use crate::parquet::qdb_metadata::QdbMetaCol;
     use crate::parquet::tests::ColumnTypeTagExt;
     use crate::parquet_read::page::{DataPage, DictPage};
     use crate::parquet_read::{ColumnChunkBuffers, DecodeContext, ParquetDecoder, RowGroupBuffers};
@@ -2741,6 +2786,135 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_decode_pco_double_lossy_rounding() {
+        // pco with real mantissa rounding (keep=10): the encoder rounds each
+        // value before pco-compressing, so decoded values must equal
+        // round_f64(original, 10) exactly (pco itself is lossless), with the
+        // NaN nulls preserved. Proves the round -> pco -> decode composition.
+        use crate::parquet_write::lossy::round_f64;
+        use crate::parquet_write::schema::ParquetEncodingConfig;
+        let keep = 10u32;
+        let cfg = ParquetEncodingConfig::new(0, 0, -1)
+            .with_lossy_keep_bits(keep)
+            .raw();
+        // Values run up to row_count/2; they must exceed 2^11 so that keep=10
+        // mantissa bits actually drops precision (smaller integers are exact).
+        let (row_count, row_group_size, data_page_size) = (10000, 1000, 1000);
+        let version = Version::V2;
+
+        let mut buffs =
+            create_col_data_buff::<f64, 8, _>(row_count, f64::NAN.to_le_bytes(), |d: f64| {
+                d.to_le_bytes()
+            });
+
+        // Build the expected buffer: every non-null value rounded to `keep`
+        // mantissa bits, NaN nulls left untouched.
+        let tas = TestAllocatorState::new();
+        let mut expected = AcVec::new_in(tas.allocator());
+        expected.extend_with(buffs.data_vec.len(), 0u8).unwrap();
+        expected.copy_from_slice(buffs.data_vec.as_ref());
+        let mut any_changed = false;
+        for chunk in expected.chunks_exact_mut(8) {
+            let v = f64::from_le_bytes(chunk.try_into().unwrap());
+            if !v.is_nan() {
+                let r = round_f64(v, keep);
+                if r.to_bits() != v.to_bits() {
+                    any_changed = true;
+                }
+                chunk.copy_from_slice(&r.to_le_bytes());
+            }
+        }
+        assert!(any_changed, "keep=10 should have rounded some values");
+        buffs.expected_data_buff = Some(expected);
+
+        let columns = vec![create_fix_column_with_config(
+            0,
+            row_count,
+            "double_col",
+            buffs.data_vec.as_ref(),
+            ColumnTypeTag::Double.into_type(),
+            cfg,
+        )];
+        let expected_buffs = vec![(buffs, ColumnTypeTag::Double.into_type())];
+
+        assert_columns(
+            row_count,
+            row_group_size,
+            data_page_size,
+            version,
+            columns,
+            &expected_buffs,
+        );
+    }
+
+    #[test]
+    fn test_decode_pco_double_and_float() {
+        // pco config: lossy keep-bits set (the trigger) with no explicit encoding
+        // (encoding id 0), so ParquetEncodingConfig::is_pco() is true. keep=52 for
+        // Double / keep=23 for Float makes the mantissa rounding a no-op, so the
+        // round trip is lossless and the decoded values must equal the originals.
+        // This exercises the full pco path: encode_pco -> PLAIN page + PcoEncoded
+        // marker -> reader sources the marker from QdbMeta -> pco-decode -> scatter
+        // into the NaN-null positions placed at every other row.
+        use crate::parquet_write::schema::ParquetEncodingConfig;
+        let pco_double_cfg = ParquetEncodingConfig::new(0, 0, -1)
+            .with_lossy_keep_bits(52)
+            .raw();
+        let pco_float_cfg = ParquetEncodingConfig::new(0, 0, -1)
+            .with_lossy_keep_bits(23)
+            .raw();
+
+        #[cfg(miri)]
+        let (row_count, row_group_size, data_page_size) = (100, 10, 10);
+        #[cfg(not(miri))]
+        let (row_count, row_group_size, data_page_size) = (10000, 1000, 1000);
+        let version = Version::V2;
+
+        let expected_buffs: Vec<(ColumnBuffers, ColumnType)> = vec![
+            (
+                create_col_data_buff::<f64, 8, _>(row_count, f64::NAN.to_le_bytes(), |d: f64| {
+                    d.to_le_bytes()
+                }),
+                ColumnTypeTag::Double.into_type(),
+            ),
+            (
+                create_col_data_buff::<f32, 4, _>(row_count, f32::NAN.to_le_bytes(), |d: f32| {
+                    d.to_le_bytes()
+                }),
+                ColumnTypeTag::Float.into_type(),
+            ),
+        ];
+
+        let columns = vec![
+            create_fix_column_with_config(
+                0,
+                row_count,
+                "double_col",
+                expected_buffs[0].0.data_vec.as_ref(),
+                ColumnTypeTag::Double.into_type(),
+                pco_double_cfg,
+            ),
+            create_fix_column_with_config(
+                1,
+                row_count,
+                "float_col",
+                expected_buffs[1].0.data_vec.as_ref(),
+                ColumnTypeTag::Float.into_type(),
+                pco_float_cfg,
+            ),
+        ];
+
+        assert_columns(
+            row_count,
+            row_group_size,
+            data_page_size,
+            version,
+            columns,
+            &expected_buffs,
+        );
+    }
+
     fn assert_columns(
         row_count: usize,
         row_group_size: usize,
@@ -2766,11 +2940,14 @@ mod tests {
 
         for (column_index, (column_buffs, column_type)) in expected_buffs.iter().enumerate() {
             let column_type = *column_type;
-            let format = if column_type.tag() == ColumnTypeTag::Symbol {
-                Some(QdbMetaColFormat::LocalKeyIsGlobal)
-            } else {
-                None
-            };
+            // Source the per-column format from the file's QdbMeta exactly as the
+            // production read path does (row_groups.rs), so markers such as
+            // PcoEncoded and LocalKeyIsGlobal reach the decoder.
+            let format = decoder
+                .qdb_meta
+                .as_ref()
+                .and_then(|m| m.schema.get(column_index))
+                .and_then(|c| c.format);
             let mut data_offset = 0usize;
             let mut col_row_count = 0usize;
             let expected = column_buffs
