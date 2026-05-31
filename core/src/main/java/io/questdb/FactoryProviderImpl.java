@@ -50,6 +50,7 @@ import io.questdb.cutlass.http.HttpSessionStoreImpl;
 import io.questdb.cutlass.http.MultiUserHttpAuthenticatorFactory;
 import io.questdb.cutlass.http.StaticHttpAuthenticatorFactory;
 import io.questdb.cutlass.line.tcp.StaticChallengeResponseMatcher;
+import io.questdb.cutlass.pgwire.AclPGAuthenticatorFactory;
 import io.questdb.cutlass.pgwire.DefaultPGAuthenticatorFactory;
 import io.questdb.cutlass.pgwire.PGAuthenticatorFactory;
 import io.questdb.cutlass.pgwire.PGConfiguration;
@@ -83,7 +84,9 @@ public class FactoryProviderImpl implements FactoryProvider {
         securityContextFactory = aclStore != null
                 ? new PrefixAwareSecurityContextFactory(aclStore, baseSecurityContextFactory)
                 : baseSecurityContextFactory;
-        pgAuthenticatorFactory = new DefaultPGAuthenticatorFactory(configuration);
+        pgAuthenticatorFactory = aclStore != null
+                ? new AclPGAuthenticatorFactory(configuration, aclStore)
+                : new DefaultPGAuthenticatorFactory(configuration);
         httpAuthenticatorFactory = aclStore != null
                 ? new MultiUserHttpAuthenticatorFactory(aclStore)
                 : getHttpAuthenticatorFactory(configuration);
