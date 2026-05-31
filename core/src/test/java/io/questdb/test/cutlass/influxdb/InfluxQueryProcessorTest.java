@@ -126,6 +126,83 @@ public class InfluxQueryProcessorTest extends AbstractBootstrapTest {
     }
 
     @Test
+    public void testFillModes() throws Exception {
+        // table "g" has a gap: points at base and base+20s, nothing at base+10s,
+        // so SAMPLE BY 10s leaves the middle bucket empty for fill() to act on
+        TestUtils.assertMemoryLeak(() -> {
+            try (final TestServerMain serverMain = startWithEnvVariables()) {
+                final int port = serverMain.getHttpServerPort();
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP).address("localhost:" + port).build()) {
+                    sender.table("g").doubleColumn("value", 10.0).at(BASE_MS, ChronoUnit.MILLIS);
+                    sender.table("g").doubleColumn("value", 30.0).at(BASE_MS + 20_000, ChronoUnit.MILLIS);
+                    sender.flush();
+                }
+                serverMain.awaitTable("g");
+                serverMain.assertSql("SELECT count() FROM g", "count\n2\n");
+
+                final String base = "SELECT mean(\"value\") FROM \"g\" WHERE time >= 1704067200000ms AND time <= 1704067220000ms GROUP BY time(10s) ";
+                try (HttpClient client = HttpClientFactory.newPlainTextInstance()) {
+                    assertQuery(client, port, base + "fill(null)",
+                            series("g", null, "[[1704067200000,10.0],[1704067210000,null],[1704067220000,30.0]]"));
+                    // default (no fill) must behave like fill(null) — the common Grafana case
+                    assertQuery(client, port, base.trim(),
+                            series("g", null, "[[1704067200000,10.0],[1704067210000,null],[1704067220000,30.0]]"));
+                    assertQuery(client, port, base + "fill(previous)",
+                            series("g", null, "[[1704067200000,10.0],[1704067210000,10.0],[1704067220000,30.0]]"));
+                    assertQuery(client, port, base + "fill(0)",
+                            series("g", null, "[[1704067200000,10.0],[1704067210000,0.0],[1704067220000,30.0]]"));
+                    assertQuery(client, port, base + "fill(linear)",
+                            series("g", null, "[[1704067200000,10.0],[1704067210000,20.0],[1704067220000,30.0]]"));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testOrderByDesc() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (final TestServerMain serverMain = startWithEnvVariables()) {
+                seed(serverMain);
+                final int port = serverMain.getHttpServerPort();
+                try (HttpClient client = HttpClientFactory.newPlainTextInstance()) {
+                    // tag grouping (host ASC) preserved while time runs DESC within each series
+                    assertQuery(client, port,
+                            "SELECT mean(\"value\") FROM \"m\" WHERE time >= 1704067200000ms AND time <= 1704067210000ms GROUP BY time(10s), \"host\" fill(none) ORDER BY time DESC",
+                            "{\"results\":[{\"statement_id\":0,\"series\":[" +
+                                    "{\"name\":\"m\",\"tags\":{\"host\":\"h1\"},\"columns\":[\"time\",\"mean\"],\"values\":[[1704067210000,3.0],[1704067200000,1.0]]}," +
+                                    "{\"name\":\"m\",\"tags\":{\"host\":\"h2\"},\"columns\":[\"time\",\"mean\"],\"values\":[[1704067200000,5.0]]}" +
+                                    "]}]}");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testWhereFilters() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (final TestServerMain serverMain = startWithEnvVariables()) {
+                seed(serverMain);
+                final int port = serverMain.getHttpServerPort();
+                final String h1Only = series("m", null, "[[1704067200000,1.0],[1704067210000,3.0]]");
+                try (HttpClient client = HttpClientFactory.newPlainTextInstance()) {
+                    // equality tag filter
+                    assertQuery(client, port,
+                            "SELECT mean(\"value\") FROM \"m\" WHERE (\"host\" = 'h1') AND time >= 1704067200000ms AND time <= 1704067210000ms GROUP BY time(10s) fill(none)",
+                            h1Only);
+                    // regex tag filter =~
+                    assertQuery(client, port,
+                            "SELECT mean(\"value\") FROM \"m\" WHERE (\"host\" =~ /h1/) AND time >= 1704067200000ms AND time <= 1704067210000ms GROUP BY time(10s) fill(none)",
+                            h1Only);
+                    // now()-relative time bound (huge window includes the 2024 data regardless of wall clock)
+                    assertQuery(client, port,
+                            "SELECT mean(\"value\") FROM \"m\" WHERE (\"host\" = 'h1') AND time > now() - 9999d GROUP BY time(10s) fill(none)",
+                            h1Only);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testErrors() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (final TestServerMain serverMain = startWithEnvVariables()) {
@@ -265,6 +342,13 @@ public class InfluxQueryProcessorTest extends AbstractBootstrapTest {
             rh.await();
             TestUtils.assertEquals(expectedStatus, rh.getStatusCode());
         }
+    }
+
+    // Builds the expected JSON for a single-series result with columns [time, mean].
+    private static String series(String name, String tags, String valuesJson) {
+        final String tagsPart = tags == null ? "" : "\"tags\":" + tags + ",";
+        return "{\"results\":[{\"statement_id\":0,\"series\":[{\"name\":\"" + name + "\","
+                + tagsPart + "\"columns\":[\"time\",\"mean\"],\"values\":" + valuesJson + "}]}]}";
     }
 
     private void seed(TestServerMain serverMain) {
