@@ -352,15 +352,19 @@ def _build_reader(source_type: str, args) -> InfluxReader:
             url=args.influx_url,
             username=args.influx_user,
             password=args.influx_password,
+            page_size=args.page_size,
         )
     from readers.v2 import V2Reader
 
     if not args.influx_token or not args.influx_org:
         raise SystemExit("v2 source requires --influx-token and --influx-org")
+    from datetime import timedelta
+
     return V2Reader(
         url=args.influx_url,
         token=args.influx_token,
         org=args.influx_org,
+        window=timedelta(minutes=args.v2_window_minutes),
     )
 
 
@@ -427,6 +431,20 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     src.add_argument("--influx-password", default="", help="v1 password")
     src.add_argument("--influx-token", default="", help="v2 API token")
     src.add_argument("--influx-org", default="", help="v2 organization")
+    src.add_argument(
+        "--page-size",
+        type=int,
+        default=50_000,
+        help="v1 read pagination: rows per SELECT page (bounds reader memory)",
+    )
+    src.add_argument(
+        "--v2-window-minutes",
+        type=int,
+        default=60,
+        help="v2 read time-window size in minutes (bounds per-query work; a "
+        "single unbounded query times out on large buckets -- lower this for "
+        "very dense data)",
+    )
 
     tgt = p.add_argument_group("target (QuestDB)")
     tgt.add_argument(

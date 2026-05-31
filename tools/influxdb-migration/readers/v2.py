@@ -2,16 +2,17 @@
 
 Uses the ``influxdb-client`` library, imported lazily. Buckets play the role of
 v1 databases (one bucket -> one ``<bucket>_`` table prefix). Schema comes from
-the Flux ``schema.tagKeys`` / ``schema.fieldKeys`` helpers; data is streamed
-record-by-record via ``query_stream`` so a large bucket never materializes in
-memory; principals are derived from API tokens (authorizations), since v2 has
-no per-database READ/WRITE user model.
+the Flux ``schema.tagKeys`` / ``schema.fieldKeys`` helpers; data is read in
+bounded time windows (one request each, retried on transient drops) so a large
+bucket never materializes in full -- only one window at a time; principals are
+derived from API tokens (authorizations), since v2 has no per-database
+READ/WRITE user model.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterator, List, Optional
 
 from model import (
@@ -46,7 +47,8 @@ class V2Reader(InfluxReader):
         url: str,
         token: str,
         org: str,
-        timeout_ms: int = 120_000,
+        window: Optional[timedelta] = None,
+        timeout_ms: int = 300_000,
     ):
         try:
             from influxdb_client import InfluxDBClient  # lazy import
@@ -57,6 +59,11 @@ class V2Reader(InfluxReader):
             ) from exc
 
         self._org = org
+        # Read the data in time windows: a single unbounded range(start: 0) query
+        # over a large bucket makes InfluxDB compute the whole pivot before
+        # streaming a byte, which blows the client read timeout. Each window is
+        # streamed (bounded memory) AND time-bounded (bounded server work).
+        self._window = window or timedelta(hours=1)
         self._client = InfluxDBClient(url=url, token=token, org=org, timeout=timeout_ms)
         self._query_api = self._client.query_api()
 
@@ -101,37 +108,86 @@ class V2Reader(InfluxReader):
 
     def rows(self, scope: str, measurement: str, schema: TableSchema) -> Iterator[Row]:
         tag_set = set(schema.tag_keys)
-        # Stream the whole measurement over all time. query_stream() yields one
-        # FluxRecord at a time, so a large bucket never materializes in memory;
-        # range(start: 0) lets InfluxDB default the stop bound to now(). pivot
-        # turns the long _field/_value form into one row per timestamp + tagset.
+        oldest = self._oldest(scope, measurement)
+        if oldest is None:
+            return
+        # Half-open [start, stop) windows with shared boundaries (start of the
+        # next window == stop of this one), so every point falls in exactly one
+        # window -- no loss, no duplication. Each window is read in full (one
+        # request, retried on transient drops) so memory is bounded by the
+        # window size, not the whole bucket. pivot turns the long _field/_value
+        # form into one row per timestamp + tagset.
+        newest = self._newest(scope, measurement) or oldest
+        start = oldest
+        # Window only across the actual data span [oldest, newest], not up to
+        # now(): backfilled data can sit years in the past, and stepping to now()
+        # would issue tens of thousands of empty windows. +1us makes the final
+        # window's exclusive stop include the newest point.
+        end = newest + timedelta(microseconds=1)
+        while start < end:
+            stop = min(start + self._window, end)
+            flux = (
+                f'from(bucket: "{_esc(scope)}")\n'
+                f"  |> range(start: {_rfc3339(start)}, stop: {_rfc3339(stop)})\n"
+                f'  |> filter(fn: (r) => r._measurement == "{_esc(measurement)}")\n'
+                f'  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")'
+            )
+            for rec in self._flat_records(flux):
+                ts_ns = _ns(rec.get("_time"))
+                if ts_ns is None:
+                    continue
+                tags = {}
+                fields = {}
+                for key, value in rec.items():
+                    if key in _RESERVED or key.startswith("_") or value is None:
+                        continue
+                    if key in tag_set:
+                        sval = str(value)
+                        if sval == "":
+                            continue
+                        tags[key] = sval
+                        continue
+                    fields[key] = value
+                    ft = _PY_TYPE_MAP.get(type(value))
+                    if ft is not None:
+                        schema.field_types[key] = ft
+                yield Row(table=measurement, tags=tags, fields=fields, ts_ns=ts_ns)
+            start = stop
+
+    def _oldest(self, scope: str, measurement: str) -> Optional[datetime]:
+        # Earliest timestamp, so windowing starts at real data rather than
+        # scanning from epoch. first() returns the earliest row per series and
+        # operates on _value (which exists), so we must NOT strip columns first;
+        # take the minimum _time across the returned rows. Streamed, so it stays
+        # cheap on large buckets.
         flux = (
             f'from(bucket: "{_esc(scope)}")\n'
             f"  |> range(start: 0)\n"
             f'  |> filter(fn: (r) => r._measurement == "{_esc(measurement)}")\n'
-            f'  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")'
+            f"  |> first()"
         )
-        for record in self._query_api.query_stream(flux, org=self._org):
-            rec = record.values
-            ts_ns = _ns(rec.get("_time"))
-            if ts_ns is None:
-                continue
-            tags = {}
-            fields = {}
-            for key, value in rec.items():
-                if key in _RESERVED or key.startswith("_") or value is None:
-                    continue
-                if key in tag_set:
-                    sval = str(value)
-                    if sval == "":
-                        continue
-                    tags[key] = sval
-                    continue
-                fields[key] = value
-                ft = _PY_TYPE_MAP.get(type(value))
-                if ft is not None:
-                    schema.field_types[key] = ft
-            yield Row(table=measurement, tags=tags, fields=fields, ts_ns=ts_ns)
+        earliest: Optional[datetime] = None
+        for rec in self._flat_records(flux):
+            t = _to_dt(rec.get("_time"))
+            if t is not None and (earliest is None or t < earliest):
+                earliest = t
+        return earliest
+
+    def _newest(self, scope: str, measurement: str) -> Optional[datetime]:
+        # Latest timestamp, to bound windowing to the real data span. last()
+        # mirrors first(): latest row per series, operating on _value.
+        flux = (
+            f'from(bucket: "{_esc(scope)}")\n'
+            f"  |> range(start: 0)\n"
+            f'  |> filter(fn: (r) => r._measurement == "{_esc(measurement)}")\n'
+            f"  |> last()"
+        )
+        latest: Optional[datetime] = None
+        for rec in self._flat_records(flux):
+            t = _to_dt(rec.get("_time"))
+            if t is not None and (latest is None or t > latest):
+                latest = t
+        return latest
 
     def principals(self) -> List[Principal]:
         principals: List[Principal] = []
@@ -185,13 +241,27 @@ class V2Reader(InfluxReader):
         except Exception:  # noqa: BLE001
             return {}
 
-    def _flat_records(self, flux: str):
-        tables = self._query_api.query(flux, org=self._org)
-        out = []
-        for table in tables:
-            for record in table.records:
-                out.append(record.values)
-        return out
+    def _flat_records(self, flux: str, attempts: int = 4):
+        # query() returns the whole (window-bounded) result in one request and
+        # materializes it, so a retry after a transient connection drop
+        # (RemoteDisconnected / read timeout from a stale pooled connection
+        # between windows) re-reads the window cleanly -- no half-written window,
+        # no duplicates. Memory is bounded by the window size (lower
+        # --v2-window-minutes for very dense data).
+        import time as _time
+
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                tables = self._query_api.query(flux, org=self._org)
+                return [record.values for table in tables for record in table.records]
+            except Exception as exc:  # noqa: BLE001 - transient HTTP/connection errors
+                last_exc = exc
+                log.warning(
+                    "v2 query attempt %d/%d failed: %s", attempt + 1, attempts, exc
+                )
+                _time.sleep(min(2.0, 0.5 * (attempt + 1)))
+        raise last_exc
 
     def close(self) -> None:
         try:
@@ -218,6 +288,12 @@ def _is_all_access(auth) -> bool:
 
 def _esc(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _rfc3339(dt: datetime) -> str:
+    # Microsecond precision so a sub-second window bound is not truncated. The
+    # bound only filters; half-open windows with shared edges keep every point.
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _to_dt(value) -> Optional[datetime]:

@@ -150,6 +150,14 @@ only by the server account.
   for non-HTTP ILP transports (with a warning).
 - **Batching:** the ILP `Sender` buffers and auto-flushes; `--batch-size N` sets
   `auto_flush_rows` so a batch flushes every N rows.
+- **Large datasets / memory.** Neither reader loads a whole measurement at once:
+  the v1 reader keyset-paginates by time (`--page-size`, rows per page); the v2
+  reader reads in time windows (`--v2-window-minutes`), one request per window
+  with retry on transient drops. Lower `--v2-window-minutes` for dense data: a
+  window that is too large makes the InfluxDB **server** compute a huge `pivot`,
+  which both blows the client read timeout and can OOM the source server.
+  Validated end to end at ~22M rows / ~1.3 GB per source with ~110-120 MB peak
+  client RSS on both paths.
 - **ILP ingestion bypasses ACL** (it uses the existing ILP auth), so the
   migration itself is unaffected by `acl.conf`; the ACL only governs later
   HTTP/`/query`/REST reads.

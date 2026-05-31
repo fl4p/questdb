@@ -2,15 +2,16 @@
 
 Uses the ``influxdb`` client library, imported lazily so v2-only users do not
 need it installed. Schema comes from ``SHOW TAG KEYS`` / ``SHOW FIELD KEYS``;
-data is read with a per-measurement ``SELECT *`` at nanosecond epoch precision
-(chunked mode is avoided -- it triggers a msgpack bug in influxdb-python 5.x);
-principals come from ``SHOW USERS`` / ``SHOW GRANTS``.
+data is read with ``SELECT *`` keyset-paginated by time (``LIMIT`` + a
+``time >= cursor`` bound) at nanosecond epoch precision, which bounds memory on
+large measurements (chunked mode is avoided -- it triggers a msgpack bug in
+influxdb-python 5.x); principals come from ``SHOW USERS`` / ``SHOW GRANTS``.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Iterator, List
+from typing import Iterator, List, Optional
 
 from model import (
     Access,
@@ -36,7 +37,14 @@ _FIELD_TYPE_MAP = {
 class V1Reader(InfluxReader):
     """Reads one InfluxDB 1.x server."""
 
-    def __init__(self, url: str, username: str = "", password: str = "", timeout: int = 60):
+    def __init__(
+        self,
+        url: str,
+        username: str = "",
+        password: str = "",
+        timeout: int = 60,
+        page_size: int = 50_000,
+    ):
         try:
             from influxdb import InfluxDBClient  # lazy import
         except ImportError as exc:  # pragma: no cover - dependency guidance
@@ -44,6 +52,7 @@ class V1Reader(InfluxReader):
                 "InfluxDB v1 source needs the 'influxdb' package: pip install influxdb"
             ) from exc
 
+        self._page_size = max(1, page_size)
         host, port, ssl = _parse_url(url)
         self._client = InfluxDBClient(
             host=host,
@@ -91,36 +100,78 @@ class V1Reader(InfluxReader):
         self._client.switch_database(scope)
         tag_set = set(schema.tag_keys)
         field_set = set(schema.field_types)
-        # SELECT * returns time + tags + fields in each row. We deliberately do
-        # NOT use chunked=True: with influxdb-python 5.x + a msgpack response the
-        # client raises msgpack ExtraData on chunked reads (and otherwise yields
-        # raw lists, not ResultSets). The whole measurement is therefore read in
-        # one query; very large measurements are held in memory (see README).
-        result_set = self._client.query(
-            f'SELECT * FROM {_ident(measurement)}',
-            epoch="ns",
-        )
-        for point in result_set.get_points():
-            ts_ns = point.get("time")
-            if ts_ns is None:
-                continue  # a point with no timestamp cannot be placed
-            tags = {}
-            fields = {}
-            for key, value in point.items():
-                if key == "time" or value is None:
-                    continue  # skip the timestamp col and sparse/absent values
-                if key in tag_set:
-                    sval = str(value)
-                    if sval == "":
-                        continue  # empty tag -> no SYMBOL
-                    tags[key] = sval
-                elif key in field_set:
-                    fields[key] = value
-                else:
-                    # Column neither in tag nor field schema (e.g. a tag with
-                    # no values at schema time). Default to field.
-                    fields[key] = value
-            yield Row(table=measurement, tags=tags, fields=fields, ts_ns=int(ts_ns))
+        # Keyset-paginate by time to bound memory. chunked mode is unusable (it
+        # raises msgpack ExtraData in influxdb-python 5.x), and a single
+        # SELECT * would materialize the whole measurement. We page with
+        # ORDER BY time ASC LIMIT <page>, advancing a "time >= cursor" bound.
+        # Many series can share one timestamp, so the LIMIT may cut a timestamp
+        # in half: we hold back every row at the page's max timestamp and
+        # re-query from that timestamp, which re-reads it in full. SELECT *
+        # returns time + tags + fields per row.
+        page = self._page_size
+        cursor = None  # ns; None = from the beginning
+        while True:
+            where = "" if cursor is None else f" WHERE time >= {cursor}"
+            query = (
+                f"SELECT * FROM {_ident(measurement)}{where} "
+                f"ORDER BY time ASC LIMIT {page}"
+            )
+            points = list(self._client.query(query, epoch="ns").get_points())
+            if not points:
+                return
+            if len(points) < page:
+                # Final (partial) page: nothing held back, emit everything.
+                for point in points:
+                    row = self._point_to_row(point, measurement, tag_set, field_set)
+                    if row is not None:
+                        yield row
+                return
+            max_t = points[-1]["time"]
+            if any(p.get("time", max_t) < max_t for p in points):
+                # Hold back the boundary timestamp; re-read it next round.
+                for point in points:
+                    if point.get("time") == max_t:
+                        continue
+                    row = self._point_to_row(point, measurement, tag_set, field_set)
+                    if row is not None:
+                        yield row
+                cursor = max_t
+            else:
+                # The whole (full) page sits at one timestamp, so that timestamp
+                # has at least `page` rows and may have MORE than the page
+                # captured. Re-read the timestamp in full so none are skipped,
+                # then step strictly past it.
+                exact = self._client.query(
+                    f"SELECT * FROM {_ident(measurement)} WHERE time = {max_t}",
+                    epoch="ns",
+                ).get_points()
+                for point in exact:
+                    row = self._point_to_row(point, measurement, tag_set, field_set)
+                    if row is not None:
+                        yield row
+                cursor = max_t + 1
+
+    def _point_to_row(self, point, measurement, tag_set, field_set) -> "Optional[Row]":
+        ts_ns = point.get("time")
+        if ts_ns is None:
+            return None  # a point with no timestamp cannot be placed
+        tags = {}
+        fields = {}
+        for key, value in point.items():
+            if key == "time" or value is None:
+                continue  # skip the timestamp col and sparse/absent values
+            if key in tag_set:
+                sval = str(value)
+                if sval == "":
+                    continue  # empty tag -> no SYMBOL
+                tags[key] = sval
+            elif key in field_set:
+                fields[key] = value
+            else:
+                # Column neither in tag nor field schema (e.g. a tag with no
+                # values at schema time). Default to field.
+                fields[key] = value
+        return Row(table=measurement, tags=tags, fields=fields, ts_ns=int(ts_ns))
 
     def principals(self) -> List[Principal]:
         principals: List[Principal] = []
