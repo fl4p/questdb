@@ -1,0 +1,51 @@
+name: questdb-e2e
+
+# Disposable QuestDB instance for end-to-end testing. Targets Podman.
+#
+# Uses the official prebuilt image (NOT this repo's source) so it starts in
+# seconds. Storage is tmpfs, so every `up` begins with an empty database and
+# `down` leaves nothing behind - exactly what deterministic e2e runs want.
+#
+# Independent of the repo-root docker-compose.yml (the build-from-source,
+# one-instance-per-project setup). Run it with either:
+#   podman compose -f docker/docker-compose.yml up -d
+#   podman-compose -f docker/docker-compose.yml up -d
+# podman-compose has no `--wait`, so poll the health port afterwards (see
+# README). For the most backend-independent path, use the `podman run` line in
+# README instead of compose.
+
+services:
+  questdb:
+    image: docker.io/questdb/questdb:${QDB_VERSION:-latest}
+    container_name: questdb-e2e
+    # Do not restart: an e2e container should die when the test run ends.
+    restart: "no"
+    ports:
+      - "${QDB_HTTP_PORT:-9000}:9000"     # web console + REST
+      - "${QDB_PG_PORT:-8812}:8812"       # postgres wire
+      - "${QDB_ILP_PORT:-9009}:9009"      # influxdb line protocol (TCP)
+      - "${QDB_HEALTH_PORT:-9003}:9003"   # min server / health (/status)
+    environment:
+      # Quiet, reproducible test instance.
+      QDB_TELEMETRY_ENABLED: "false"
+    # Ephemeral storage: data lives in RAM and is discarded on container removal.
+    # Swap this for a bind mount (see README; add :Z on SELinux) if a test needs
+    # to inspect on-disk files or survive a restart.
+    tmpfs:
+      - /var/lib/questdb
+    # Under rootless Podman the hard limit is capped by your login limits; lower
+    # this or raise the user limit if startup complains.
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    # Readiness gate: the min HTTP server on 9003 only accepts connections once
+    # the database is up. Uses bash /dev/tcp so it needs no curl/wget in the
+    # image. podman compose honors depends_on.condition with a recent provider;
+    # podman-compose support varies, so prefer the README poll loop.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9003' 2>/dev/null || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+      start_period: 5s

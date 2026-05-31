@@ -1,0 +1,43 @@
+name: questdb-projects
+
+# One isolated QuestDB instance per project, built from this repo's source.
+# project-a defines the build and tags the image; project-b reuses that image.
+# Add a project by copying a service block, bumping the +100 ports, and adding a
+# new ./data/<project> bind mount.
+
+services:
+  project-a:
+    build:
+      context: .
+      dockerfile: core/Dockerfile
+      target: questdb
+    image: questdb-local:dev
+    container_name: questdb-project-a
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # web console + REST
+      - "8812:8812"   # postgres wire
+      - "9009:9009"   # influxdb line protocol (TCP)
+    volumes:
+      - ./data/project-a:/var/lib/questdb
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+  project-b:
+    image: questdb-local:dev          # reuses the image built by project-a
+    depends_on:
+      - project-a                     # ensures the image exists first
+    container_name: questdb-project-b
+    restart: unless-stopped
+    ports:
+      - "9100:9000"
+      - "8912:8812"
+      - "9109:9009"
+    volumes:
+      - ./data/project-b:/var/lib/questdb
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
