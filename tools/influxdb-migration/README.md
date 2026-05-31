@@ -84,6 +84,36 @@ The canonical `conf/acl.conf` is produced by the ACL tool from these two files,
 so there is a single acl.conf writer and prefixes stay consistent. This tool can
 also emit `acl.conf` itself with `--emit-acl-conf` (off by default).
 
+## Generate the canonical `acl.conf` (step 2)
+
+`acl_from_artifacts.py` is the canonical, standalone `acl.conf` writer. It reads
+the two artifacts from step 1 and never contacts InfluxDB or QuestDB, so you can
+(re)generate or adjust the ACL at any time — rotate passwords, change
+`--multi-scope-policy` — without re-running the migration.
+
+```bash
+# Step 1 — migrate data; emits both artifacts by default on a real run
+./influx_migrate.py --source-type v1 --influx-url http://localhost:8086 \
+    --influx-user admin --influx-password secret \
+    --questdb-ilp 'http::addr=localhost:9000;' \
+    --manifest-out migration-manifest.json --principals-out principals.json
+
+# Step 2 — generate the canonical conf/acl.conf from those artifacts
+./acl_from_artifacts.py \
+    --manifest migration-manifest.json \
+    --principals principals.json \
+    --acl-out conf/acl.conf \
+    --credentials-out credentials.csv
+```
+
+`--dry-run` reports the `acl.conf` it would write without touching disk.
+`--multi-scope-policy widest|skip|split-note` and `--password-map name,password`
+behave exactly as in the opt-in `--emit-acl-conf` path described below. The
+prefix for each user is taken **verbatim** from the manifest, so it always
+matches the tables the migration actually wrote — including `--no-prefix` runs,
+where the prefix is empty. A locked-down/no-grant user still gets a generated
+password line, because the fork's ACL loader rejects a user block without one.
+
 ## Users & permissions (`--emit-acl-conf`, opt-in)
 
 When you ask this tool to emit `acl.conf` directly, the mapping is:
