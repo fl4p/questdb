@@ -481,6 +481,15 @@ public interface CairoConfiguration {
 
     int getPartitionEncoderParquetDataPageSize();
 
+    /**
+     * Default Parquet encoding for FLOAT columns during native-to-Parquet partition conversion,
+     * applied only to columns that carry no explicit {@code PARQUET(...)} encoding. Returns one of
+     * the {@link io.questdb.griffin.engine.table.parquet.ParquetEncoding} {@code ENCODING_*}
+     * constants; {@code ENCODING_DEFAULT} leaves the choice to the encoder (the standard, externally
+     * readable layout). {@code ENCODING_PCO} produces a denser but QuestDB-internal column.
+     */
+    int getPartitionEncoderParquetFloatEncoding();
+
     double getPartitionEncoderParquetMinCompressionRatio();
 
     long getPartitionEncoderParquetO3RewriteUnusedMaxBytes();

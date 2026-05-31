@@ -59,6 +59,7 @@ import io.questdb.cutlass.text.CsvFileIndexer;
 import io.questdb.cutlass.text.TextConfiguration;
 import io.questdb.cutlass.text.types.InputFormatConfiguration;
 import io.questdb.griffin.engine.table.parquet.ParquetCompression;
+import io.questdb.griffin.engine.table.parquet.ParquetEncoding;
 import io.questdb.griffin.engine.table.parquet.ParquetVersion;
 import io.questdb.griffin.engine.table.parquet.PartitionEncoder;
 import io.questdb.log.Log;
@@ -392,6 +393,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final int partitionEncoderParquetCompressionCodec;
     private final int partitionEncoderParquetCompressionLevel;
     private final int partitionEncoderParquetDataPageSize;
+    private final int partitionEncoderParquetFloatEncoding;
     private final double partitionEncoderParquetMinCompressionRatio;
     private final long partitionEncoderParquetO3RewriteUnusedMaxBytes;
     private final double partitionEncoderParquetO3RewriteUnusedRatio;
@@ -2182,6 +2184,8 @@ public class PropServerConfiguration implements ServerConfiguration {
         this.partitionEncoderParquetCompressionLevel = getInt(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_COMPRESSION_LEVEL, defaultCompressionLevel);
         this.partitionEncoderParquetRowGroupSize = Math.max(4, getInt(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_ROW_GROUP_SIZE, 100_000));
         this.partitionEncoderParquetDataPageSize = getInt(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_DATA_PAGE_SIZE, Numbers.SIZE_1MB);
+        this.partitionEncoderParquetFloatEncoding = parseParquetFloatEncoding(
+                getString(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING, "default"));
         this.partitionEncoderParquetMinCompressionRatio = getDouble(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_MIN_COMPRESSION_RATIO, "1.2");
         this.partitionEncoderParquetO3RewriteUnusedMaxBytes = getLongSize(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_O3_REWRITE_UNUSED_MAX_BYTES, 1024 * 1024 * 1024L);
         this.partitionEncoderParquetO3RewriteUnusedRatio = getDouble(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_O3_REWRITE_UNUSED_RATIO, "0.5");
@@ -2495,6 +2499,24 @@ public class PropServerConfiguration implements ServerConfiguration {
         }
 
         throw ServerConfigurationException.forInvalidKey(key.getPropertyPath(), mode);
+    }
+
+    private static int parseParquetFloatEncoding(CharSequence name) throws ServerConfigurationException {
+        // "bss" is accepted as a friendly alias for byte_stream_split.
+        final int id = Chars.equalsLowerCaseAscii(name, "bss")
+                ? ParquetEncoding.ENCODING_BYTE_STREAM_SPLIT
+                : ParquetEncoding.getEncoding(name);
+        switch (id) {
+            case ParquetEncoding.ENCODING_DEFAULT:
+            case ParquetEncoding.ENCODING_PLAIN:
+            case ParquetEncoding.ENCODING_BYTE_STREAM_SPLIT:
+            case ParquetEncoding.ENCODING_PCO:
+                return id;
+            default:
+                throw ServerConfigurationException.forInvalidKey(
+                        PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(),
+                        "expected one of: default, plain, byte_stream_split (bss), pco");
+        }
     }
 
     // The enterprise version needs to add tcps and https
@@ -4167,6 +4189,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public int getPartitionEncoderParquetDataPageSize() {
             return partitionEncoderParquetDataPageSize;
+        }
+
+        @Override
+        public int getPartitionEncoderParquetFloatEncoding() {
+            return partitionEncoderParquetFloatEncoding;
         }
 
         @Override

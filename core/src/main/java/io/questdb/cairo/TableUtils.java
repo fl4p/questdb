@@ -52,6 +52,7 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.table.parquet.MappedMemoryPartitionDescriptor;
 import io.questdb.griffin.engine.table.parquet.ParquetCompression;
+import io.questdb.griffin.engine.table.parquet.ParquetEncoding;
 import io.questdb.griffin.engine.table.parquet.PartitionDescriptor;
 import io.questdb.griffin.engine.table.parquet.PartitionEncoder;
 import io.questdb.griffin.model.ExpressionNode;
@@ -1892,9 +1893,21 @@ public final class TableUtils {
                     // replace the column's stored config with a pco LOSSY(n) config just for
                     // this conversion, without persisting it to the table metadata.
                     final int lossyOverrideKeepBits = lossyKeepBitsForColumn(lossyColumns, columnName);
-                    final int parquetEncodingConfig = lossyOverrideKeepBits >= 0
-                            ? packParquetConfig(0, 0, 0, false, lossyOverrideKeepBits)
-                            : metadata.getColumnMetadata(columnIndex).getParquetEncodingConfig();
+                    int parquetEncodingConfig;
+                    if (lossyOverrideKeepBits >= 0) {
+                        parquetEncodingConfig = packParquetConfig(0, 0, 0, false, lossyOverrideKeepBits);
+                    } else {
+                        parquetEncodingConfig = metadata.getColumnMetadata(columnIndex).getParquetEncodingConfig();
+                        // Apply the server-configured default FLOAT encoding (e.g. pco) to columns
+                        // that carry no explicit PARQUET(...) encoding. Leaves DOUBLE and any
+                        // explicitly-encoded column untouched.
+                        if (ColumnType.tagOf(columnType) == ColumnType.FLOAT && !isParquetConfigExplicit(parquetEncodingConfig)) {
+                            final int defaultFloatEncoding = configuration.getPartitionEncoderParquetFloatEncoding();
+                            if (defaultFloatEncoding != ParquetEncoding.ENCODING_DEFAULT) {
+                                parquetEncodingConfig = packParquetConfig(defaultFloatEncoding, 0, 0, false);
+                            }
+                        }
+                    }
 
                     if (columnRowCount > 0) {
                         if (ColumnType.isSymbol(columnType)) {

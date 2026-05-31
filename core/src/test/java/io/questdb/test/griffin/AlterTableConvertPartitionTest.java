@@ -366,6 +366,59 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
         });
     }
 
+    @Test
+    public void testConvertToParquetFloatEncodingDefaultsToPcoViaServerConfig() throws Exception {
+        // cairo.partition.encoder.parquet.float.encoding = pco makes FLOAT columns that carry
+        // no explicit PARQUET(...) encoding default to the pco codec during native-to-Parquet
+        // conversion. pco is lossless here, so values round-trip exactly; the proof that pco
+        // (not the standard PLAIN encoding) was actually applied is that the pco-encoded file
+        // is materially smaller than the same data encoded plain. The server-config default is
+        // not persisted to the column metadata.
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            // Baseline: standard (plain) FLOAT encoding.
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING, "plain");
+            execute("CREATE TABLE x_plain (f FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_plain SELECT (x * 0.1 + 1.0)::float, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_plain SELECT (x * 0.1 + 1.0)::float, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_plain CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long plainSize = parquetFileSize("x_plain");
+
+            // pco default for FLOAT.
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING, "pco");
+            execute("CREATE TABLE x_pco (f FLOAT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_pco SELECT (x * 0.1 + 1.0)::float, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_pco SELECT (x * 0.1 + 1.0)::float, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_pco CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long pcoSize = parquetFileSize("x_pco");
+
+            Assert.assertTrue(
+                    "pco-encoded FLOAT column should be smaller than plain [pco=" + pcoSize + ", plain=" + plainSize + ']',
+                    pcoSize < plainSize);
+
+            // pco is lossless: the converted partition reads back exactly through the in-table reader.
+            int n = 0;
+            try (
+                    RecordCursorFactory factory = select("SELECT f FROM x_pco WHERE ts < '2024-06-11'", sqlExecutionContext);
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    float got = rec.getFloat(0);
+                    float expected = (float) ((n + 1) * 0.1 + 1.0);
+                    Assert.assertEquals("row " + n, expected, got, 0.0f);
+                    n++;
+                }
+            }
+            Assert.assertEquals(10_000, n);
+
+            // The server-config default must not be persisted to column metadata.
+            try (TableReader reader = engine.getReader("x_pco")) {
+                Assert.assertEquals("server-config default must not persist to column metadata",
+                        0, reader.getMetadata().getColumnMetadata(0).getParquetEncodingConfig());
+            }
+        });
+    }
+
     // ============================================================
     // Metadata-driven bloom filter conversion tests (A1-A4, B1, C1-C2, D1-D2, H1)
     // ============================================================
@@ -1424,6 +1477,19 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
             Assert.assertTrue(ff.exists(path.$()));
         } else {
             Assert.assertFalse(ff.exists(path.$()));
+        }
+    }
+
+    private long parquetFileSize(String tableName) throws Exception {
+        try (
+                RecordCursorFactory factory = select("SELECT parquetFileSize FROM table_partitions('" + tableName + "') WHERE isParquet", sqlExecutionContext);
+                RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+        ) {
+            final Record rec = cursor.getRecord();
+            Assert.assertTrue("expected a converted parquet partition", cursor.hasNext());
+            final long size = rec.getLong(0);
+            Assert.assertFalse("expected exactly one converted parquet partition", cursor.hasNext());
+            return size;
         }
     }
 

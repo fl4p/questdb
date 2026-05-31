@@ -763,6 +763,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public int getPartitionEncoderParquetFloatEncoding() {
+        return getDelegate().getPartitionEncoderParquetFloatEncoding();
+    }
+
+    @Override
     public double getPartitionEncoderParquetMinCompressionRatio() {
         return getDelegate().getPartitionEncoderParquetMinCompressionRatio();
     }

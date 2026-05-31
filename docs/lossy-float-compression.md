@@ -19,7 +19,10 @@ behind a PLAIN page + a `PcoEncoded` marker), read on both the standalone
 `read_parquet()` path and ordinary in-table scans, and three ways to request it
 -- at `CREATE`, via `ALTER COLUMN ... SET PARQUET(...)`, and as part of the
 per-conversion override `CONVERT ... WITH (lossy = '...')` (which currently uses
-the standard encoding). See "pco integration" below.
+the standard encoding). A server config,
+`cairo.partition.encoder.parquet.float.encoding`, can make pco (or another
+encoding) the default for FLOAT columns without per-column DDL; it defaults to
+the standard interoperable layout. See "pco integration" below.
 
 ## Summary
 
@@ -471,6 +474,26 @@ opt-in for both lossy and lossless float columns -- but because its output is
 not standard Parquet, it is offered behind the explicit `PCO` encoding rather
 than as the default; BSS+zstd remains the interoperable default.
 
+f32 vs f64 density under pco. pco charges for information content, not the
+declared width (`bench_codecs::run_pco_f32_vs_f64_bench`). For values that are
+exactly f32-representable, storing them as f32 or as f64 costs the same to
+within ~0.1% at every precision (the widened doubles carry all-zero low mantissa
+bits, which pco strips):
+
+| keep_bits | f32 B/val | f64 B/val | f64/f32 |
+|---|---|---|---|
+| full | 1.675 | 1.677 | 1.00x |
+| 16 | 0.799 | 0.801 | 1.00x |
+| 12 | 0.306 | 0.307 | 1.00x |
+| 11 | 0.202 | 0.203 | 1.00x |
+
+For genuine 52-bit doubles (a random walk that fills the mantissa), pco-lossless
+costs 5.3 (price-like) to 7.1 (qty-like) bytes/value; the f32 form is 2.0-3.2x
+smaller, but only because casting to f32 is itself lossy (discards ~29 mantissa
+bits, ~1e-7 relative error) -- not a free win. So under pco, FLOAT vs DOUBLE is a
+precision decision, not a storage lever; this is why the server-config default
+above is scoped to FLOAT.
+
 ### pco integration (implemented)
 
 The original plan here was Tier B, a mu-law / LnQ companded int16/int32 codec.
@@ -488,6 +511,23 @@ Surface (FLOAT/DOUBLE only):
   existing column.
 - `ALTER TABLE t CONVERT PARTITION TO PARQUET ... WITH (lossy = 'c:n, ...')` --
   one-shot rounding for a single conversion (standard encoding; not pco).
+
+Server-level default (FLOAT only):
+
+- `cairo.partition.encoder.parquet.float.encoding` selects the default encoding
+  for FLOAT columns during native-to-Parquet conversion. Values: `default`
+  (the default -- leaves the choice to the encoder, i.e. the standard
+  interoperable layout), `plain`, `byte_stream_split` (alias `bss`), and `pco`.
+  Set it to `pco` to make FLOAT columns default to pco without an explicit
+  `PARQUET(PCO)` on every column.
+- The default is applied only to FLOAT columns that carry no explicit
+  `PARQUET(...)` encoding; DOUBLE columns and explicitly-encoded columns are
+  untouched. The applied default is not persisted to the column metadata -- it
+  is resolved at conversion time, so changing the config changes future
+  conversions only. An encoding not valid for FLOAT (e.g. `rle_dictionary`) is
+  rejected at startup. There is no DOUBLE equivalent yet; lossless pco on a
+  genuine 52-bit DOUBLE is far less dense than on a FLOAT (see below), so the
+  default is scoped to FLOAT.
 
 How it works:
 

@@ -41,6 +41,7 @@ import io.questdb.cairo.TableUtils;
 import io.questdb.cutlass.http.HttpFullFatServerConfiguration;
 import io.questdb.cutlass.pgwire.DefaultPGConfiguration;
 import io.questdb.cutlass.qwp.protocol.QwpConstants;
+import io.questdb.griffin.engine.table.parquet.ParquetEncoding;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.network.EpollFacadeImpl;
@@ -637,6 +638,63 @@ public class PropServerConfigurationTest {
         properties.setProperty("line.float.default.column.type", "FLAT");
         configuration = newPropServerConfiguration(properties);
         Assert.assertEquals(ColumnType.DOUBLE, configuration.getLineTcpReceiverConfiguration().getDefaultColumnTypeForFloat());
+    }
+
+    @Test
+    public void testDefaultPartitionEncoderParquetFloatEncoding() throws Exception {
+        Properties properties = new Properties();
+
+        // default: leave the encoding choice to the encoder (standard, interoperable layout)
+        PropServerConfiguration configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_DEFAULT, configuration.getCairoConfiguration().getPartitionEncoderParquetFloatEncoding());
+
+        // explicit "default"
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(), "default");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_DEFAULT, configuration.getCairoConfiguration().getPartitionEncoderParquetFloatEncoding());
+
+        // plain
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(), "plain");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PLAIN, configuration.getCairoConfiguration().getPartitionEncoderParquetFloatEncoding());
+
+        // byte_stream_split (canonical name)
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(), "byte_stream_split");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_BYTE_STREAM_SPLIT, configuration.getCairoConfiguration().getPartitionEncoderParquetFloatEncoding());
+
+        // bss (friendly alias)
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(), "bss");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_BYTE_STREAM_SPLIT, configuration.getCairoConfiguration().getPartitionEncoderParquetFloatEncoding());
+
+        // pco
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(), "pco");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PCO, configuration.getCairoConfiguration().getPartitionEncoderParquetFloatEncoding());
+
+        // case-insensitive
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(), "PCO");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PCO, configuration.getCairoConfiguration().getPartitionEncoderParquetFloatEncoding());
+
+        // rle_dictionary is a valid encoding name but not valid for FLOAT - rejected
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(), "rle_dictionary");
+        try {
+            newPropServerConfiguration(properties);
+            Assert.fail("expected ServerConfigurationException for an encoding not valid for FLOAT");
+        } catch (ServerConfigurationException e) {
+            TestUtils.assertContains(e.getMessage(), "cairo.partition.encoder.parquet.float.encoding");
+        }
+
+        // garbage - rejected
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(), "nope");
+        try {
+            newPropServerConfiguration(properties);
+            Assert.fail("expected ServerConfigurationException for an unknown encoding name");
+        } catch (ServerConfigurationException e) {
+            TestUtils.assertContains(e.getMessage(), "cairo.partition.encoder.parquet.float.encoding");
+        }
     }
 
     @Test

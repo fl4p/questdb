@@ -38,6 +38,7 @@ import io.questdb.cutlass.text.DefaultTextConfiguration;
 import io.questdb.cutlass.text.TextConfiguration;
 import io.questdb.griffin.DefaultSqlExecutionCircuitBreakerConfiguration;
 import io.questdb.griffin.engine.table.parquet.ParquetCompression;
+import io.questdb.griffin.engine.table.parquet.ParquetEncoding;
 import io.questdb.griffin.engine.table.parquet.ParquetVersion;
 import io.questdb.griffin.engine.table.parquet.PartitionEncoder;
 import io.questdb.std.Chars;
@@ -777,6 +778,11 @@ public class DefaultCairoConfiguration implements CairoConfiguration {
     @Override
     public int getPartitionEncoderParquetDataPageSize() {
         return 0; // use default (1024*1024) bytes
+    }
+
+    @Override
+    public int getPartitionEncoderParquetFloatEncoding() {
+        return ParquetEncoding.ENCODING_DEFAULT;
     }
 
     @Override
