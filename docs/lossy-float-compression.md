@@ -5,10 +5,21 @@
 PR 1 (lossless prerequisites: DELTA_BINARY_PACKED default for designated
 timestamp, BYTE_STREAM_SPLIT for FLOAT/DOUBLE) is implemented and open as
 PR #7189. PR 2 (Tier A mantissa bit-rounding) and the `LOSSY(n)` DDL surface are
-implemented locally on the lossy branch, gated on PR #7189 merging first. The
-high-ratio internal codec (PR 3) remains a proposal; the real-data benchmark below
-redirects it from the originally planned Tier B (mu-law/LnQ int16) toward
-integrating the `pco` crate.
+implemented locally on the lossy branch, gated on PR #7189 merging first.
+
+The high-ratio internal codec (originally proposed as Tier B, mu-law/LnQ int16)
+is now implemented as an integration of the `pco` crate, after the benchmark
+below showed it beats both arctic and a hand-rolled int16 codec. `pco` is NOT
+the default; it is opt-in via the explicit `PCO` encoding, because a pco column
+is not readable by external Parquet tools. `PARQUET(PCO)` stores a FLOAT/DOUBLE
+column losslessly with pco; `PARQUET(PCO, LOSSY(n))` rounds first. `LOSSY(n)`
+without `PCO` keeps a standard encoding (Plain / BYTE_STREAM_SPLIT) so the file
+stays interoperable. pco is implemented end to end: write (round -> pco blob
+behind a PLAIN page + a `PcoEncoded` marker), read on both the standalone
+`read_parquet()` path and ordinary in-table scans, and three ways to request it
+-- at `CREATE`, via `ALTER COLUMN ... SET PARQUET(...)`, and as part of the
+per-conversion override `CONVERT ... WITH (lossy = '...')` (which currently uses
+the standard encoding). See "pco integration" below.
 
 ## Summary
 
@@ -455,40 +466,55 @@ decodes ~1.5-2x faster. Under rounding it wins by 1.3-2.1x almost everywhere; th
 sole exception is the extreme-range BTCUSDT px column under aggressive rounding
 (keep=11: BSS+zstd 0.021 vs pco 0.030), where rounding collapses the near-constant
 column into long runs that zstd's LZ stage compresses better than pco's per-value
-model. pco encode runs ~1.3-1.6x slower than zstd level 1. So pco is the right
-default for the lossy path and a strong option for lossless float columns too,
-with BSS+zstd retained as the standard-Parquet fallback.
+model. pco encode runs ~1.3-1.6x slower than zstd level 1. So pco is a strong
+opt-in for both lossy and lossless float columns -- but because its output is
+not standard Parquet, it is offered behind the explicit `PCO` encoding rather
+than as the default; BSS+zstd remains the interoperable default.
 
-### PR 3 — high-ratio internal codec (superseded direction)
+### pco integration (implemented)
 
-The original plan here was Tier B, a mu-law / LnQ companded int16/int32 codec, to
-close the ratio gap to arctic on smooth columns. The real-data benchmark above
-redirects this: `round -> pcodec` reaches arctic-class (and on lossy data,
-better-than-arctic) ratios without the log quantizer's failure modes, and the
-`logq` result shows a hand-rolled int16 codec would at best match `pcodec` while
-carrying more implementation and read-path risk. So if a high-ratio
-QuestDB-internal codec is pursued, the recommended form is integrating the `pco`
-crate behind the existing `LOSSY(n)` knob, not building Tier B. Either way it is a
-larger change than PR 2:
+The original plan here was Tier B, a mu-law / LnQ companded int16/int32 codec.
+The real-data benchmark redirected it to the `pco` crate, which reaches
+arctic-class (and on lossy data, better-than-arctic) ratios without the log
+quantizer's failure modes; the `logq` result showed a hand-rolled int16 codec
+would at best match `pco` with more risk. pco is implemented and opt-in.
 
-- Both produce a non-standard Parquet representation, so the Parquet reader must
-  recognize the column and invert it on read, materializing a `DOUBLE`/`FLOAT` for
-  the rest of the engine. The logical column type is unchanged; only the physical
-  representation differs.
-- Files written this way are not readable by external Parquet tools. This path is
-  only appropriate when the Parquet files stay internal to QuestDB.
-- Predicate pushdown / page-stats pruning must account for the transform (for a
-  monotonic transform like log, min/max still map correctly, but the comparison
-  must be done in the right space).
+Surface (FLOAT/DOUBLE only):
 
-The mu-law specifics below are retained for reference only.
+- `PARQUET(PCO)` -- lossless pco.
+- `PARQUET(PCO, LOSSY(n))` -- round to `n` mantissa bits, then pco.
+- `LOSSY(n)` without `PCO` -- round, then a standard encoding (interoperable).
+- `ALTER TABLE t ALTER COLUMN c SET PARQUET(PCO[, LOSSY(n)])` -- set it on an
+  existing column.
+- `ALTER TABLE t CONVERT PARTITION TO PARQUET ... WITH (lossy = 'c:n, ...')` --
+  one-shot rounding for a single conversion (standard encoding; not pco).
 
-- Encode `Double`/`Float` as a companded int16/int32 column plus the metadata
-  needed to invert (`mu`, `Xmax` from page stats, `n`).
-- Inverse transform on the Parquet read path for these columns.
-- This is the larger change: it touches the read path and introduces a stored
-  type distinct from the logical column type, so it needs careful handling in the
-  Parquet reader and in anything that inspects Parquet column types.
+How it works:
+
+- `ParquetEncodingConfig::is_pco()` is true for the explicit `PCO` encoding
+  (id 6); `encoding()` maps id 6 to None so the data page header is written as
+  PLAIN. The page body holds a pco blob of the present (non-null) values
+  (`SimdEncodable::encode_pco`), and the column's Parquet compression is forced
+  to Uncompressed (pco already entropy-codes).
+- The column is marked `QdbMetaColFormat::PcoEncoded` in the parquet footer
+  QdbMeta, and -- crucially for in-table scans -- a `PCO_ENCODED` bit is set in
+  the compact `_pm` metadata sidecar's `ColumnFlags`. The standalone
+  `read_parquet()` path reads the footer QdbMeta; the in-table page-frame
+  decoder reads the `_pm` flag. Both map back to `PcoEncoded`.
+- On read, the decoder pco-decompresses the page body back to the present values
+  and feeds them through the normal PLAIN primitive decoder, so definition
+  levels scatter them into the null (NaN) positions. The logical column type is
+  unchanged.
+
+Limitations / follow-ups:
+
+- A pco column is not readable by external Parquet tools; that is the reason pco
+  is opt-in rather than the default.
+- Predicate pushdown / page-stats pruning over pco columns is not specialized;
+  pages decode fully. Worth measuring before relying on pruning for pco columns.
+- The `CONVERT ... WITH (lossy=...)` override currently always uses the standard
+  encoding; a `WITH (pco=...)` variant could be added if a one-shot pco
+  conversion is wanted.
 
 ## Read path
 
