@@ -35,6 +35,7 @@ import io.questdb.cutlass.http.processors.StaticContentProcessorFactory;
 import io.questdb.cutlass.http.processors.TableStatusCheckProcessor;
 import io.questdb.cutlass.http.processors.TextImportProcessor;
 import io.questdb.cutlass.http.processors.WarningsProcessor;
+import io.questdb.cutlass.influxdb.InfluxQueryProcessor;
 import io.questdb.cutlass.qwp.server.QwpIngressHttpProcessor;
 import io.questdb.cutlass.qwp.server.egress.QwpEgressHttpProcessor;
 import io.questdb.mp.Job;
@@ -284,6 +285,23 @@ public class HttpServer implements Closeable {
             @Override
             public HttpRequestHandler newInstance() {
                 return new TableStatusCheckProcessor(cairoEngine, httpServerConfiguration.getJsonQueryProcessorConfiguration());
+            }
+        });
+
+        // InfluxDB v1 query endpoint (InfluxQL over HTTP, for Grafana compatibility)
+        server.bind(new HttpRequestHandlerFactory() {
+            @Override
+            public ObjHashSet<String> getUrls() {
+                return httpServerConfiguration.getContextPathQuery();
+            }
+
+            @Override
+            public HttpRequestHandler newInstance() {
+                return new InfluxQueryProcessor(
+                        httpServerConfiguration.getJsonQueryProcessorConfiguration(),
+                        cairoEngine,
+                        sharedQueryWorkerCount
+                );
             }
         });
 

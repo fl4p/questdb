@@ -42,6 +42,9 @@ public interface HttpFullFatServerConfiguration extends HttpServerConfiguration 
         add("/write");
         add("/api/v2/write");
     }};
+    ObjHashSet<String> CONTEXT_PATH_QUERY = new ObjHashSet<>() {{
+        add("/query");
+    }};
     ObjHashSet<String> CONTEXT_PATH_QWP = new ObjHashSet<>() {{
         add("/write/v4");
         add("/api/v4/write");
@@ -85,6 +88,10 @@ public interface HttpFullFatServerConfiguration extends HttpServerConfiguration 
 
     default ObjHashSet<String> getContextPathILP() {
         return CONTEXT_PATH_ILP;
+    }
+
+    default ObjHashSet<String> getContextPathQuery() {
+        return CONTEXT_PATH_QUERY;
     }
 
     default ObjHashSet<String> getContextPathQWP() {

@@ -271,7 +271,7 @@ public class DefaultHttpServerConfiguration extends DefaultIODispatcherConfigura
 
         @Override
         public CharSequence getInfluxPingVersion() {
-            return "v2.7.4";
+            return "1.8.10";
         }
 
         @Override
