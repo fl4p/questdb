@@ -90,6 +90,42 @@ public class InfluxQueryProcessorTest extends AbstractBootstrapTest {
     }
 
     @Test
+    public void testDbPrefix() throws Exception {
+        // ?db=<db> maps a measurement to table <db>_<measurement>; SHOW strips the prefix
+        TestUtils.assertMemoryLeak(() -> {
+            try (final TestServerMain serverMain = startWithEnvVariables()) {
+                final int port = serverMain.getHttpServerPort();
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP).address("localhost:" + port).build()) {
+                    sender.table("mydb_cpu").symbol("host", "h1").doubleColumn("value", 2.0).at(BASE_MS, ChronoUnit.MILLIS);
+                    sender.flush();
+                }
+                serverMain.awaitTable("mydb_cpu");
+                serverMain.assertSql("SELECT count() FROM mydb_cpu", "count\n1\n");
+
+                try (HttpClient client = HttpClientFactory.newPlainTextInstance()) {
+                    // SHOW MEASUREMENTS scoped to db=mydb returns the bare measurement name
+                    assertQueryDb(client, port, "mydb", "SHOW MEASUREMENTS",
+                            "{\"results\":[{\"statement_id\":0,\"series\":[{\"name\":\"measurements\",\"columns\":[\"name\"],\"values\":[[\"cpu\"]]}]}]}");
+
+                    // SHOW TAG KEYS FROM "cpu" with db=mydb resolves table mydb_cpu
+                    assertQueryDb(client, port, "mydb", "SHOW TAG KEYS FROM \"cpu\"",
+                            "{\"results\":[{\"statement_id\":0,\"series\":[{\"name\":\"cpu\",\"columns\":[\"tagKey\"],\"values\":[[\"host\"]]}]}]}");
+
+                    // SELECT FROM "cpu" with db=mydb resolves table mydb_cpu; series name is bare "cpu"
+                    assertQueryDb(client, port, "mydb",
+                            "SELECT mean(\"value\") FROM \"cpu\" WHERE time >= 1704067200000ms AND time <= 1704067200000ms GROUP BY time(10s) fill(none)",
+                            "{\"results\":[{\"statement_id\":0,\"series\":[{\"name\":\"cpu\",\"columns\":[\"time\",\"mean\"],\"values\":[[1704067200000,2.0]]}]}]}");
+
+                    // without ?db=, bare "cpu" does not exist -> per-statement error
+                    assertQueryDb(client, port, "",
+                            "SELECT mean(\"value\") FROM \"cpu\" WHERE time >= 1704067200000ms AND time <= 1704067200000ms GROUP BY time(10s) fill(none)",
+                            "{\"results\":[{\"statement_id\":0,\"error\":\"measurement not found: cpu\"}]}");
+                }
+            }
+        });
+    }
+
+    @Test
     public void testErrors() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (final TestServerMain serverMain = startWithEnvVariables()) {
@@ -196,6 +232,20 @@ public class InfluxQueryProcessorTest extends AbstractBootstrapTest {
         try (HttpClient.ResponseHeaders rh = client.newRequest("127.0.0.1", port)
                 .GET()
                 .url("/query")
+                .query("q", influxql)
+                .send()
+        ) {
+            rh.await();
+            TestUtils.assertEquals("200", rh.getStatusCode());
+            HttpUtils.assertChunkedBody(rh, expectedBody);
+        }
+    }
+
+    private void assertQueryDb(HttpClient client, int port, String db, String influxql, String expectedBody) {
+        try (HttpClient.ResponseHeaders rh = client.newRequest("127.0.0.1", port)
+                .GET()
+                .url("/query")
+                .query("db", db)
                 .query("q", influxql)
                 .send()
         ) {

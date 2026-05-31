@@ -75,6 +75,7 @@ import static java.net.HttpURLConnection.HTTP_OK;
 public class InfluxQueryProcessor implements HttpRequestProcessor, HttpRequestHandler, HttpPostPutProcessor, Closeable {
     private static final Log LOG = LogFactory.getLog(InfluxQueryProcessor.class);
     private static final LocalValue<InfluxQueryProcessorState> LV = new LocalValue<>();
+    private static final Utf8String URL_PARAM_DB = new Utf8String("db");
     private static final Utf8String URL_PARAM_Q = new Utf8String("q");
     // Set in onHeadersReady() and read by onChunk() while this worker receives
     // the request body, mirroring LineHttpProcessorImpl. Per-connection durable
@@ -149,9 +150,19 @@ public class InfluxQueryProcessor implements HttpRequestProcessor, HttpRequestHa
             return;
         }
 
+        // InfluxDB ?db=<db> maps to a QuestDB table-name prefix "<db>_", so several
+        // InfluxDB databases can live in one QuestDB instance. Absent/empty db = no prefix.
+        String dbPrefix = "";
+        final DirectUtf8Sequence db = context.getRequestHeader().getUrlParam(URL_PARAM_DB);
+        if (db != null && db.size() > 0) {
+            final StringSink dbSink = Misc.getThreadLocalSink();
+            Utf8s.utf8ToUtf16(db.lo(), db.hi(), dbSink);
+            dbPrefix = dbSink.toString() + "_";
+        }
+
         state.resetTranslation();
         try {
-            translator.translate(query, engine, state);
+            translator.translate(query, engine, dbPrefix, state);
             state.finishTranslation();
         } catch (InfluxQlException e) {
             sendError(state, response, e.getMessage());

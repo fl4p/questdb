@@ -70,6 +70,7 @@ public class InfluxQlTranslator {
     private final StringSink sql = new StringSink();
     private final IntList tokenType = new IntList();
     private final ObjList<String> tokens = new ObjList<>();
+    private String dbPrefix = ""; // InfluxDB ?db= mapped to a table-name prefix (e.g. "mydb_"), or "" for none
     private int p; // parse cursor within the current statement's token range
 
     /**
@@ -77,7 +78,8 @@ public class InfluxQlTranslator {
      * {@code ;}-separated statement, requesting one {@link TranslatedQuery} per
      * statement from {@code consumer}.
      */
-    public void translate(CharSequence q, CairoEngine engine, StatementConsumer consumer) throws InfluxQlException {
+    public void translate(CharSequence q, CairoEngine engine, String dbPrefix, StatementConsumer consumer) throws InfluxQlException {
+        this.dbPrefix = dbPrefix == null ? "" : dbPrefix;
         tokenize(q);
         final int n = tokens.size();
         int lo = 0;
@@ -369,6 +371,11 @@ public class InfluxQlTranslator {
         }
     }
 
+    // Maps an InfluxDB measurement to a QuestDB table name, applying the ?db= prefix.
+    private String tableName(String measurement) {
+        return dbPrefix.isEmpty() ? measurement : dbPrefix + measurement;
+    }
+
     private void translateSelect(int lo, int hi, CairoEngine engine, TranslatedQuery out) throws InfluxQlException {
         p = lo + 1; // skip SELECT
 
@@ -504,9 +511,10 @@ public class InfluxQlTranslator {
             }
         }
 
-        // resolve the measurement and its designated timestamp
+        // resolve the measurement (with optional ?db= prefix) and its designated timestamp
+        final String table = tableName(measurement);
         final String tsCol;
-        TableToken tt = engine.getTableTokenIfExists(measurement);
+        TableToken tt = engine.getTableTokenIfExists(table);
         if (tt == null) {
             out.statementError = "measurement not found: " + measurement;
             return;
@@ -549,7 +557,7 @@ public class InfluxQlTranslator {
             out.valueCols.add(cursorIdx++);
             out.valueLabels.add(uniqueLabel(out.valueLabels, itemLabel.getQuick(i), itemField.getQuick(i)));
         }
-        sql.put(" FROM \"").put(measurement).put('"');
+        sql.put(" FROM \"").put(table).put('"');
         if (whereLo >= 0 && whereHi > whereLo) {
             sql.put(" WHERE ");
             transformWhere(whereLo, whereHi, tsCol);
@@ -618,8 +626,15 @@ public class InfluxQlTranslator {
                     limit = tokens.getQuick(i + 1);
                 }
             }
+            boolean hasWhere = false;
+            if (!dbPrefix.isEmpty()) {
+                sql.put(" WHERE table_name LIKE '").put(escapeSingleQuotes(dbPrefix)).put("%'");
+                hasWhere = true;
+                out.stripPrefix = dbPrefix;
+                out.stripPrefixCol = 0;
+            }
             if (regex != null) {
-                sql.put(" WHERE table_name ~ '").put(escapeSingleQuotes(regex)).put('\'');
+                sql.put(hasWhere ? " AND " : " WHERE ").put("table_name ~ '").put(escapeSingleQuotes(regex)).put('\'');
             }
             if (limit != null) {
                 sql.put(" LIMIT ").put(limit);
@@ -658,7 +673,7 @@ public class InfluxQlTranslator {
                 throw new InfluxQlException("SHOW TAG KEYS requires FROM \"measurement\"");
             }
             sql.clear();
-            sql.put("SELECT \"column\" FROM table_columns('").put(escapeSingleQuotes(m)).put("') WHERE \"type\" = 'SYMBOL'");
+            sql.put("SELECT \"column\" FROM table_columns('").put(escapeSingleQuotes(tableName(m))).put("') WHERE \"type\" = 'SYMBOL'");
             out.seriesName = m;
             out.valueCols.add(0);
             out.valueLabels.add("tagKey");
@@ -675,7 +690,7 @@ public class InfluxQlTranslator {
                     .put("CASE WHEN \"type\" IN ('DOUBLE','FLOAT') THEN 'float' ")
                     .put("WHEN \"type\" IN ('LONG','INT','SHORT','BYTE') THEN 'integer' ")
                     .put("WHEN \"type\" = 'BOOLEAN' THEN 'boolean' ELSE 'string' END ")
-                    .put("FROM table_columns('").put(escapeSingleQuotes(m)).put("') ")
+                    .put("FROM table_columns('").put(escapeSingleQuotes(tableName(m))).put("') ")
                     .put("WHERE \"type\" != 'SYMBOL' AND \"designated\" = false");
             out.seriesName = m;
             out.valueCols.add(0);
@@ -702,7 +717,7 @@ public class InfluxQlTranslator {
                 throw new InfluxQlException("SHOW TAG VALUES requires WITH KEY = \"tag\"");
             }
             sql.clear();
-            sql.put("SELECT DISTINCT '").put(escapeSingleQuotes(key)).put("', \"").put(key).put("\" FROM \"").put(escapeSingleQuotes(m)).put('"');
+            sql.put("SELECT DISTINCT '").put(escapeSingleQuotes(key)).put("', \"").put(key).put("\" FROM \"").put(escapeSingleQuotes(tableName(m))).put('"');
             out.seriesName = m;
             out.valueCols.add(0);
             out.valueCols.add(1);

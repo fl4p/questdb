@@ -118,9 +118,28 @@ public class InfluxQlTranslatorTest {
         translateOne("DELETE FROM x");
     }
 
+    @Test
+    public void testShowMeasurementsWithDbPrefix() throws InfluxQlException {
+        TranslatedQuery tq = translateOne("SHOW MEASUREMENTS", "mydb_");
+        Assert.assertEquals("SELECT table_name FROM tables() WHERE table_name LIKE 'mydb_%'", tq.sql.toString());
+        Assert.assertEquals("mydb_", tq.stripPrefix);
+        Assert.assertEquals(0, tq.stripPrefixCol);
+    }
+
+    @Test
+    public void testShowTagKeysWithDbPrefix() throws InfluxQlException {
+        TranslatedQuery tq = translateOne("SHOW TAG KEYS FROM \"cpu\"", "mydb_");
+        Assert.assertEquals("SELECT \"column\" FROM table_columns('mydb_cpu') WHERE \"type\" = 'SYMBOL'", tq.sql.toString());
+        Assert.assertEquals("cpu", tq.seriesName);
+    }
+
     private TranslatedQuery translateOne(String q) throws InfluxQlException {
+        return translateOne(q, "");
+    }
+
+    private TranslatedQuery translateOne(String q, String dbPrefix) throws InfluxQlException {
         out.clear();
-        translator.translate(q, null, consumer);
+        translator.translate(q, null, dbPrefix, consumer);
         return out.getLast();
     }
 }

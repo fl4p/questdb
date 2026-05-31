@@ -441,6 +441,15 @@ public class InfluxQueryProcessorState implements Mutable, Closeable, InfluxQlTr
     }
 
     private void writeValue(HttpChunkedResponse response, int idx) {
+        // SHOW MEASUREMENTS: strip the <db>_ table prefix so Grafana sees bare names
+        if (tq.stripPrefix != null && idx == tq.stripPrefixCol) {
+            String s = columnAsString(idx);
+            if (s != null && s.startsWith(tq.stripPrefix)) {
+                s = s.substring(tq.stripPrefix.length());
+            }
+            writeStringOrNull(response, s);
+            return;
+        }
         final int type = metadata.getColumnType(idx);
         switch (ColumnType.tagOf(type)) {
             case ColumnType.DOUBLE: {

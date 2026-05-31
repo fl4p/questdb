@@ -20,9 +20,28 @@ For `/query`, the InfluxQL text is the `q` URL parameter (GET) or an
 
 1. Add a datasource of type **InfluxDB**, Query Language **InfluxQL**.
 2. URL: `http://<host>:9000`.
-3. Database: any value (QuestDB has a single namespace; the `db` parameter is
-   accepted and ignored).
+3. Database: the InfluxDB database name. It maps to a QuestDB table-name prefix
+   `<db>_` (see [Multiple databases](#multiple-databases)). Leave it empty to
+   address tables by their bare name.
 4. **Save & Test** — this succeeds on the `/ping` `204` + `X-Influxdb-Version`.
+
+## Multiple databases
+
+The InfluxDB `db` query parameter maps a measurement to the QuestDB table
+`<db>_<measurement>`, so several InfluxDB databases can share one QuestDB
+instance without measurement-name collisions:
+
+- `?db=mydb` + `SELECT ... FROM "cpu"` resolves table `mydb_cpu`.
+- `SHOW MEASUREMENTS` / `SHOW TAG KEYS` / `SHOW FIELD KEYS` / `SHOW TAG VALUES`
+  are scoped to that database, and `SHOW MEASUREMENTS` strips the prefix so the
+  client sees bare names (`cpu`, not `mydb_cpu`). The `name` in query results is
+  the bare measurement too.
+- An empty or absent `db` applies no prefix: the measurement is the table name
+  directly (single-database setups).
+
+This lines up with the prefix-scoped users in `docs/ACL.md`: a user restricted to
+prefix `mydb_` sees exactly the tables of InfluxDB database `mydb`. Choose
+database names that form valid QuestDB table-name prefixes.
 
 ## Data-model mapping
 

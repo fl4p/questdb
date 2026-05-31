@@ -54,6 +54,11 @@ public class TranslatedQuery implements Mutable {
     public boolean synthesized;
     public String seriesName;
     public CharSequence sql;
+    // when non-null, this leading string is stripped from string values in
+    // column stripPrefixCol on output (used to hide the <db>_ table prefix from
+    // SHOW MEASUREMENTS so Grafana sees bare measurement names)
+    public String stripPrefix;
+    public int stripPrefixCol = -1;
     // cursor index of the timestamp column, or -1 for SHOW forms
     public int timeCol = -1;
 
@@ -63,6 +68,8 @@ public class TranslatedQuery implements Mutable {
         seriesName = null;
         statementError = null;
         synthesized = false;
+        stripPrefix = null;
+        stripPrefixCol = -1;
         timeCol = -1;
         tagCols.clear();
         tagLabels.clear();
