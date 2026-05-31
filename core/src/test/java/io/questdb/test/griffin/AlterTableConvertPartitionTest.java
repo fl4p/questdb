@@ -315,9 +315,10 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
     @Test
     public void testConvertToParquetWithLossyOverride() throws Exception {
         // One-shot per-conversion lossy override: CONVERT ... WITH (lossy='px:10')
-        // rounds the column during this conversion (via pco) without changing the
-        // column's stored config. Values read back rounded, and the metadata config
-        // stays default.
+        // rounds the column to ten mantissa bits during this conversion only, with a
+        // standard encoding (pco is opt-in, not used here), without changing the
+        // column's stored config. Values read back rounded, metadata config stays
+        // default.
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
             execute("""
                     CREATE TABLE x (

@@ -538,6 +538,13 @@ pub fn is_encoding_valid_for_column_tag(encoding_id: i32, col_type_tag: i32) -> 
     if encoding_id == 0 {
         return true;
     }
+    if encoding_id as u32 == PCO_ENCODING_ID {
+        // pco is only valid for FLOAT/DOUBLE.
+        return matches!(
+            ColumnTypeTag::try_from(col_type_tag as u8),
+            Ok(ColumnTypeTag::Float | ColumnTypeTag::Double)
+        );
+    }
     let encoding = match encoding_id {
         1 => Encoding::Plain,
         2 => Encoding::RleDictionary,
@@ -642,6 +649,10 @@ const LEVEL_MASK: u32 = 0xFF;
 const EXPLICIT_FLAG: u32 = 1 << 24;
 const LOSSY_KEEP_BITS_SHIFT: u32 = 26;
 const LOSSY_KEEP_BITS_MASK: u32 = 0x3F;
+/// Encoding id for the pco numeric codec. pco is not a standard Parquet
+/// encoding, so `encoding()` maps it to None (the page header is written as
+/// PLAIN); `is_pco()` keys off this id instead.
+const PCO_ENCODING_ID: u32 = 6;
 
 impl ParquetEncodingConfig {
     /// Create a config from the raw packed i32 received from JNI.
@@ -686,15 +697,15 @@ impl ParquetEncodingConfig {
         }
     }
 
-    /// Whether a FLOAT/DOUBLE column should use the pco numeric codec rather
-    /// than a standard Parquet encoding. pco is the default back end for the
-    /// lossy float path: it applies when lossy rounding is requested and the
-    /// user has not pinned a standard encoding. Pinning one (e.g.
-    /// `BYTE_STREAM_SPLIT`) is the escape hatch for callers that need the file
-    /// to stay readable by external Parquet tools. The caller applies this only
-    /// to FLOAT/DOUBLE columns; other types ignore it.
+    /// Whether a FLOAT/DOUBLE column should use the pco numeric codec. pco is
+    /// opt-in via the explicit `PCO` encoding (id 6); it is NOT the default for
+    /// the lossy path, since a pco column is not readable by external Parquet
+    /// tools. `PARQUET(PCO)` stores the column losslessly with pco;
+    /// `PARQUET(PCO, LOSSY(n))` rounds first. Without `PCO`, lossy rounding uses
+    /// a standard encoding (Plain / BYTE_STREAM_SPLIT). The caller applies this
+    /// only to FLOAT/DOUBLE columns; other types ignore it.
     pub fn is_pco(self) -> bool {
-        self.lossy_keep_bits().is_some() && self.encoding().is_none()
+        self.is_explicit() && (self.0 as u32 & ENCODING_MASK) == PCO_ENCODING_ID
     }
 
     /// Pack lossy keep-bits into an existing config. Test-only helper.

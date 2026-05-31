@@ -37,7 +37,10 @@ public class ParquetEncoding {
     public static final int ENCODING_DELTA_LENGTH_BYTE_ARRAY = ENCODING_RLE_DICTIONARY + 1; // 3
     public static final int ENCODING_DELTA_BINARY_PACKED = ENCODING_DELTA_LENGTH_BYTE_ARRAY + 1; // 4
     public static final int ENCODING_BYTE_STREAM_SPLIT = ENCODING_DELTA_BINARY_PACKED + 1; // 5
-    public static final int MAX_ENUM_INT = ENCODING_BYTE_STREAM_SPLIT + 1;
+    // pco is QuestDB's own numeric codec, not a standard Parquet encoding. A pco
+    // column is readable only by QuestDB, so it is opt-in (FLOAT/DOUBLE only).
+    public static final int ENCODING_PCO = ENCODING_BYTE_STREAM_SPLIT + 1; // 6
+    public static final int MAX_ENUM_INT = ENCODING_PCO + 1;
     private static final IntObjHashMap<CharSequence> encodingToNameMap = new IntObjHashMap<>(16);
     private static final LowerCaseCharSequenceIntHashMap nameToEncodingMap = new LowerCaseCharSequenceIntHashMap(32);
 
@@ -105,6 +108,7 @@ public class ParquetEncoding {
         nameToEncodingMap.put("delta_length_byte_array", ENCODING_DELTA_LENGTH_BYTE_ARRAY);
         nameToEncodingMap.put("delta_binary_packed", ENCODING_DELTA_BINARY_PACKED);
         nameToEncodingMap.put("byte_stream_split", ENCODING_BYTE_STREAM_SPLIT);
+        nameToEncodingMap.put("pco", ENCODING_PCO);
 
         encodingToNameMap.put(ENCODING_DEFAULT, "default");
         encodingToNameMap.put(ENCODING_PLAIN, "plain");
@@ -112,5 +116,6 @@ public class ParquetEncoding {
         encodingToNameMap.put(ENCODING_DELTA_LENGTH_BYTE_ARRAY, "delta_length_byte_array");
         encodingToNameMap.put(ENCODING_DELTA_BINARY_PACKED, "delta_binary_packed");
         encodingToNameMap.put(ENCODING_BYTE_STREAM_SPLIT, "byte_stream_split");
+        encodingToNameMap.put(ENCODING_PCO, "pco");
     }
 }

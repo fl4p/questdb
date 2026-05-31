@@ -2795,7 +2795,8 @@ mod tests {
         use crate::parquet_write::lossy::round_f64;
         use crate::parquet_write::schema::ParquetEncodingConfig;
         let keep = 10u32;
-        let cfg = ParquetEncodingConfig::new(0, 0, -1)
+        // Encoding id 6 = PCO (explicit opt-in), plus lossy keep-bits.
+        let cfg = ParquetEncodingConfig::new(6, 0, -1)
             .with_lossy_keep_bits(keep)
             .raw();
         // Values run up to row_count/2; they must exceed 2^11 so that keep=10
@@ -2850,20 +2851,14 @@ mod tests {
 
     #[test]
     fn test_decode_pco_double_and_float() {
-        // pco config: lossy keep-bits set (the trigger) with no explicit encoding
-        // (encoding id 0), so ParquetEncodingConfig::is_pco() is true. keep=52 for
-        // Double / keep=23 for Float makes the mantissa rounding a no-op, so the
+        // pco config: explicit PCO encoding (id 6) and no lossy rounding, so the
         // round trip is lossless and the decoded values must equal the originals.
         // This exercises the full pco path: encode_pco -> PLAIN page + PcoEncoded
         // marker -> reader sources the marker from QdbMeta -> pco-decode -> scatter
         // into the NaN-null positions placed at every other row.
         use crate::parquet_write::schema::ParquetEncodingConfig;
-        let pco_double_cfg = ParquetEncodingConfig::new(0, 0, -1)
-            .with_lossy_keep_bits(52)
-            .raw();
-        let pco_float_cfg = ParquetEncodingConfig::new(0, 0, -1)
-            .with_lossy_keep_bits(23)
-            .raw();
+        let pco_double_cfg = ParquetEncodingConfig::new(6, 0, -1).raw();
+        let pco_float_cfg = ParquetEncodingConfig::new(6, 0, -1).raw();
 
         #[cfg(miri)]
         let (row_count, row_group_size, data_page_size) = (100, 10, 10);

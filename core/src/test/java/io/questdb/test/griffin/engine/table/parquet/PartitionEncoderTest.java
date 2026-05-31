@@ -316,15 +316,15 @@ public class PartitionEncoderTest extends AbstractCairoTest {
 
     @Test
     public void testLossyPcoRoundTrip() throws Exception {
-        // End-to-end: a DOUBLE column declared with PARQUET(LOSSY(10)) and no explicit
-        // encoding uses the pco codec (the default lossy back end). The values come back
-        // rounded - low 42 mantissa bits cleared, within the 2^-(10+1) relative error
-        // bound - decoded through QuestDB's own reader, since pco columns are not
-        // readable by external Parquet tools.
+        // End-to-end: a DOUBLE column declared with PARQUET(PCO, LOSSY(10)) opts into
+        // the pco codec (pco is not the default; it must be requested explicitly). The
+        // values come back rounded - low 42 mantissa bits cleared, within the 2^-(10+1)
+        // relative error bound - decoded through QuestDB's own reader, since pco columns
+        // are not readable by external Parquet tools.
         assertMemoryLeak(() -> {
             inputRoot = root;
             execute("CREATE TABLE x (" +
-                    " px DOUBLE PARQUET(LOSSY(10))," +
+                    " px DOUBLE PARQUET(PCO, LOSSY(10))," +
                     " ts TIMESTAMP" +
                     ") TIMESTAMP(ts) PARTITION BY MONTH");
             execute("INSERT INTO x SELECT" +
@@ -371,9 +371,9 @@ public class PartitionEncoderTest extends AbstractCairoTest {
     @Test
     public void testLossySetViaAlterColumn() throws Exception {
         // Lossiness can be set on an existing column with ALTER TABLE ... ALTER
-        // COLUMN ... SET PARQUET(LOSSY(n)), not only at CREATE time. The column is
-        // created plain; after the ALTER the config reaches the encoder and the
-        // converted values come back rounded (via pco, since no encoding is pinned).
+        // COLUMN ... SET PARQUET(PCO, LOSSY(n)), not only at CREATE time. The column
+        // is created plain; after the ALTER the config reaches the encoder and the
+        // converted values come back rounded (via the explicitly requested pco codec).
         assertMemoryLeak(() -> {
             inputRoot = root;
             execute("CREATE TABLE x (px DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY MONTH");
@@ -381,7 +381,7 @@ public class PartitionEncoderTest extends AbstractCairoTest {
                     " x * 0.1 + 1.0," +
                     " timestamp_sequence('2015-01-01', 1_000_000)" +
                     " FROM long_sequence(1000)");
-            execute("ALTER TABLE x ALTER COLUMN px SET PARQUET(LOSSY(10))");
+            execute("ALTER TABLE x ALTER COLUMN px SET PARQUET(PCO, LOSSY(10))");
 
             try (
                     Path path = new Path();
