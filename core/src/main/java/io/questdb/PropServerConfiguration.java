@@ -400,6 +400,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final boolean partitionEncoderParquetRawArrayEncoding;
     private final int partitionEncoderParquetRowGroupSize;
     private final boolean partitionEncoderParquetStatisticsEnabled;
+    private final int partitionEncoderParquetTimestampEncoding;
     private final int partitionEncoderParquetVersion;
     private final PGConfiguration pgConfiguration = new PropPGConfiguration();
     private final boolean pgEnabled;
@@ -2186,6 +2187,8 @@ public class PropServerConfiguration implements ServerConfiguration {
         this.partitionEncoderParquetDataPageSize = getInt(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_DATA_PAGE_SIZE, Numbers.SIZE_1MB);
         this.partitionEncoderParquetFloatEncoding = parseParquetFloatEncoding(
                 getString(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING, "default"));
+        this.partitionEncoderParquetTimestampEncoding = parseParquetTimestampEncoding(
+                getString(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING, "default"));
         this.partitionEncoderParquetMinCompressionRatio = getDouble(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_MIN_COMPRESSION_RATIO, "1.2");
         this.partitionEncoderParquetO3RewriteUnusedMaxBytes = getLongSize(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_O3_REWRITE_UNUSED_MAX_BYTES, 1024 * 1024 * 1024L);
         this.partitionEncoderParquetO3RewriteUnusedRatio = getDouble(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_O3_REWRITE_UNUSED_RATIO, "0.5");
@@ -2516,6 +2519,21 @@ public class PropServerConfiguration implements ServerConfiguration {
                 throw ServerConfigurationException.forInvalidKey(
                         PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(),
                         "expected one of: default, plain, byte_stream_split (bss), pco");
+        }
+    }
+
+    private static int parseParquetTimestampEncoding(CharSequence name) throws ServerConfigurationException {
+        final int id = ParquetEncoding.getEncoding(name);
+        switch (id) {
+            case ParquetEncoding.ENCODING_DEFAULT:
+            case ParquetEncoding.ENCODING_PLAIN:
+            case ParquetEncoding.ENCODING_DELTA_BINARY_PACKED:
+            case ParquetEncoding.ENCODING_PCO:
+                return id;
+            default:
+                throw ServerConfigurationException.forInvalidKey(
+                        PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING.getPropertyPath(),
+                        "expected one of: default, plain, delta_binary_packed, pco");
         }
     }
 
@@ -4214,6 +4232,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public int getPartitionEncoderParquetRowGroupSize() {
             return partitionEncoderParquetRowGroupSize;
+        }
+
+        @Override
+        public int getPartitionEncoderParquetTimestampEncoding() {
+            return partitionEncoderParquetTimestampEncoding;
         }
 
         @Override

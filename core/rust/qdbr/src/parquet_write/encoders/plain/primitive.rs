@@ -6,7 +6,7 @@ use parquet2::bloom_filter::hash_native;
 use parquet2::encoding::hybrid_rle::bitpacked_encode;
 use parquet2::encoding::Encoding;
 use parquet2::page::Page;
-use parquet2::schema::types::{PhysicalType, PrimitiveType};
+use parquet2::schema::types::PrimitiveType;
 use parquet2::schema::Repetition;
 use parquet2::statistics::{
     serialize_statistics, BooleanStatistics, FixedLenStatistics, ParquetStatistics, Statistics,
@@ -118,7 +118,7 @@ pub fn encode_int_notnull<T, P>(
     bloom_set: Option<Arc<Mutex<HashSet<u64>>>>,
 ) -> ParquetResult<Vec<Page>>
 where
-    P: NativeType + num_traits::AsPrimitive<i64>,
+    P: NativeType + num_traits::AsPrimitive<i64> + pco::data_types::Number,
     T: Default + num_traits::AsPrimitive<P> + Debug + Copy,
 {
     let rows_per_page = rows_per_primitive_page(&options, primitive_type.physical_type);
@@ -252,13 +252,12 @@ fn simd_segments_to_page<T: SimdEncodable>(
 ) -> ParquetResult<Page> {
     assert_eq!(primitive_type.field_info.repetition, Repetition::Optional);
 
-    // pco is the default back end for the lossy float path. Only FLOAT/DOUBLE
-    // columns can request it; the physical-type guard keeps the int/timestamp
-    // callers that share this code on their standard encodings.
-    let use_pco = matches!(
-        primitive_type.physical_type,
-        PhysicalType::Float | PhysicalType::Double
-    ) && columns[0].parquet_encoding_config.is_pco();
+    // pco can back FLOAT/DOUBLE and the i64 family (LONG/TIMESTAMP/DATE). Gate
+    // on the column tag, not the physical type: this must select exactly the
+    // same columns as the PcoEncoded marker (see `schema::is_pco_eligible_tag`),
+    // or the reader would pco-decode a page that was not pco-encoded.
+    let use_pco = crate::parquet_write::schema::is_pco_eligible_tag(columns[0].data_type.tag())
+        && columns[0].parquet_encoding_config.is_pco();
 
     // SAFETY: Column data originates from JNI/Java memory-mapped buffers.
     let mut views = unsafe {
@@ -497,17 +496,28 @@ fn int_notnull_segments_to_page<T, P>(
     mut bloom_hashes: Option<&mut HashSet<u64>>,
 ) -> ParquetResult<Page>
 where
-    P: NativeType + num_traits::AsPrimitive<i64>,
+    P: NativeType + num_traits::AsPrimitive<i64> + pco::data_types::Number,
     T: Default + num_traits::AsPrimitive<P> + Debug + 'static,
 {
     assert_eq!(primitive_type.field_info.repetition, Repetition::Required);
 
+    // pco on a NOT NULL i64 column (the designated timestamp). Gate on the column
+    // tag, identical to the nullable simd path and the PcoEncoded marker, so the
+    // encode and the marker never disagree. P is i32 or i64 here, both pco Numbers.
+    let use_pco = crate::parquet_write::schema::is_pco_eligible_tag(columns[0].data_type.tag())
+        && columns[0].parquet_encoding_config.is_pco();
+
     let num_rows = window.row_count;
-    let default_bytes = {
-        let pv: P = T::default().as_();
-        pv.to_bytes().as_ref().to_vec()
-    };
+    let default_p: P = T::default().as_();
+    let default_bytes = default_p.to_bytes().as_ref().to_vec();
     let mut buffer = Vec::with_capacity(size_of::<P>() * num_rows);
+    // pco collects the present values (NOT NULL, so every row) into a vector and
+    // compresses them once; the page header still advertises PLAIN.
+    let mut pco_values: Vec<P> = if use_pco {
+        Vec::with_capacity(num_rows)
+    } else {
+        Vec::new()
+    };
     let mut statistics = MaxMin::new();
     let mut column_top = 0;
 
@@ -518,11 +528,19 @@ where
     for view in views {
         column_top += view.adjusted_column_top;
         for _ in 0..view.adjusted_column_top {
-            buffer.extend_from_slice(&default_bytes);
+            if use_pco {
+                pco_values.push(default_p);
+            } else {
+                buffer.extend_from_slice(&default_bytes);
+            }
         }
         for value in view.slice {
             let pv: P = value.as_();
-            buffer.extend_from_slice(pv.to_bytes().as_ref());
+            if use_pco {
+                pco_values.push(pv);
+            } else {
+                buffer.extend_from_slice(pv.to_bytes().as_ref());
+            }
             if options.write_statistics {
                 statistics.update(pv);
             }
@@ -530,6 +548,10 @@ where
                 h.insert(hash_native(pv));
             }
         }
+    }
+
+    if use_pco {
+        buffer = crate::parquet::pco_codec::compress(&pco_values)?;
     }
 
     let stats = if options.write_statistics {

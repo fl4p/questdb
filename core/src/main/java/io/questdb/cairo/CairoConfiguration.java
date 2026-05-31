@@ -498,6 +498,16 @@ public interface CairoConfiguration {
 
     int getPartitionEncoderParquetRowGroupSize();
 
+    /**
+     * Default Parquet encoding for TIMESTAMP columns during native-to-Parquet partition conversion,
+     * applied only to columns that carry no explicit {@code PARQUET(...)} encoding. Returns one of
+     * the {@link io.questdb.griffin.engine.table.parquet.ParquetEncoding} {@code ENCODING_*}
+     * constants; {@code ENCODING_DEFAULT} leaves the choice to the encoder (the designated timestamp
+     * defaults to DELTA_BINARY_PACKED, externally readable). {@code ENCODING_PCO} produces a denser
+     * but QuestDB-internal column.
+     */
+    int getPartitionEncoderParquetTimestampEncoding();
+
     int getPartitionEncoderParquetVersion();
 
     long getPartitionO3SplitMinSize();

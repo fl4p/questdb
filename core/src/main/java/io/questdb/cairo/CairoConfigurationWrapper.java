@@ -788,6 +788,11 @@ public class CairoConfigurationWrapper implements CairoConfiguration {
     }
 
     @Override
+    public int getPartitionEncoderParquetTimestampEncoding() {
+        return getDelegate().getPartitionEncoderParquetTimestampEncoding();
+    }
+
+    @Override
     public int getPartitionEncoderParquetVersion() {
         return getDelegate().getPartitionEncoderParquetVersion();
     }

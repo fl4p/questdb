@@ -16,7 +16,7 @@ use std::io::Cursor;
 use std::ptr::null;
 use std::time::Instant;
 
-use arrow::array::{Float32Array, Float64Array};
+use arrow::array::{Float32Array, Float64Array, Int64Array};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pco::data_types::Number;
@@ -598,5 +598,210 @@ fn run_pco_f32_vs_f64_bench() {
         println!("| f64 (lossless) | {:.3} | 0 |", bpv64);
         println!("| f32 (lossy cast) | {:.3} | {:.2e} |", bpv32, max);
         println!("(f64/f32 ratio = {:.2}x)", bpv64 / bpv32);
+    }
+}
+
+/// Load a raw little-endian i64 file (8 bytes per value, no header). Used for
+/// the real timestamp columns extracted from exchange L2 captures.
+fn load_i64_raw(path: &str) -> Option<Vec<i64>> {
+    let raw = std::fs::read(path).ok()?;
+    if raw.is_empty() || raw.len() % 8 != 0 {
+        return None;
+    }
+    Some(
+        raw.chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
+    )
+}
+
+/// Encode an i64 column (QuestDB `LONG`) to an in-memory parquet file with the
+/// given encoding+codec. The designated-timestamp path uses the SAME i64 delta
+/// encoder, so the byte size here matches what QuestDB writes for a timestamp.
+/// Returns (file bytes, encode time ms). The size includes the parquet container
+/// (footer/schema/page headers); negligible per value at this row count, but it
+/// is overhead the bare pco blob does not carry.
+fn encode_i64_to_parquet(data: &[i64], encoding_id: i32, codec: &Codec) -> (Vec<u8>, f64) {
+    let config = ParquetEncodingConfig::new(encoding_id, codec.id, codec.level).raw();
+    let start = Instant::now();
+    let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+    let col = Column::from_raw_data(
+        0,
+        "ts",
+        ColumnTypeTag::Long.into_type().code(),
+        0,
+        data.len(),
+        data.as_ptr() as *const u8,
+        std::mem::size_of_val(data),
+        null(),
+        0,
+        null(),
+        0,
+        false,
+        false,
+        config,
+    )
+    .expect("column");
+    let partition = Partition { table: "bench".to_string(), columns: vec![col] };
+    ParquetWriter::new(&mut buf)
+        .with_statistics(true)
+        .finish(partition)
+        .expect("write parquet");
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    (buf.into_inner(), elapsed)
+}
+
+/// Decode the single Int64 column from a parquet file via arrow. Returns
+/// (count, decode time ms).
+fn decode_i64_from_parquet(bytes: &[u8]) -> (usize, f64) {
+    let bytes: Bytes = Bytes::copy_from_slice(bytes);
+    let start = Instant::now();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .expect("reader")
+        .with_batch_size(65536)
+        .build()
+        .expect("build reader");
+    let mut count = 0usize;
+    let mut acc = 0i64;
+    for batch in reader.flatten() {
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("i64 array");
+        count += arr.len();
+        if !arr.is_empty() {
+            acc = acc
+                .wrapping_add(arr.value(0))
+                .wrapping_add(arr.value(arr.len() - 1));
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    std::hint::black_box(acc);
+    (count, elapsed)
+}
+
+/// pco on the first differences: store `[v0, v1-v0, v2-v1, ...]`, pco-compress
+/// the whole vector, then reconstruct by cumulative sum and assert exact
+/// equality. Tests whether a manual delta beats pco's built-in auto-delta.
+/// Returns (blob bytes, encode ms, decode ms).
+fn bench_delta_pco(data: &[i64]) -> (usize, f64, f64) {
+    let cfg = pco::ChunkConfig::default().with_compression_level(8);
+    let mut deltas: Vec<i64> = Vec::with_capacity(data.len());
+    if let Some(&first) = data.first() {
+        deltas.push(first);
+        for w in data.windows(2) {
+            deltas.push(w[1].wrapping_sub(w[0]));
+        }
+    }
+    let mut len = 0usize;
+    let mut enc_ms = 0.0;
+    let mut dec_ms = 0.0;
+    for run in 0..RUNS {
+        let t0 = Instant::now();
+        let bytes = pco::standalone::simple_compress(&deltas, &cfg).expect("pco compress");
+        enc_ms += t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = Instant::now();
+        let decoded: Vec<i64> = pco::standalone::simple_decompress(&bytes).expect("pco decompress");
+        // Reconstruct the original series from the deltas.
+        let mut acc = 0i64;
+        let restored: Vec<i64> = decoded
+            .iter()
+            .map(|&d| {
+                acc = acc.wrapping_add(d);
+                acc
+            })
+            .collect();
+        dec_ms += t1.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(restored, data, "delta+pco round trip");
+        std::hint::black_box(&restored);
+        if run == 0 {
+            len = bytes.len();
+        }
+    }
+    (len, enc_ms / RUNS as f64, dec_ms / RUNS as f64)
+}
+
+/// Compare encodings on a single i64 timestamp column.
+fn run_timestamp_dataset(title: &str, data: &[i64]) {
+    let n = data.len();
+    let deltas: Vec<i64> = data.windows(2).map(|w| w[1] - w[0]).collect();
+    let zero = deltas.iter().filter(|&&d| d == 0).count();
+    let dmin = deltas.iter().copied().min().unwrap_or(0);
+    let dmax = deltas.iter().copied().max().unwrap_or(0);
+    println!("\n## {title}");
+    println!(
+        "rows={n}, delta min/max={dmin}/{dmax}, zero-deltas={zero} ({:.1}%)",
+        100.0 * zero as f64 / deltas.len().max(1) as f64
+    );
+    println!("\n| method | bytes/value | ratio vs 8.0 | total bytes | encode ms | decode ms |");
+    println!("|---|---|---|---|---|---|");
+
+    let uncompressed = &CODECS[0];
+    let zstd = CODECS.iter().find(|c| c.name == "zstd").unwrap();
+
+    // Shipped baseline: DELTA_BINARY_PACKED (encoding id 4), uncompressed and +zstd.
+    for (label, codec) in [
+        ("DELTA_BINARY_PACKED", uncompressed),
+        ("DELTA_BINARY_PACKED+zstd", zstd),
+    ] {
+        let mut len = 0usize;
+        let mut enc = 0.0;
+        let mut dec = 0.0;
+        for run in 0..RUNS {
+            let (bytes, e) = encode_i64_to_parquet(data, 4, codec);
+            let (cnt, d) = decode_i64_from_parquet(&bytes);
+            assert_eq!(cnt, n);
+            enc += e;
+            dec += d;
+            if run == 0 {
+                len = bytes.len();
+            }
+        }
+        report_ts_row(label, len, n, enc / RUNS as f64, dec / RUNS as f64);
+    }
+
+    // pco (auto-delta) and manual delta+pco. pco blobs carry no container.
+    let (plen, penc, pdec) = bench_pco(data);
+    report_ts_row("pco (auto-delta)", plen, n, penc, pdec);
+    let (dlen, denc, ddec) = bench_delta_pco(data);
+    report_ts_row("delta + pco", dlen, n, denc, ddec);
+}
+
+fn report_ts_row(label: &str, total: usize, n: usize, enc_ms: f64, dec_ms: f64) {
+    let bpv = total as f64 / n as f64;
+    println!(
+        "| {label} | {:.4} | {:.2}x | {} | {:.1} | {:.1} |",
+        bpv,
+        8.0 / bpv,
+        total,
+        enc_ms,
+        dec_ms
+    );
+}
+
+#[test]
+#[ignore = "benchmark; needs /tmp/real_ts_*.i64; run in release with --ignored --nocapture"]
+fn run_pco_timestamp_bench() {
+    println!("\n# Timestamp codecs: shipped DELTA_BINARY_PACKED vs pco vs delta+pco");
+    println!("Real exchange L2 timestamps (i64). pco/delta+pco are bare blobs;");
+    println!("DELTA_BINARY_PACKED rows include the parquet container. {RUNS} runs averaged.");
+    let mut files: Vec<String> = std::fs::read_dir("/tmp")
+        .expect("read /tmp")
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("real_ts_") && n.ends_with(".i64"))
+        .map(|n| format!("/tmp/{n}"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        println!("(no /tmp/real_ts_*.i64 files found; skipping)");
+        return;
+    }
+    for f in files {
+        match load_i64_raw(&f) {
+            Some(data) if data.len() > 1 => run_timestamp_dataset(&f, &data),
+            _ => println!("\n## {f}  (could not load; skipped)"),
+        }
     }
 }

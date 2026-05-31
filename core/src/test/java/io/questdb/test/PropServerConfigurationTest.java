@@ -698,6 +698,58 @@ public class PropServerConfigurationTest {
     }
 
     @Test
+    public void testDefaultPartitionEncoderParquetTimestampEncoding() throws Exception {
+        Properties properties = new Properties();
+
+        // default: the encoder keeps its own default (DELTA_BINARY_PACKED for the designated ts)
+        PropServerConfiguration configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_DEFAULT, configuration.getCairoConfiguration().getPartitionEncoderParquetTimestampEncoding());
+
+        // explicit "default"
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING.getPropertyPath(), "default");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_DEFAULT, configuration.getCairoConfiguration().getPartitionEncoderParquetTimestampEncoding());
+
+        // plain
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING.getPropertyPath(), "plain");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PLAIN, configuration.getCairoConfiguration().getPartitionEncoderParquetTimestampEncoding());
+
+        // delta_binary_packed
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING.getPropertyPath(), "delta_binary_packed");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_DELTA_BINARY_PACKED, configuration.getCairoConfiguration().getPartitionEncoderParquetTimestampEncoding());
+
+        // pco
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING.getPropertyPath(), "pco");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PCO, configuration.getCairoConfiguration().getPartitionEncoderParquetTimestampEncoding());
+
+        // case-insensitive
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING.getPropertyPath(), "PCO");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PCO, configuration.getCairoConfiguration().getPartitionEncoderParquetTimestampEncoding());
+
+        // byte_stream_split is valid for FLOAT but not for TIMESTAMP - rejected
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING.getPropertyPath(), "byte_stream_split");
+        try {
+            newPropServerConfiguration(properties);
+            Assert.fail("expected ServerConfigurationException for an encoding not valid for TIMESTAMP");
+        } catch (ServerConfigurationException e) {
+            TestUtils.assertContains(e.getMessage(), "cairo.partition.encoder.parquet.timestamp.encoding");
+        }
+
+        // garbage - rejected
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING.getPropertyPath(), "nope");
+        try {
+            newPropServerConfiguration(properties);
+            Assert.fail("expected ServerConfigurationException for an unknown encoding name");
+        } catch (ServerConfigurationException e) {
+            TestUtils.assertContains(e.getMessage(), "cairo.partition.encoder.parquet.timestamp.encoding");
+        }
+    }
+
+    @Test
     public void testDefaultAddColumnTypeForInteger() throws Exception {
         Properties properties = new Properties();
 

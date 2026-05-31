@@ -450,10 +450,8 @@ pub fn to_parquet_schema(
     for column in partition.columns.iter() {
         let format = if column.data_type.tag() == ColumnTypeTag::Symbol {
             Some(QdbMetaColFormat::LocalKeyIsGlobal)
-        } else if matches!(
-            column.data_type.tag(),
-            ColumnTypeTag::Float | ColumnTypeTag::Double
-        ) && column.parquet_encoding_config.is_pco()
+        } else if is_pco_eligible_tag(column.data_type.tag())
+            && column.parquet_encoding_config.is_pco()
         {
             // The data pages hold a pco blob written as PLAIN; the reader must
             // pco-decode them. See `parquet_read::decode` and `pco_codec`.
@@ -504,7 +502,15 @@ pub fn to_encodings(partition: &Partition) -> Vec<Encoding> {
         .columns
         .iter()
         .map(|c| {
-            if let Some(enc) = c.parquet_encoding_config.encoding() {
+            if c.parquet_encoding_config.is_pco() {
+                // pco overrides the page encoding at the value level (see
+                // `use_pco`); the page header still advertises PLAIN. Force
+                // PLAIN here so a designated timestamp does not resolve to
+                // DELTA_BINARY_PACKED and bypass the pco path while still
+                // getting the PcoEncoded marker -- which would make the reader
+                // pco-decode a delta-packed blob.
+                Encoding::Plain
+            } else if let Some(enc) = c.parquet_encoding_config.encoding() {
                 validate_encoding(c.data_type, enc)
             } else {
                 default_encoding(c.data_type, c.designated_timestamp)
@@ -529,6 +535,23 @@ fn default_encoding(data_type: ColumnType, is_designated_timestamp: bool) -> Enc
     }
 }
 
+/// Column type tags that may carry a pco-encoded payload. pco is a fitted
+/// numeric codec, so only fixed-width numeric columns qualify: FLOAT/DOUBLE and
+/// the i64 family (LONG/TIMESTAMP/DATE). This is the single source of truth for
+/// every pco gate -- the write encoder, both PcoEncoded markers (footer QdbMeta
+/// and the `_pm` ColumnFlags sidecar), the compression override, and DDL
+/// validation must all agree, or the reader would misread the blob.
+pub fn is_pco_eligible_tag(tag: ColumnTypeTag) -> bool {
+    matches!(
+        tag,
+        ColumnTypeTag::Float
+            | ColumnTypeTag::Double
+            | ColumnTypeTag::Long
+            | ColumnTypeTag::Timestamp
+            | ColumnTypeTag::Date
+    )
+}
+
 /// Check whether the given encoding_id is valid for the column type tag.
 /// encoding_id values: 0=DEFAULT, 1=PLAIN, 2=RLE_DICTIONARY,
 /// 3=DELTA_LENGTH_BYTE_ARRAY, 4=DELTA_BINARY_PACKED, 5=BYTE_STREAM_SPLIT.
@@ -539,10 +562,10 @@ pub fn is_encoding_valid_for_column_tag(encoding_id: i32, col_type_tag: i32) -> 
         return true;
     }
     if encoding_id as u32 == PCO_ENCODING_ID {
-        // pco is only valid for FLOAT/DOUBLE.
+        // pco is valid for FLOAT/DOUBLE and the i64 family (LONG/TIMESTAMP/DATE).
         return matches!(
             ColumnTypeTag::try_from(col_type_tag as u8),
-            Ok(ColumnTypeTag::Float | ColumnTypeTag::Double)
+            Ok(tag) if is_pco_eligible_tag(tag)
         );
     }
     let encoding = match encoding_id {
@@ -614,11 +637,7 @@ pub fn to_compressions(partition: &Partition) -> Vec<Option<CompressionOptions>>
         .map(|c| {
             // pco pages are already entropy-coded; a Parquet codec on top only
             // wastes CPU and can grow the page, so force Uncompressed for them.
-            if matches!(
-                c.data_type.tag(),
-                ColumnTypeTag::Float | ColumnTypeTag::Double
-            ) && c.parquet_encoding_config.is_pco()
-            {
+            if is_pco_eligible_tag(c.data_type.tag()) && c.parquet_encoding_config.is_pco() {
                 Some(CompressionOptions::Uncompressed)
             } else {
                 c.parquet_encoding_config.compression()
@@ -697,13 +716,14 @@ impl ParquetEncodingConfig {
         }
     }
 
-    /// Whether a FLOAT/DOUBLE column should use the pco numeric codec. pco is
-    /// opt-in via the explicit `PCO` encoding (id 6); it is NOT the default for
-    /// the lossy path, since a pco column is not readable by external Parquet
-    /// tools. `PARQUET(PCO)` stores the column losslessly with pco;
-    /// `PARQUET(PCO, LOSSY(n))` rounds first. Without `PCO`, lossy rounding uses
-    /// a standard encoding (Plain / BYTE_STREAM_SPLIT). The caller applies this
-    /// only to FLOAT/DOUBLE columns; other types ignore it.
+    /// Whether the column requested the pco numeric codec. pco is opt-in via the
+    /// explicit `PCO` encoding (id 6); it is NOT a default, since a pco column is
+    /// not readable by external Parquet tools. `PARQUET(PCO)` stores the column
+    /// losslessly with pco; for FLOAT/DOUBLE, `PARQUET(PCO, LOSSY(n))` rounds
+    /// first. Without `PCO`, FLOAT/DOUBLE lossy rounding uses a standard encoding
+    /// (Plain / BYTE_STREAM_SPLIT). The caller applies this only to pco-eligible
+    /// columns (see `is_pco_eligible_tag`: FLOAT/DOUBLE and LONG/TIMESTAMP/DATE);
+    /// other types ignore it.
     pub fn is_pco(self) -> bool {
         self.is_explicit() && (self.0 as u32 & ENCODING_MASK) == PCO_ENCODING_ID
     }
@@ -1271,6 +1291,44 @@ mod tests {
     fn test_is_encoding_valid_unknown_column_tag() {
         assert!(!is_encoding_valid_for_column_tag(1, 255));
         assert!(!is_encoding_valid_for_column_tag(1, 0));
+    }
+
+    #[test]
+    fn test_is_encoding_valid_pco_eligible_types() {
+        let pco = PCO_ENCODING_ID as i32;
+        // pco is valid for FLOAT/DOUBLE and the i64 family.
+        for tag in [
+            ColumnTypeTag::Float,
+            ColumnTypeTag::Double,
+            ColumnTypeTag::Long,
+            ColumnTypeTag::Timestamp,
+            ColumnTypeTag::Date,
+        ] {
+            assert!(is_pco_eligible_tag(tag), "{tag:?} should be pco-eligible");
+            assert!(
+                is_encoding_valid_for_column_tag(pco, tag as i32),
+                "PCO should be valid for {tag:?}"
+            );
+        }
+        // pco is rejected for every other type, including the other integers.
+        for tag in [
+            ColumnTypeTag::Int,
+            ColumnTypeTag::Short,
+            ColumnTypeTag::Byte,
+            ColumnTypeTag::GeoLong,
+            ColumnTypeTag::Symbol,
+            ColumnTypeTag::String,
+            ColumnTypeTag::Boolean,
+        ] {
+            assert!(
+                !is_pco_eligible_tag(tag),
+                "{tag:?} should not be pco-eligible"
+            );
+            assert!(
+                !is_encoding_valid_for_column_tag(pco, tag as i32),
+                "PCO should be rejected for {tag:?}"
+            );
+        }
     }
 
     #[test]

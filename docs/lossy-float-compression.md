@@ -24,6 +24,12 @@ the standard encoding). A server config,
 encoding) the default for FLOAT columns without per-column DDL; it defaults to
 the standard interoperable layout. See "pco integration" below.
 
+pco also extends to the i64 family (`LONG`/`TIMESTAMP`/`DATE`, the designated
+timestamp included), again opt-in via `PARQUET(PCO)` or, for TIMESTAMP, the
+`cairo.partition.encoder.parquet.timestamp.encoding` server default. On real
+exchange timestamp columns pco is ~2.4x denser than the shipped
+DELTA_BINARY_PACKED+zstd at microsecond precision; see "pco on timestamps" below.
+
 ## Summary
 
 Add optional, per-column **lossy** compression for `DOUBLE`/`FLOAT` columns, applied
@@ -494,6 +500,83 @@ bits, ~1e-7 relative error) -- not a free win. So under pco, FLOAT vs DOUBLE is 
 precision decision, not a storage lever; this is why the server-config default
 above is scoped to FLOAT.
 
+### pco on timestamps (real-data benchmark)
+
+`bench_codecs::run_pco_timestamp_bench` compares the shipped designated-timestamp
+encoding (DELTA_BINARY_PACKED, with and without zstd) against pco and against a
+manual delta-then-pco, on real exchange timestamp columns (i64). The datasets span
+three regimes from a BitMEX L2 capture and a regular-cadence BTC quote feed:
+bursty (93% duplicate timestamps within the same millisecond), sparse/irregular
+(3 years, distinct timestamps, gaps up to 117 days), and a perfectly regular 1 s
+grid. Bytes per value (pco/delta+pco are bare blobs; the DELTA rows include the
+parquet container, negligible on the large datasets):
+
+| dataset | regime | unit | DELTA+zstd | pco | pco advantage |
+|---|---|---|---|---|---|
+| XBTUSD 3-year (10.5M rows) | sparse/irregular | us | 1.344 | 0.557 | 2.4x |
+| XBTUSD L2 (199k rows) | bursty, 93% dup | us | 0.246 | 0.101 | 2.4x |
+| XBTUSD L2 (199k rows) | bursty, 93% dup | ms | 0.163 | 0.101 | 1.6x |
+| BTC quotes (21k rows) | regular 1 s grid | us | 0.018 | 0.003 | pco wins* |
+
+(*at 21k rows the DELTA row is dominated by parquet container overhead, so read
+the regular-grid line as "pco still smaller", not a reliable multiple.)
+
+Three findings, robust across the regimes:
+
+- **pco beats the shipped DELTA_BINARY_PACKED+zstd on every real regime**, by
+  1.6-2.4x at microsecond precision and more on the regular grid.
+- **pco is insensitive to the microsecond scaling that hurts DELTA.** The same
+  series as ms vs us: pco stays 0.101 both ways, while DELTA+zstd grows from 0.163
+  to 0.246 (DELTA bit-packs the larger us deltas; pco models the x1000 factor).
+  QuestDB stores designated timestamps in us, so pco's edge is structural.
+- **A manual delta-then-pco earns nothing over pco's built-in auto-delta**
+  (0.557 vs 0.567; 0.101 vs 0.167). The decoder does not implement a delta+pco
+  path; plain pco is the only i64 pco form.
+
+Costs, weighed equally: pco encodes ~2.5x slower than DELTA+zstd (184 ms vs 74 ms
+on the 10.5M-row column; decode is comparable or faster), which is acceptable for
+a conversion-time codec but real. A pco timestamp column is not readable by
+external Parquet tools (same interop tradeoff as float pco), which is why it is
+opt-in. The datasets are one instrument (XBTUSD) across three distributions plus
+one quote grid; the distributions differ sharply, but cross-venue generality is
+not yet established.
+
+### Enabling pco
+
+Both paths only take effect when a partition is converted to Parquet (pco is a
+Parquet-conversion codec, not a native-storage one).
+
+Per-column at `CREATE TABLE` (explicit, persisted to column metadata):
+
+```sql
+CREATE TABLE trades (
+  price  DOUBLE  PARQUET(PCO),    -- pco on a DOUBLE
+  qty    LONG    PARQUET(PCO),    -- pco on a LONG
+  ts     TIMESTAMP PARQUET(PCO)   -- pco on the designated timestamp
+) TIMESTAMP(ts) PARTITION BY DAY;
+
+-- or set it on an existing column:
+ALTER TABLE trades ALTER COLUMN ts SET PARQUET(PCO);
+
+-- conversion is when the encoding is actually applied:
+ALTER TABLE trades CONVERT PARTITION TO PARQUET WHERE ts < '2026-01-01';
+```
+
+Server default (applies to columns with no explicit `PARQUET(...)`; not persisted,
+resolved at conversion time, an explicit per-column setting always wins):
+
+```properties
+# conf/server.conf (or the QDB_... env var)
+cairo.partition.encoder.parquet.timestamp.encoding=pco   # TIMESTAMP columns
+cairo.partition.encoder.parquet.float.encoding=pco       # FLOAT columns
+```
+
+`timestamp.encoding` accepts `default` (standard DELTA_BINARY_PACKED, externally
+readable), `plain`, `delta_binary_packed`, `pco`. There is no LONG/DATE or DOUBLE
+server default -- use per-column `PARQUET(PCO)` for those. Confirm a conversion
+took with `table_partitions('trades')` (`isParquet`, `parquetFileSize`): a pco
+column is far smaller than the same data stored plain.
+
 ### pco integration (implemented)
 
 The original plan here was Tier B, a mu-law / LnQ companded int16/int32 codec.
@@ -502,17 +585,27 @@ arctic-class (and on lossy data, better-than-arctic) ratios without the log
 quantizer's failure modes; the `logq` result showed a hand-rolled int16 codec
 would at best match `pco` with more risk. pco is implemented and opt-in.
 
-Surface (FLOAT/DOUBLE only):
+Surface (FLOAT/DOUBLE and the i64 family LONG/TIMESTAMP/DATE):
 
-- `PARQUET(PCO)` -- lossless pco.
-- `PARQUET(PCO, LOSSY(n))` -- round to `n` mantissa bits, then pco.
+- `PARQUET(PCO)` -- lossless pco. Works on FLOAT/DOUBLE and on LONG/TIMESTAMP/DATE
+  (the designated timestamp included).
+- `PARQUET(PCO, LOSSY(n))` -- round to `n` mantissa bits, then pco. FLOAT/DOUBLE
+  only; `LOSSY` is mantissa rounding and is rejected on integer/timestamp types.
 - `LOSSY(n)` without `PCO` -- round, then a standard encoding (interoperable).
 - `ALTER TABLE t ALTER COLUMN c SET PARQUET(PCO[, LOSSY(n)])` -- set it on an
   existing column.
 - `ALTER TABLE t CONVERT PARTITION TO PARQUET ... WITH (lossy = 'c:n, ...')` --
   one-shot rounding for a single conversion (standard encoding; not pco).
 
-Server-level default (FLOAT only):
+The i64 path is mechanical: `pco_codec::compress`/`decompress` are generic over
+`pco::data_types::Number`, so `SimdEncodable::encode_pco` for `i64` and the
+decoder's `pco_decode_to_value_bytes::<i64>` reuse the same code as f32/f64. A
+single helper `schema::is_pco_eligible_tag` is the source of truth for which
+column tags may carry pco; the write encoder, both `PcoEncoded` markers (footer
+QdbMeta and the `_pm` `ColumnFlags` sidecar), the compression override, and DDL
+validation all consult it, so the encode gate and the marker never disagree.
+
+Server-level defaults:
 
 - `cairo.partition.encoder.parquet.float.encoding` selects the default encoding
   for FLOAT columns during native-to-Parquet conversion. Values: `default`
@@ -520,14 +613,19 @@ Server-level default (FLOAT only):
   interoperable layout), `plain`, `byte_stream_split` (alias `bss`), and `pco`.
   Set it to `pco` to make FLOAT columns default to pco without an explicit
   `PARQUET(PCO)` on every column.
-- The default is applied only to FLOAT columns that carry no explicit
-  `PARQUET(...)` encoding; DOUBLE columns and explicitly-encoded columns are
-  untouched. The applied default is not persisted to the column metadata -- it
-  is resolved at conversion time, so changing the config changes future
-  conversions only. An encoding not valid for FLOAT (e.g. `rle_dictionary`) is
-  rejected at startup. There is no DOUBLE equivalent yet; lossless pco on a
-  genuine 52-bit DOUBLE is far less dense than on a FLOAT (see below), so the
-  default is scoped to FLOAT.
+- `cairo.partition.encoder.parquet.timestamp.encoding` is the TIMESTAMP sibling.
+  Values: `default` (the encoder's own default -- DELTA_BINARY_PACKED for the
+  designated timestamp, externally readable), `plain`, `delta_binary_packed`, and
+  `pco`. `byte_stream_split` is rejected (it is a float-only encoding). Set it to
+  `pco` to make TIMESTAMP columns default to pco without per-column DDL.
+- Each default is applied only to columns of its type that carry no explicit
+  `PARQUET(...)` encoding; other columns (e.g. DOUBLE, LONG, explicitly-encoded)
+  are untouched. The applied default is not persisted to the column metadata --
+  it is resolved at conversion time, so changing the config changes future
+  conversions only. An encoding not valid for the type is rejected at startup.
+  There is no FLOAT default for DOUBLE, and no LONG knob; lossless pco on a
+  genuine 52-bit DOUBLE is far less dense than on a FLOAT (see below), and LONG
+  columns vary too much to default centrally -- use per-column `PARQUET(PCO)`.
 
 How it works:
 

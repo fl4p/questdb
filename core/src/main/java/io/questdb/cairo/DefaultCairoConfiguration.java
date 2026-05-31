@@ -806,6 +806,11 @@ public class DefaultCairoConfiguration implements CairoConfiguration {
     }
 
     @Override
+    public int getPartitionEncoderParquetTimestampEncoding() {
+        return ParquetEncoding.ENCODING_DEFAULT;
+    }
+
+    @Override
     public int getPartitionEncoderParquetVersion() {
         return ParquetVersion.PARQUET_VERSION_V1;
     }

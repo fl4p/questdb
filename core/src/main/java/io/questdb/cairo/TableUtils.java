@@ -1898,13 +1898,17 @@ public final class TableUtils {
                         parquetEncodingConfig = packParquetConfig(0, 0, 0, false, lossyOverrideKeepBits);
                     } else {
                         parquetEncodingConfig = metadata.getColumnMetadata(columnIndex).getParquetEncodingConfig();
-                        // Apply the server-configured default FLOAT encoding (e.g. pco) to columns
-                        // that carry no explicit PARQUET(...) encoding. Leaves DOUBLE and any
-                        // explicitly-encoded column untouched.
-                        if (ColumnType.tagOf(columnType) == ColumnType.FLOAT && !isParquetConfigExplicit(parquetEncodingConfig)) {
-                            final int defaultFloatEncoding = configuration.getPartitionEncoderParquetFloatEncoding();
-                            if (defaultFloatEncoding != ParquetEncoding.ENCODING_DEFAULT) {
-                                parquetEncodingConfig = packParquetConfig(defaultFloatEncoding, 0, 0, false);
+                        // Apply the server-configured default encoding (e.g. pco) to columns that
+                        // carry no explicit PARQUET(...) encoding. FLOAT and TIMESTAMP have separate
+                        // knobs; DOUBLE, LONG and any explicitly-encoded column stay untouched.
+                        if (!isParquetConfigExplicit(parquetEncodingConfig)) {
+                            final int defaultEncoding = switch (ColumnType.tagOf(columnType)) {
+                                case ColumnType.FLOAT -> configuration.getPartitionEncoderParquetFloatEncoding();
+                                case ColumnType.TIMESTAMP -> configuration.getPartitionEncoderParquetTimestampEncoding();
+                                default -> ParquetEncoding.ENCODING_DEFAULT;
+                            };
+                            if (defaultEncoding != ParquetEncoding.ENCODING_DEFAULT) {
+                                parquetEncodingConfig = packParquetConfig(defaultEncoding, 0, 0, false);
                             }
                         }
                     }

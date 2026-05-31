@@ -721,13 +721,10 @@ fn build_column_infos_from_partition<'a>(
                 flags = flags.with_local_key_is_global();
             }
 
-            if matches!(
-                col.data_type.tag(),
-                qdb_core::col_type::ColumnTypeTag::Float
-                    | qdb_core::col_type::ColumnTypeTag::Double
-            ) && col.parquet_encoding_config.is_pco()
+            if crate::parquet_write::schema::is_pco_eligible_tag(col.data_type.tag())
+                && col.parquet_encoding_config.is_pco()
             {
-                // FLOAT/DOUBLE pages hold a pco blob; the in-table page-frame
+                // pco-eligible pages hold a pco blob; the in-table page-frame
                 // decoder reads this flag to pco-decode. Mirrors the QdbMeta
                 // PcoEncoded marker written into the parquet footer.
                 flags = flags.with_pco_encoded();

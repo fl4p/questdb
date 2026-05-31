@@ -419,6 +419,100 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
         });
     }
 
+    @Test
+    public void testConvertToParquetPcoOnLongAndTimestampColumns() throws Exception {
+        // Per-column PARQUET(PCO) now works for the i64 family (LONG/TIMESTAMP), not just
+        // FLOAT/DOUBLE. pco is lossless, so the columns must read back exactly through the
+        // in-table reader (the _pm ColumnFlags PcoEncoded path, distinct from read_parquet).
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            execute("CREATE TABLE x (l LONG PARQUET(PCO), ts2 TIMESTAMP PARQUET(PCO), ts TIMESTAMP) " +
+                    "TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x SELECT x * 7 - 3, " +
+                    "timestamp_sequence('2024-06-10T00:00:01', 500_000L), " +
+                    "timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x SELECT x, '2024-06-12'::timestamp, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+
+            // Read the pco-encoded LONG and TIMESTAMP columns back through the in-table scan.
+            // Capture the timestamp bases from the first row to avoid hard-coding epoch micros.
+            int n = 0;
+            long ts2Base = 0;
+            long tsBase = 0;
+            try (
+                    RecordCursorFactory factory = select("SELECT l, ts2, ts FROM x WHERE ts < '2024-06-11'", sqlExecutionContext);
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    if (n == 0) {
+                        ts2Base = rec.getTimestamp(1);
+                        tsBase = rec.getTimestamp(2);
+                    }
+                    Assert.assertEquals("l row " + n, (n + 1L) * 7 - 3, rec.getLong(0));
+                    Assert.assertEquals("ts2 row " + n, ts2Base + (long) n * 500_000L, rec.getTimestamp(1));
+                    Assert.assertEquals("ts row " + n, tsBase + (long) n * 1_000_000L, rec.getTimestamp(2));
+                    n++;
+                }
+            }
+            Assert.assertEquals(10_000, n);
+        });
+    }
+
+    @Test
+    public void testConvertToParquetTimestampEncodingPcoViaServerConfig() throws Exception {
+        // cairo.partition.encoder.parquet.timestamp.encoding = pco makes TIMESTAMP columns that
+        // carry no explicit PARQUET(...) encoding default to pco during native-to-Parquet
+        // conversion. pco is lossless, so the designated timestamp round-trips exactly; the proof
+        // pco was applied is that the file is much smaller than the same data stored PLAIN (raw
+        // 8-byte i64). The default is not persisted to metadata. (pco vs DELTA_BINARY_PACKED is a
+        // closer race on a regular grid -- delta's best case -- so the robust check is vs PLAIN.)
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            // Baseline: PLAIN timestamp encoding (raw 8-byte i64 per value).
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING, "plain");
+            execute("CREATE TABLE x_plain (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_plain SELECT x::int, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_plain SELECT x::int, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_plain CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long plainSize = parquetFileSize("x_plain");
+
+            // pco default for TIMESTAMP.
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING, "pco");
+            execute("CREATE TABLE x_pco (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_pco SELECT x::int, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_pco SELECT x::int, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_pco CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long pcoSize = parquetFileSize("x_pco");
+
+            Assert.assertTrue(
+                    "pco-encoded TIMESTAMP should be much smaller than plain [pco=" + pcoSize + ", plain=" + plainSize + ']',
+                    pcoSize < plainSize);
+
+            // pco is lossless: the designated timestamp reads back exactly through the in-table reader.
+            int n = 0;
+            long tsBase = 0;
+            try (
+                    RecordCursorFactory factory = select("SELECT ts FROM x_pco WHERE ts < '2024-06-11'", sqlExecutionContext);
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    if (n == 0) {
+                        tsBase = rec.getTimestamp(0);
+                    }
+                    Assert.assertEquals("row " + n, tsBase + (long) n * 1_000_000L, rec.getTimestamp(0));
+                    n++;
+                }
+            }
+            Assert.assertEquals(10_000, n);
+
+            // The server-config default must not be persisted to column metadata (ts is column 1).
+            try (TableReader reader = engine.getReader("x_pco")) {
+                Assert.assertEquals("server-config default must not persist to column metadata",
+                        0, reader.getMetadata().getColumnMetadata(1).getParquetEncodingConfig());
+            }
+        });
+    }
+
     // ============================================================
     // Metadata-driven bloom filter conversion tests (A1-A4, B1, C1-C2, D1-D2, H1)
     // ============================================================

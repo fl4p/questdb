@@ -441,13 +441,14 @@ pub trait SimdEncodable: NativeType {
     }
 
     /// Append a pco blob of the already-filtered non-null values to `buffer`.
-    /// Only FLOAT/DOUBLE override this; other types return Unsupported. The
-    /// caller passes the present values in row order (the same set `encode_data`
-    /// writes), so the reader's definition-level scatter lines them back up.
+    /// FLOAT/DOUBLE and the i64 family (LONG/TIMESTAMP/DATE) override this; other
+    /// types return Unsupported. The caller passes the present values in row
+    /// order (the same set `encode_data` writes), so the reader's
+    /// definition-level scatter lines them back up.
     fn encode_pco(_non_null_values: &[Self], _buffer: &mut Vec<u8>) -> ParquetResult<()> {
         Err(fmt_err!(
             Unsupported,
-            "pco encoding is only supported for FLOAT and DOUBLE columns"
+            "pco encoding is only supported for FLOAT, DOUBLE, LONG, TIMESTAMP and DATE columns"
         ))
     }
 
@@ -477,6 +478,11 @@ impl SimdEncodable for i64 {
         let iterator = ExactSizedIter::new(iterator, non_null_count);
         encode(iterator, buffer);
         true
+    }
+
+    fn encode_pco(non_null_values: &[Self], buffer: &mut Vec<u8>) -> ParquetResult<()> {
+        buffer.extend_from_slice(&crate::parquet::pco_codec::compress(non_null_values)?);
+        Ok(())
     }
 
     fn min() -> Self {

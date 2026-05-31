@@ -262,6 +262,7 @@ fn decode_page_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
             values_buffer,
             bufs,
             column_type,
+            is_pco,
             mode,
         ),
         PhysicalType::FixedLenByteArray(len) => decode_fixed_len_dispatch::<FILTERED, FILL_NULLS>(
@@ -759,9 +760,28 @@ fn decode_int64_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
     values_buffer: &[u8],
     bufs: &mut ColumnChunkBuffers,
     column_type: ColumnType,
+    is_pco: bool,
     mode: DecodeModeContext<'_>,
 ) -> ParquetResult<bool> {
     let row_hi = mode.source_row_count();
+    // A pco-encoded i64 column (LONG/TIMESTAMP/DATE) writes its values as a pco
+    // blob behind a PLAIN page header; the marker tells the decoder to
+    // pco-decode them back into the PLAIN value bytes the decoder expects.
+    if is_pco
+        && matches!(
+            column_type.tag(),
+            ColumnTypeTag::Long | ColumnTypeTag::Timestamp | ColumnTypeTag::Date
+        )
+    {
+        clear_aux_buffers(bufs);
+        let reconstructed = pco_decode_to_value_bytes::<i64>(values_buffer)?;
+        decode_page0_mode::<_, FILTERED, FILL_NULLS>(
+            page,
+            mode,
+            &mut PlainPrimitiveDecoder::<i64>::new(&reconstructed, bufs, nulls::LONG),
+        )?;
+        return Ok(true);
+    }
     match (page.encoding(), dict, column_type.tag()) {
         (Encoding::Plain, _, ColumnTypeTag::Decimal64) => {
             decode_page0_mode::<_, FILTERED, FILL_NULLS>(
@@ -2897,6 +2917,77 @@ mod tests {
                 expected_buffs[1].0.data_vec.as_ref(),
                 ColumnTypeTag::Float.into_type(),
                 pco_float_cfg,
+            ),
+        ];
+
+        assert_columns(
+            row_count,
+            row_group_size,
+            data_page_size,
+            version,
+            columns,
+            &expected_buffs,
+        );
+    }
+
+    #[test]
+    fn test_decode_pco_long_timestamp_date() {
+        // pco on the i64 family. Explicit PCO encoding (id 6), no lossy rounding,
+        // so the round trip is lossless. Exercises encode_pco::<i64> -> PLAIN page
+        // + PcoEncoded marker -> reader sources the marker from QdbMeta ->
+        // decode_int64_dispatch pco branch -> scatter into the i64::MIN-null
+        // positions placed at every other row. Covers LONG, TIMESTAMP and DATE,
+        // which all share the i64 SimdEncodable/decoder path.
+        use crate::parquet_write::schema::ParquetEncodingConfig;
+        let pco_cfg = ParquetEncodingConfig::new(6, 0, -1).raw();
+
+        #[cfg(miri)]
+        let (row_count, row_group_size, data_page_size) = (100, 10, 10);
+        #[cfg(not(miri))]
+        let (row_count, row_group_size, data_page_size) = (10000, 1000, 1000);
+        let version = Version::V2;
+
+        let tags = [
+            ColumnTypeTag::Long,
+            ColumnTypeTag::Timestamp,
+            ColumnTypeTag::Date,
+        ];
+        let expected_buffs: Vec<(ColumnBuffers, ColumnType)> = tags
+            .iter()
+            .map(|tag| {
+                (
+                    create_col_data_buff::<i64, 8, _>(row_count, LONG_NULL, |v: i64| {
+                        v.to_le_bytes()
+                    }),
+                    tag.into_type(),
+                )
+            })
+            .collect();
+
+        let columns = vec![
+            create_fix_column_with_config(
+                0,
+                row_count,
+                "long_col",
+                expected_buffs[0].0.data_vec.as_ref(),
+                ColumnTypeTag::Long.into_type(),
+                pco_cfg,
+            ),
+            create_fix_column_with_config(
+                1,
+                row_count,
+                "timestamp_col",
+                expected_buffs[1].0.data_vec.as_ref(),
+                ColumnTypeTag::Timestamp.into_type(),
+                pco_cfg,
+            ),
+            create_fix_column_with_config(
+                2,
+                row_count,
+                "date_col",
+                expected_buffs[2].0.data_vec.as_ref(),
+                ColumnTypeTag::Date.into_type(),
+                pco_cfg,
             ),
         ];
 
