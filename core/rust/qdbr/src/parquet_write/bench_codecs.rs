@@ -16,16 +16,17 @@ use std::io::Cursor;
 use std::ptr::null;
 use std::time::Instant;
 
-use arrow::array::Float64Array;
+use arrow::array::{Float32Array, Float64Array};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use pco::data_types::Number;
 use qdb_core::col_type::ColumnTypeTag;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 use crate::parquet::tests::ColumnTypeTagExt;
 use crate::parquet_write::file::ParquetWriter;
-use crate::parquet_write::lossy::round_f64;
+use crate::parquet_write::lossy::{round_f32, round_f64};
 use crate::parquet_write::schema::{Column, ParquetEncodingConfig, Partition};
 
 const N: usize = 1_000_000;
@@ -263,7 +264,47 @@ fn run_dataset(title: &str, data: &[f64]) {
                 rmean,
             );
         }
+
+        // pco row (round -> pco). pco is a fitted numeric codec, not a Parquet
+        // encoding, so this is raw codec bytes (no Parquet framing); the framing
+        // overhead in the rows above is a few KB, negligible at N=1M.
+        let (pco_bytes, pco_enc, pco_dec) = bench_pco(&rounded);
+        let bpv = pco_bytes as f64 / rounded.len() as f64;
+        println!(
+            "| pco | {} | {} | pco-8 | {:.3} | {:.2}x | {:.1} | {:.1} | {:.2e} | {:.2e} |",
+            keep_disp,
+            implied,
+            bpv,
+            8.0 / bpv,
+            pco_enc,
+            pco_dec,
+            rmax,
+            rmean,
+        );
     }
+}
+
+/// Compress with pco (level 8) and round-trip-decompress for timing+correctness.
+/// Returns (compressed bytes, mean encode ms, mean decode ms) over RUNS.
+fn bench_pco<T: Number>(data: &[T]) -> (usize, f64, f64) {
+    let cfg = pco::ChunkConfig::default().with_compression_level(8);
+    let mut enc_ms = 0.0;
+    let mut dec_ms = 0.0;
+    let mut len = 0usize;
+    for run in 0..RUNS {
+        let t0 = Instant::now();
+        let bytes = pco::standalone::simple_compress(data, &cfg).expect("pco compress");
+        enc_ms += t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = Instant::now();
+        let decoded: Vec<T> = pco::standalone::simple_decompress(&bytes).expect("pco decompress");
+        dec_ms += t1.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(decoded.len(), data.len());
+        std::hint::black_box(&decoded);
+        if run == 0 {
+            len = bytes.len();
+        }
+    }
+    (len, enc_ms / RUNS as f64, dec_ms / RUNS as f64)
 }
 
 #[test]
@@ -281,4 +322,201 @@ fn run_codec_bench() {
 
     run_dataset("price-like (geometric random walk, smooth)", &price);
     run_dataset("qty-like (heavy-tailed abs-normal * 10^U(-2,4))", &qty);
+}
+
+// ---- Real-data confirmation: round -> BSS+zstd (shipped path) vs round -> pco ----
+// f32 columns, matching the source dtype and the earlier numpy proxy benchmark.
+
+const REAL_MAX_ROWS: usize = 50_000_000; // middle contiguous slice cap (matches proxy)
+
+/// Encode an f32 slice to an in-memory parquet `Float` column. Returns (bytes, ms).
+fn encode_to_parquet_f32(data: &[f32], encoding_id: i32, codec: &Codec) -> (Vec<u8>, f64) {
+    let config = ParquetEncodingConfig::new(encoding_id, codec.id, codec.level).raw();
+    let start = Instant::now();
+    let mut buf: Cursor<Vec<u8>> = Cursor::new(Vec::new());
+    let col = Column::from_raw_data(
+        0,
+        "val",
+        ColumnTypeTag::Float.into_type().code(),
+        0,
+        data.len(),
+        data.as_ptr() as *const u8,
+        std::mem::size_of_val(data),
+        null(),
+        0,
+        null(),
+        0,
+        false,
+        false,
+        config,
+    )
+    .expect("column");
+    let partition = Partition { table: "bench".to_string(), columns: vec![col] };
+    ParquetWriter::new(&mut buf)
+        .with_statistics(true)
+        .finish(partition)
+        .expect("write parquet");
+    (buf.into_inner(), start.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn decode_from_parquet_f32(bytes: &[u8]) -> (usize, f64) {
+    let bytes: Bytes = Bytes::copy_from_slice(bytes);
+    let start = Instant::now();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .expect("reader")
+        .with_batch_size(65536)
+        .build()
+        .expect("build reader");
+    let mut count = 0usize;
+    let mut acc = 0.0_f32;
+    for batch in reader.flatten() {
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("f32 array");
+        count += arr.len();
+        if !arr.is_empty() {
+            acc += arr.value(0) + arr.value(arr.len() - 1);
+        }
+    }
+    std::hint::black_box(acc);
+    (count, start.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// Minimal .npy loader for 1-D `<f4`/`<f8` arrays. Reads the whole file, then
+/// keeps a middle contiguous slice of at most REAL_MAX_ROWS finite values.
+fn load_npy_f32(path: &str) -> Option<Vec<f32>> {
+    let raw = std::fs::read(path).ok()?;
+    if raw.len() < 12 || &raw[0..6] != b"\x93NUMPY" {
+        return None;
+    }
+    let major = raw[6];
+    let (hdr_len, data_start) = if major == 1 {
+        let l = u16::from_le_bytes([raw[8], raw[9]]) as usize;
+        (l, 10 + l)
+    } else {
+        let l = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+        (l, 12 + l)
+    };
+    let header = std::str::from_utf8(&raw[data_start - hdr_len..data_start]).ok()?;
+    let data = &raw[data_start..];
+    let (elem, is_f8) = if header.contains("<f4") {
+        (4usize, false)
+    } else if header.contains("<f8") {
+        (8usize, true)
+    } else {
+        return None;
+    };
+    let n_total = data.len() / elem;
+    let (start_el, count) = if n_total > REAL_MAX_ROWS {
+        ((n_total - REAL_MAX_ROWS) / 2, REAL_MAX_ROWS)
+    } else {
+        (0, n_total)
+    };
+    let region = &data[start_el * elem..(start_el + count) * elem];
+    let mut out = Vec::with_capacity(count);
+    for c in region.chunks_exact(elem) {
+        let v = if is_f8 {
+            f64::from_le_bytes(c.try_into().unwrap()) as f32
+        } else {
+            f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+        };
+        if v.is_finite() {
+            out.push(v);
+        }
+    }
+    Some(out)
+}
+
+fn run_real_dataset(name: &str, data: &[f32]) {
+    let bss = CODECS.iter().find(|c| c.name == "zstd").unwrap();
+    println!("\n## {name}  (n={}, f32)", data.len());
+    println!("\n| keep_bits | pipeline | bytes/value | ratio vs 4.0 | encode ms | decode ms | realized max rel err |");
+    println!("|---|---|---|---|---|---|---|");
+    for keep in [23u32, 12, 11] {
+        let rounded: Vec<f32> = data.iter().map(|&x| round_f32(x, keep)).collect();
+        let (rmax, _) = rel_error_f32(data, &rounded);
+        let keep_disp = if keep >= 23 { "full".to_string() } else { keep.to_string() };
+
+        // round -> BYTE_STREAM_SPLIT -> zstd (the shipped lossy path).
+        let mut enc = 0.0;
+        let mut dec = 0.0;
+        let mut len = 0usize;
+        for run in 0..RUNS {
+            let (b, e) = encode_to_parquet_f32(&rounded, 5, bss);
+            let (cnt, d) = decode_from_parquet_f32(&b);
+            assert_eq!(cnt, rounded.len());
+            enc += e;
+            dec += d;
+            if run == 0 {
+                len = b.len();
+            }
+        }
+        let bpv = len as f64 / rounded.len() as f64;
+        println!(
+            "| {} | BSS+zstd | {:.3} | {:.2}x | {:.1} | {:.1} | {:.2e} |",
+            keep_disp,
+            bpv,
+            4.0 / bpv,
+            enc / RUNS as f64,
+            dec / RUNS as f64,
+            rmax,
+        );
+
+        // round -> pco.
+        let (pb, pe, pd) = bench_pco(&rounded);
+        let pbpv = pb as f64 / rounded.len() as f64;
+        println!(
+            "| {} | pco-8 | {:.3} | {:.2}x | {:.1} | {:.1} | {:.2e} |",
+            keep_disp,
+            pbpv,
+            4.0 / pbpv,
+            pe,
+            pd,
+            rmax,
+        );
+    }
+}
+
+fn rel_error_f32(orig: &[f32], rounded: &[f32]) -> (f64, f64) {
+    let mut max = 0.0_f64;
+    let mut sum = 0.0_f64;
+    let mut cnt = 0usize;
+    for (&o, &r) in orig.iter().zip(rounded.iter()) {
+        if o == 0.0 {
+            continue;
+        }
+        let e = (((r - o) as f64) / o as f64).abs();
+        if e > max {
+            max = e;
+        }
+        sum += e;
+        cnt += 1;
+    }
+    (max, if cnt > 0 { sum / cnt as f64 } else { 0.0 })
+}
+
+#[test]
+#[ignore = "benchmark; needs /tmp/real_*.npy; run in release with --ignored --nocapture"]
+fn run_pco_real_bench() {
+    println!("\n# Real-data: round -> BSS+zstd (shipped) vs round -> pco");
+    let mut files: Vec<String> = std::fs::read_dir("/tmp")
+        .expect("read /tmp")
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("real_") && n.ends_with(".npy"))
+        .map(|n| format!("/tmp/{n}"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        println!("(no /tmp/real_*.npy files found; skipping)");
+        return;
+    }
+    for f in files {
+        match load_npy_f32(&f) {
+            Some(data) if !data.is_empty() => run_real_dataset(&f, &data),
+            _ => println!("\n## {f}  (could not load; skipped)"),
+        }
+    }
 }
