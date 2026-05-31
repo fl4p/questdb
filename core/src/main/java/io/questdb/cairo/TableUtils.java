@@ -1739,7 +1739,11 @@ public final class TableUtils {
                     bits = -1;
                 }
             }
-            if (bits >= 0 && nameEnd - nameStart == nameLength) {
+            // Require at least 1 kept bit, matching the parser-side validator
+            // (SqlCompilerImpl.validateConvertLossyColumns). bits==0 would mean
+            // "round away everything"; reject it here too so a future unvalidated
+            // caller cannot reach the encoder with it.
+            if (bits >= 1 && nameEnd - nameStart == nameLength) {
                 boolean match = true;
                 for (int k = 0; k < nameLength; k++) {
                     if (spec.charAt(nameStart + k) != columnName.charAt(k)) {
