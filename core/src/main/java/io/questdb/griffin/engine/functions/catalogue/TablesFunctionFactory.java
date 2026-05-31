@@ -32,6 +32,7 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.DefaultLocalCacheSnapshotFactory;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.MetadataCacheReader;
+import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TimestampDriver;
@@ -180,7 +181,7 @@ public class TablesFunctionFactory implements FunctionFactory {
             try (MetadataCacheReader metadataRO = engine.getMetadataCache().readLock()) {
                 tableCacheVersion = metadataRO.snapshot(tableCache, tableCacheVersion);
             }
-            cursor.of(engine.getRecentWriteTracker(), engine.getTableSequencerAPI());
+            cursor.of(engine.getRecentWriteTracker(), engine.getTableSequencerAPI(), executionContext.getSecurityContext());
             cursor.toTop();
             return cursor;
         }
@@ -206,7 +207,9 @@ public class TablesFunctionFactory implements FunctionFactory {
             private int iteratorIdx = -1;
             private int iteratorLim;
             private RecentWriteTracker recentWriteTracker;
+            private SecurityContext securityContext;
             private TableSequencerAPI tableSequencerAPI;
+            private int visibleCount;
 
             public TablesRecordCursor(CharSequenceObjMap<CairoTable> tableCache) {
                 this.tableCache = tableCache;
@@ -224,18 +227,30 @@ public class TablesFunctionFactory implements FunctionFactory {
 
             @Override
             public boolean hasNext() {
-                if (iteratorIdx < iteratorLim) {
-                    record.of(tableCache.getAt(++iteratorIdx), recentWriteTracker, tableSequencerAPI);
+                while (iteratorIdx < iteratorLim) {
+                    final CairoTable table = tableCache.getAt(++iteratorIdx);
+                    if (securityContext != null && !securityContext.canViewTable(table.getTableToken())) {
+                        continue;
+                    }
+                    record.of(table, recentWriteTracker, tableSequencerAPI);
                     return true;
                 }
                 return false;
             }
 
-            public void of(RecentWriteTracker recentWriteTracker, TableSequencerAPI tableSequencerAPI) {
+            public void of(RecentWriteTracker recentWriteTracker, TableSequencerAPI tableSequencerAPI, SecurityContext securityContext) {
                 this.recentWriteTracker = recentWriteTracker;
                 this.tableSequencerAPI = tableSequencerAPI;
+                this.securityContext = securityContext;
                 // can is refreshed every time cursor is refreshed
                 this.iteratorLim = tableCache.size() - 1;
+                int count = 0;
+                for (int i = 0, n = tableCache.size(); i < n; i++) {
+                    if (securityContext == null || securityContext.canViewTable(tableCache.getAt(i).getTableToken())) {
+                        count++;
+                    }
+                }
+                this.visibleCount = count;
             }
 
             @Override
@@ -245,7 +260,7 @@ public class TablesFunctionFactory implements FunctionFactory {
 
             @Override
             public long size() {
-                return iteratorLim + 1;
+                return visibleCount;
             }
 
             @Override

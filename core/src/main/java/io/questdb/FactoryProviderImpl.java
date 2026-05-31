@@ -28,6 +28,8 @@ import io.questdb.cairo.DefaultTickCalendarServiceFactory;
 import io.questdb.cairo.DefaultWalJobFactory;
 import io.questdb.cairo.TickCalendarServiceFactory;
 import io.questdb.cairo.WalJobFactory;
+import io.questdb.cairo.security.AclStore;
+import io.questdb.cairo.security.PrefixAwareSecurityContextFactory;
 import io.questdb.cairo.security.ReadOnlySecurityContextFactory;
 import io.questdb.cairo.security.SecurityContextFactory;
 import io.questdb.cutlass.auth.AuthUtils;
@@ -45,6 +47,7 @@ import io.questdb.cutlass.http.HttpCookieHandlerImpl;
 import io.questdb.cutlass.http.HttpFullFatServerConfiguration;
 import io.questdb.cutlass.http.HttpSessionStore;
 import io.questdb.cutlass.http.HttpSessionStoreImpl;
+import io.questdb.cutlass.http.MultiUserHttpAuthenticatorFactory;
 import io.questdb.cutlass.http.StaticHttpAuthenticatorFactory;
 import io.questdb.cutlass.line.tcp.StaticChallengeResponseMatcher;
 import io.questdb.cutlass.pgwire.DefaultPGAuthenticatorFactory;
@@ -70,12 +73,20 @@ public class FactoryProviderImpl implements FactoryProvider {
     private final SecurityContextFactory securityContextFactory;
 
     public FactoryProviderImpl(ServerConfiguration configuration) {
+        // conf/acl.conf, when present, turns on multi-user logins and prefix-scoped
+        // authorization; otherwise the server keeps its default single-user behavior.
+        final AclStore aclStore = AclStore.load(configuration.getCairoConfiguration().getConfRoot());
         httpCookieHandler = getHttpCookieHandler(configuration);
         httpSessionStore = getHttpSessionStore(configuration);
         lineAuthenticatorFactory = getLineAuthenticatorFactory(configuration);
-        securityContextFactory = getSecurityContextFactory(configuration);
+        final SecurityContextFactory baseSecurityContextFactory = getSecurityContextFactory(configuration);
+        securityContextFactory = aclStore != null
+                ? new PrefixAwareSecurityContextFactory(aclStore, baseSecurityContextFactory)
+                : baseSecurityContextFactory;
         pgAuthenticatorFactory = new DefaultPGAuthenticatorFactory(configuration);
-        httpAuthenticatorFactory = getHttpAuthenticatorFactory(configuration);
+        httpAuthenticatorFactory = aclStore != null
+                ? new MultiUserHttpAuthenticatorFactory(aclStore)
+                : getHttpAuthenticatorFactory(configuration);
     }
 
     public static LineAuthenticatorFactory getLineAuthenticatorFactory(ServerConfiguration configuration) {

@@ -1,0 +1,70 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.cutlass.http;
+
+import io.questdb.cairo.SecurityContext;
+import io.questdb.std.Utf8SequenceObjHashMap;
+import io.questdb.std.str.DirectUtf8Sequence;
+
+/**
+ * HTTP Basic authenticator backed by the ACL store. It matches the incoming
+ * {@code Authorization} header against a precomputed map of expected
+ * {@code Basic <base64(user:password)>} headers to user names, and exposes the
+ * matched user as the principal. One instance per connection context; per-request
+ * state is reset at the start of each {@link #authenticate(HttpRequestHeader)}.
+ */
+public final class MultiUserHttpAuthenticator implements HttpAuthenticator {
+    private final Utf8SequenceObjHashMap<String> headerToUser;
+    private CharSequence principal;
+
+    public MultiUserHttpAuthenticator(Utf8SequenceObjHashMap<String> headerToUser) {
+        this.headerToUser = headerToUser;
+    }
+
+    @Override
+    public boolean authenticate(HttpRequestHeader headers) {
+        principal = null;
+        final DirectUtf8Sequence header = headers.getHeader(HttpConstants.HEADER_AUTHORIZATION);
+        if (header == null) {
+            return false;
+        }
+        final String user = headerToUser.get(header);
+        if (user == null) {
+            return false;
+        }
+        principal = user;
+        return true;
+    }
+
+    @Override
+    public byte getAuthType() {
+        return SecurityContext.AUTH_TYPE_CREDENTIALS;
+    }
+
+    @Override
+    public CharSequence getPrincipal() {
+        return principal;
+    }
+}

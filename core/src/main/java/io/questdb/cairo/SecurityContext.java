@@ -165,6 +165,17 @@ public interface SecurityContext extends Mutable {
     void authorizeViewDrop(TableToken tableToken);
 
     /**
+     * Non-throwing visibility check used to filter table-listing catalogue cursors
+     * (tables(), table_columns(), SHOW TABLES, information_schema.tables, pg_class)
+     * so a principal only sees tables it is allowed to access. The default allows
+     * every table; prefix-scoped contexts override it. Distinct from the
+     * authorize* methods, which throw to deny an action on a known table.
+     */
+    default boolean canViewTable(TableToken tableToken) {
+        return true;
+    }
+
+    /**
      * Should throw an exception if:
      * - logged in as a user and the user has been disabled, or it has no permissions to connect via the endpoint used,
      * - logged in as a service account and the service account has been disabled, or it has no permissions to connect via the endpoint used,

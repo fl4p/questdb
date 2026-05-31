@@ -29,6 +29,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableUtils;
@@ -85,6 +86,7 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
         private final CharSequence sysTablePrefix;
         private final CharSequence tempPendingRenameTablePrefix;
         private CairoEngine engine;
+        private SecurityContext securityContext;
         private TableToken tableToken;
 
         public InformationSchemaTablesCursorFactory(CairoConfiguration configuration, RecordMetadata metadata) {
@@ -97,6 +99,7 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
         @Override
         public RecordCursor getCursor(SqlExecutionContext executionContext) {
             engine = executionContext.getCairoEngine();
+            securityContext = executionContext.getSecurityContext();
             cursor.toTop();
             return cursor;
         }
@@ -115,6 +118,7 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
         protected void _close() {
             cursor.close();
             engine = null;
+            securityContext = null;
         }
 
         private class TableListRecordCursor implements NoRandomAccessRecordCursor {
@@ -143,7 +147,8 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
                 for (; tableIndex < n; tableIndex++) {
                     tableToken = tableBucket.get(tableIndex);
                     if (TableUtils.isFinalTableName(tableToken.getTableName(), tempPendingRenameTablePrefix) &&
-                            !isSystemTable(tableToken)) {
+                            !isSystemTable(tableToken) &&
+                            (securityContext == null || securityContext.canViewTable(tableToken))) {
                         break;
                     }
                 }

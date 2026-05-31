@@ -29,6 +29,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableUtils;
@@ -147,7 +148,7 @@ public class PgClassFunctionFactory implements FunctionFactory {
 
         @Override
         public RecordCursor getCursor(SqlExecutionContext executionContext) {
-            cursor.of(executionContext.getCairoEngine());
+            cursor.of(executionContext.getCairoEngine(), executionContext.getSecurityContext());
             cursor.toTop();
             return cursor;
         }
@@ -177,6 +178,7 @@ public class PgClassFunctionFactory implements FunctionFactory {
         private final ObjHashSet<TableToken> tableBucket = new ObjHashSet<>();
         private CairoEngine engine;
         private int fixedRelPos = -1;
+        private SecurityContext securityContext;
         private int tableIndex = -1;
         private String tableName;
 
@@ -227,17 +229,21 @@ public class PgClassFunctionFactory implements FunctionFactory {
                 tableIndex = 0;
             }
 
-            if (tableIndex == tableBucket.size()) {
-                return false;
+            while (tableIndex < tableBucket.size()) {
+                TableToken token = tableBucket.get(tableIndex++);
+                if (securityContext != null && !securityContext.canViewTable(token)) {
+                    continue;
+                }
+                tableName = token.getTableName();
+                intValues[INDEX_OID] = token.getTableId();
+                return true;
             }
-            TableToken token = tableBucket.get(tableIndex++);
-            tableName = token.getTableName();
-            intValues[INDEX_OID] = token.getTableId();
-            return true;
+            return false;
         }
 
-        public void of(CairoEngine engine) {
+        public void of(CairoEngine engine, SecurityContext securityContext) {
             this.engine = engine;
+            this.securityContext = securityContext;
         }
 
         @Override
