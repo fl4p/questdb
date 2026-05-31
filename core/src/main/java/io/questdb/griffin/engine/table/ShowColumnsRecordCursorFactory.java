@@ -144,6 +144,11 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
         }
 
         public ShowColumnsCursor of(SqlExecutionContext executionContext, TableToken tableToken, int tokenPosition) {
+            // hide schema of tables the principal may not see (prefix-scoped users):
+            // report as non-existent rather than revealing column names by name guess.
+            if (!executionContext.getSecurityContext().canViewTable(tableToken)) {
+                throw CairoException.tableDoesNotExist(tableToken.getTableName()).position(tokenPosition);
+            }
             final CairoEngine engine = executionContext.getCairoEngine();
             try (MetadataCacheReader metadataRO = engine.getMetadataCache().readLock()) {
                 final CairoTable cairoTable = metadataRO.getTable(tableToken);

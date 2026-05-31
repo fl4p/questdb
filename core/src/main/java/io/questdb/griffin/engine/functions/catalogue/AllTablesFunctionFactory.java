@@ -32,6 +32,7 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.DefaultLocalCacheSnapshotFactory;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.MetadataCacheReader;
+import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
@@ -95,6 +96,7 @@ public class AllTablesFunctionFactory implements FunctionFactory {
             try (MetadataCacheReader metadataRO = engine.getMetadataCache().readLock()) {
                 tableCacheVersion = metadataRO.snapshot(tableCache, tableCacheVersion);
             }
+            cursor.of(executionContext.getSecurityContext());
             cursor.toTop();
             return cursor;
         }
@@ -118,6 +120,7 @@ public class AllTablesFunctionFactory implements FunctionFactory {
             private final AllTablesRecord record = new AllTablesRecord();
             private final CharSequenceObjMap<CairoTable> tableCache;
             private int iteratorIdx = -1;
+            private SecurityContext securityContext;
 
             public AllTablesRecordCursor(CharSequenceObjMap<CairoTable> tableCache) {
                 this.tableCache = tableCache;
@@ -134,12 +137,19 @@ public class AllTablesFunctionFactory implements FunctionFactory {
 
             @Override
             public boolean hasNext() {
-                if (iteratorIdx < tableCache.size() - 1) {
-                    record.of(tableCache.getAt(++iteratorIdx));
+                while (iteratorIdx < tableCache.size() - 1) {
+                    final CairoTable table = tableCache.getAt(++iteratorIdx);
+                    if (securityContext != null && !securityContext.canViewTable(table.getTableToken())) {
+                        continue;
+                    }
+                    record.of(table);
                     return true;
                 }
-
                 return false;
+            }
+
+            public void of(SecurityContext securityContext) {
+                this.securityContext = securityContext;
             }
 
             @Override
