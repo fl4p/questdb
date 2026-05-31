@@ -51,6 +51,12 @@ public class AclUsernamePasswordMatcher implements UsernamePasswordMatcher {
 
     @Override
     public byte verifyPassword(CharSequence username, long passwordPtr, int passwordLen) {
+        // A pgwire startup packet may omit the user field, leaving username null; honor the
+        // UsernamePasswordMatcher contract (return AUTH_TYPE_NONE for null/empty) instead of
+        // letting a null reach aclStore.lookup() and NPE on the worker thread.
+        if (username == null || username.length() == 0) {
+            return AUTH_TYPE_NONE;
+        }
         final AclEntry entry = aclStore.lookup(username);
         if (entry == null) {
             return AUTH_TYPE_NONE;

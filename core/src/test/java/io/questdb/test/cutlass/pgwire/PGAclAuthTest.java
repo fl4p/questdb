@@ -90,6 +90,45 @@ public class PGAclAuthTest extends AbstractBootstrapTest {
     }
 
     @Test
+    public void testKnownGap_prefixUserCanCreateOutsidePrefix() throws Exception {
+        // SECURITY KNOWN GAP (tracked): a prefix-scoped rw user can CREATE objects OUTSIDE its
+        // prefix. authorizeTableCreate()/authorizeViewCreate()/authorizeMatViewCreate() receive no
+        // object name, and checkCreate() only checks the read-only flag -- so the prefix is not
+        // enforced at create time. This is pre-existing in the shared PrefixAwareSecurityContext
+        // (already reachable over HTTP); pgwire ACL only extends the reach. The blast radius is
+        // namespace squatting only: the creator gets NO data access to the squatted table (read,
+        // insert, drop all route through the prefix check and are denied), so it is not a data leak.
+        //
+        // TRIPWIRE: when authorizeTableCreate enforces the prefix, the CREATE below will start
+        // failing with "Access denied". At that point, invert this assertion (expect failure) and
+        // delete this known-gap note. See docs/acl-pgwire-plan.md.
+        TestUtils.assertMemoryLeak(() -> {
+            try (ServerMain serverMain = startWithEnvVariables()) {
+                int port = serverMain.getConfiguration().getPGWireConfiguration().getBindPort();
+
+                // alice (prefix projecta_, rw) can currently squat a name outside her prefix.
+                assertQuerySucceeds(
+                        "alice",
+                        "s3cret",
+                        port,
+                        "create table projectb_squat (x int)",
+                        "KNOWN GAP: prefix-scoped rw user can currently create outside its prefix"
+                );
+
+                // ...but squatting grants no data access: she cannot even read what she created.
+                assertQueryFails(
+                        "alice",
+                        "s3cret",
+                        port,
+                        "select count() from projectb_squat",
+                        "Access denied [table=projectb_squat]",
+                        "squatted table must not be readable by its creator"
+                );
+            }
+        });
+    }
+
+    @Test
     public void testPrefixScopedAuthorization() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (ServerMain serverMain = startWithEnvVariables()) {

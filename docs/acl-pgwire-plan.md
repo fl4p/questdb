@@ -53,4 +53,28 @@ HTTP. ILP is out of scope.
 `PGAclAuthTest` (`test/cutlass/pgwire/`) exercises ACL auth over a real pgwire
 socket: valid/wrong/unknown credentials, admin/quest rejection when ACL is
 present, prefix filtering of `tables()` and table access, and read-only
-enforcement.
+enforcement. `AclUsernamePasswordMatcherTest` (`test/cairo/security/`) covers the
+matcher directly, including the null/empty-username guard.
+
+## Known gap (tracked): CREATE is not prefix-enforced
+
+A prefix-scoped `rw` user can `CREATE TABLE`/`CREATE VIEW`/`CREATE MATERIALIZED
+VIEW` with a name OUTSIDE its prefix. `SecurityContext.authorizeTableCreate()`
+(and the view/mat-view equivalents) receive no object name, and
+`PrefixAwareSecurityContext.checkCreate()` only checks the read-only flag, so the
+prefix cannot be enforced at create time.
+
+- Pre-existing in the shared `PrefixAwareSecurityContext` and already reachable
+  over HTTP; the pgwire ACL work only extends the reach to a second protocol.
+- Severity: MEDIUM. Blast radius is namespace squatting / pollution, NOT data
+  access. Every follow-on op (insert/select/drop/update/truncate, and CTAS
+  bodies) routes through `checkVisible`/`checkWrite` -> `inPrefix` and is denied,
+  so the creator cannot read, write, or even drop the squatted object (admin
+  cleanup required).
+- Documented by `PGAclAuthTest.testKnownGap_prefixUserCanCreateOutsidePrefix`,
+  which asserts the current (insecure) behavior and acts as a tripwire.
+- Proper fix (separate task): thread the new object name through
+  `authorizeTableCreate`, `authorizeViewCreate`, and `authorizeMatViewCreate` and
+  enforce `startsWith(prefix)`. This is a `SecurityContext` interface change that
+  also affects HTTP, hence out of scope here. When done, invert the tripwire
+  assertion and remove this section.
