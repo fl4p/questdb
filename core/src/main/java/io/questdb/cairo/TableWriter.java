@@ -1528,7 +1528,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
     }
 
     @Override
-    public boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp) {
+    public boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp, @Nullable CharSequence lossyColumns) {
         assert metadata.getTimestampIndex() > -1;
         assert PartitionBy.isPartitioned(partitionBy);
 
@@ -1586,7 +1586,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
             setPathForParquetPartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, getTxn());
 
             LOG.info().$("converting native partition to parquet [path=").$substr(pathRootSize, path).I$();
-            long parquetFileLength = produceParquetFromNative(path, other, partitionTimestamp, partitionIndex, partitionNameTxn, getTxn(), bloomFilterColumns, bloomFilterFpp);
+            long parquetFileLength = produceParquetFromNative(path, other, partitionTimestamp, partitionIndex, partitionNameTxn, getTxn(), bloomFilterColumns, bloomFilterFpp, lossyColumns);
 
             // Before updating column top, check and re-build indexes.
             // copyOrRebuildColumnIndexes() must be called before zeroColumnTopsAfterParquetRewrite()
@@ -10460,7 +10460,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
         return parquetRowCount;
     }
 
-    private long produceParquetFromNative(Path path, Path other, long partitionTimestamp, int partitionIndex, long partitionNameTxn, long parquetNameTxn, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp) {
+    private long produceParquetFromNative(Path path, Path other, long partitionTimestamp, int partitionIndex, long partitionNameTxn, long parquetNameTxn, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp, @Nullable CharSequence lossyColumns) {
         final long partitionRowCount = getPartitionSize(partitionIndex);
         return TableUtils.produceParquetFromNative(
                 path,
@@ -10478,6 +10478,7 @@ public class TableWriter implements TableWriterAPI, MetadataService, Closeable {
                 bloomFilterColumns,
                 bloomFilterFpp,
                 parquetBloomFilterIndexes,
+                lossyColumns,
                 -1L
         );
     }

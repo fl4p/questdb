@@ -174,9 +174,9 @@ public class TableReaderReloadFuzzTest extends AbstractCairoTest {
                         if (isParquet) {
                             writer.convertPartitionParquetToNative(timestamp);
                         } else {
-                            writer.convertPartitionNativeToParquet(timestamp, null, Double.NaN);
+                            writer.convertPartitionNativeToParquet(timestamp, null, Double.NaN, null);
                             if (delete) {
-                                writer.convertPartitionNativeToParquet(writer.getPartitionTimestamp(1), null, Double.NaN);
+                                writer.convertPartitionNativeToParquet(writer.getPartitionTimestamp(1), null, Double.NaN, null);
                                 writer.removePartition(writer.getPartitionTimestamp(0));
                             }
                         }

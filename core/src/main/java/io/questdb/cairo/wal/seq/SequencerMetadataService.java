@@ -91,7 +91,7 @@ public class SequencerMetadataService implements MetadataServiceStub {
     }
 
     @Override
-    public boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp) {
+    public boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp, @Nullable CharSequence lossyColumns) {
         return false;
     }
 

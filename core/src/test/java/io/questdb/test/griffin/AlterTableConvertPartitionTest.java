@@ -29,7 +29,12 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.SymbolMapWriter;
+import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.SqlException;
 import io.questdb.griffin.engine.table.ParquetRowGroupFilter;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
@@ -210,7 +215,7 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
             assertException(
                     "ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10' WITH (unknown_option = 'val')",
                     67,
-                    "bloom_filter_columns or fpp expected"
+                    "bloom_filter_columns, fpp or lossy expected"
             );
 
             // missing '=' after bloom_filter_columns
@@ -275,6 +280,88 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
                     95,
                     "',' or ')' expected"
             );
+
+            // lossy on a non-float column (id is INT)
+            assertLossyOptionError(
+                    "ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10' WITH (lossy = 'id:10')",
+                    "LOSSY is only supported for FLOAT and DOUBLE columns"
+            );
+
+            // lossy on a non-existent column
+            assertLossyOptionError(
+                    "ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10' WITH (lossy = 'nope:10')",
+                    "lossy column does not exist"
+            );
+
+            // lossy entry missing the ':bits' part
+            assertLossyOptionError(
+                    "ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10' WITH (lossy = 'id')",
+                    "lossy option expects 'column:bits' pairs"
+            );
+        });
+    }
+
+    private static void assertLossyOptionError(String sql, String expectedMessage) {
+        try {
+            execute(sql);
+            Assert.fail("expected SqlException for: " + sql);
+        } catch (SqlException e) {
+            TestUtils.assertContains(e.getFlyweightMessage(), expectedMessage);
+        } catch (Exception e) {
+            Assert.fail("expected SqlException, got " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    @Test
+    public void testConvertToParquetWithLossyOverride() throws Exception {
+        // One-shot per-conversion lossy override: CONVERT ... WITH (lossy='px:10')
+        // rounds the column during this conversion (via pco) without changing the
+        // column's stored config. Values read back rounded, and the metadata config
+        // stays default.
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            execute("""
+                    CREATE TABLE x (
+                        px DOUBLE,
+                        ts TIMESTAMP
+                    ) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL
+                    """);
+            // Day 1 (will be converted) plus a later active partition, so the
+            // converted partition is not the active one (active partitions cannot
+            // be converted). Day-1 rows use x = 1..500.
+            execute("INSERT INTO x SELECT x * 0.1 + 1.0, timestamp_sequence('2024-06-10', 60_000_000L) FROM long_sequence(500)");
+            execute("INSERT INTO x SELECT x * 0.1 + 1.0, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(500)");
+
+            execute("ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10' WITH (lossy = 'px:10')");
+
+            final double bound = Math.pow(2, -(10 + 1)) * 1.000_001;
+            final long dropMask = (1L << (52 - 10)) - 1;
+            boolean anyChanged = false;
+            int n = 0;
+            try (
+                    RecordCursorFactory factory = select("SELECT px FROM x WHERE ts < '2024-06-11'", sqlExecutionContext);
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    double got = rec.getDouble(0);
+                    double orig = (n + 1) * 0.1 + 1.0;
+                    Assert.assertEquals("low mantissa bits not cleared at row " + n, 0L, Double.doubleToLongBits(got) & dropMask);
+                    double rel = Math.abs((got - orig) / orig);
+                    Assert.assertTrue("rel err " + rel + " exceeds " + bound + " at row " + n, rel <= bound);
+                    if (got != orig) {
+                        anyChanged = true;
+                    }
+                    n++;
+                }
+            }
+            Assert.assertEquals(500, n);
+            Assert.assertTrue("WITH (lossy=...) did not reach the encoder", anyChanged);
+
+            // The one-shot override must not persist on the column metadata.
+            try (TableReader reader = engine.getReader("x")) {
+                Assert.assertEquals("lossy override must not persist to column metadata",
+                        0, reader.getMetadata().getColumnMetadata(0).getParquetEncodingConfig());
+            }
         });
     }
 

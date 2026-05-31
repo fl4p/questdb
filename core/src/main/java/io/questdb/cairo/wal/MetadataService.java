@@ -140,7 +140,7 @@ public interface MetadataService {
             SecurityContext securityContext
     );
 
-    boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp);
+    boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp, @Nullable CharSequence lossyColumns);
 
     boolean convertPartitionParquetToNative(long partitionTimestamp);
 

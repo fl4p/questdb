@@ -348,8 +348,12 @@ public class AlterOperationBuilder implements Mutable {
         extraInfo.add(writerColumnIndex);
     }
 
-    public void setParquetConversionOptions(@Nullable CharSequence bloomFilterColumns, double fpp) {
+    public void setParquetConversionOptions(@Nullable CharSequence bloomFilterColumns, double fpp, @Nullable CharSequence lossyColumns) {
+        // extraStrInfo[0] = bloom filter columns, extraStrInfo[1] = lossy override
+        // columns; fpp stays the last entry of extraInfo (AlterOperation reads it
+        // from the tail). Either string may be null.
         extraStrInfo.add(bloomFilterColumns);
+        extraStrInfo.add(lossyColumns);
         extraInfo.add(Double.doubleToLongBits(fpp));
     }
 

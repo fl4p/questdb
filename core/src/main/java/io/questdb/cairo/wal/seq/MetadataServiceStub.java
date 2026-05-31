@@ -62,7 +62,7 @@ public interface MetadataServiceStub extends MetadataService {
     }
 
     @Override
-    default boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp) {
+    default boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp, @Nullable CharSequence lossyColumns) {
         throw CairoException.critical(0).put("convert native partition to parquet does not update sequencer metadata");
     }
 

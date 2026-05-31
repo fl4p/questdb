@@ -4950,6 +4950,7 @@ public class SqlCompilerImpl implements SqlCompiler, Closeable, SqlParserCallbac
             TableRecordMetadata tableMetadata
     ) throws SqlException {
         CharSequence bloomFilterColumns = null;
+        CharSequence lossyColumns = null;
         double fpp = Double.NaN;
 
         CharSequence tok = expectToken(lexer, "'('");
@@ -4958,7 +4959,7 @@ public class SqlCompilerImpl implements SqlCompiler, Closeable, SqlParserCallbac
         }
 
         while (true) {
-            tok = expectToken(lexer, "bloom_filter_columns or fpp");
+            tok = expectToken(lexer, "bloom_filter_columns, fpp or lossy");
 
             if (isBloomFilterColumnsKeyword(tok)) {
                 if (bloomFilterColumns != null) {
@@ -4989,8 +4990,20 @@ public class SqlCompilerImpl implements SqlCompiler, Closeable, SqlParserCallbac
                 } catch (NumericException e) {
                     throw SqlException.$(lexer.lastTokenPosition(), "invalid fpp value");
                 }
+            } else if (isLossyKeyword(tok)) {
+                if (lossyColumns != null) {
+                    throw SqlException.$(lexer.lastTokenPosition(), "duplicate lossy option");
+                }
+                tok = expectToken(lexer, "'='");
+                if (!Chars.equals(tok, '=')) {
+                    throw SqlException.$(lexer.lastTokenPosition(), "'=' expected");
+                }
+                tok = expectToken(lexer, "lossy column spec");
+                int lossyPosition = lexer.lastTokenPosition();
+                lossyColumns = unquote(tok);
+                validateConvertLossyColumns(lossyColumns, tableMetadata, lossyPosition);
             } else {
-                throw SqlException.$(lexer.lastTokenPosition(), "bloom_filter_columns or fpp expected");
+                throw SqlException.$(lexer.lastTokenPosition(), "bloom_filter_columns, fpp or lossy expected");
             }
 
             tok = SqlUtil.fetchNext(lexer);
@@ -5005,7 +5018,83 @@ public class SqlCompilerImpl implements SqlCompiler, Closeable, SqlParserCallbac
             }
         }
 
-        alterOperationBuilder.setParquetConversionOptions(bloomFilterColumns, fpp);
+        alterOperationBuilder.setParquetConversionOptions(bloomFilterColumns, fpp, lossyColumns);
+    }
+
+    // Validates the CONVERT ... WITH (lossy='col:bits, ...') option: each named
+    // column must exist and be FLOAT/DOUBLE, and the keep-bits must be in range
+    // (1..23 for FLOAT, 1..52 for DOUBLE). Mirrors PARQUET(LOSSY(n)) validation.
+    private void validateConvertLossyColumns(
+            CharSequence spec,
+            TableRecordMetadata tableMetadata,
+            int position
+    ) throws SqlException {
+        final int len = spec.length();
+        int i = 0;
+        boolean any = false;
+        while (i < len) {
+            while (i < len && (spec.charAt(i) == ',' || spec.charAt(i) == ' ' || spec.charAt(i) == '\t')) {
+                i++;
+            }
+            if (i >= len) {
+                break;
+            }
+            final int nameStart = i;
+            while (i < len && spec.charAt(i) != ':' && spec.charAt(i) != ',') {
+                i++;
+            }
+            int nameEnd = i;
+            while (nameEnd > nameStart && (spec.charAt(nameEnd - 1) == ' ' || spec.charAt(nameEnd - 1) == '\t')) {
+                nameEnd--;
+            }
+            if (i >= len || spec.charAt(i) != ':' || nameEnd <= nameStart) {
+                throw SqlException.$(position, "lossy option expects 'column:bits' pairs");
+            }
+            i++;
+            int bitsStart = i;
+            while (i < len && spec.charAt(i) != ',') {
+                i++;
+            }
+            int bitsEnd = i;
+            while (bitsStart < bitsEnd && (spec.charAt(bitsStart) == ' ' || spec.charAt(bitsStart) == '\t')) {
+                bitsStart++;
+            }
+            while (bitsEnd > bitsStart && (spec.charAt(bitsEnd - 1) == ' ' || spec.charAt(bitsEnd - 1) == '\t')) {
+                bitsEnd--;
+            }
+            if (bitsEnd <= bitsStart) {
+                throw SqlException.$(position, "lossy option expects 'column:bits' pairs");
+            }
+            final CharSequence columnName = spec.subSequence(nameStart, nameEnd);
+            final int columnIndex = tableMetadata.getColumnIndexQuiet(columnName);
+            if (columnIndex < 0) {
+                throw SqlException.$(position, "lossy column does not exist [column=").put(columnName).put(']');
+            }
+            final int maxBits;
+            switch (ColumnType.tagOf(tableMetadata.getColumnType(columnIndex))) {
+                case ColumnType.DOUBLE:
+                    maxBits = 52;
+                    break;
+                case ColumnType.FLOAT:
+                    maxBits = 23;
+                    break;
+                default:
+                    throw SqlException.$(position, "LOSSY is only supported for FLOAT and DOUBLE columns [column=").put(columnName).put(']');
+            }
+            final int bits;
+            try {
+                bits = Numbers.parseInt(spec, bitsStart, bitsEnd);
+            } catch (NumericException e) {
+                throw SqlException.$(position, "LOSSY mantissa bits must be a number [column=").put(columnName).put(']');
+            }
+            if (bits < 1 || bits > maxBits) {
+                throw SqlException.$(position, "LOSSY mantissa bits must be between 1 and ").put(maxBits).put(" [column=").put(columnName).put(']');
+            }
+            any = true;
+        }
+        if (!any) {
+            throw SqlException.$(position, "lossy option expects 'column:bits' pairs");
+        }
     }
 
     private void parseResumeWal(TableToken tableToken, int tableNamePosition, SqlExecutionContext executionContext) throws SqlException {

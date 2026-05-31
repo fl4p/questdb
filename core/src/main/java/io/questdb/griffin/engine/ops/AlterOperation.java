@@ -502,14 +502,19 @@ public class AlterOperation extends AbstractOperation implements Mutable {
 
     private void applyConvertPartition(MetadataService svc, boolean toParquet) {
         // Check if we have bloom filter options (only for toParquet conversion)
-        // Data layout with bloom filter: extraInfo = [ts1, pos1, ts2, pos2, ..., fpp_bits], extraStrInfo = [bloomFilterColumns]
-        // Data layout without bloom filter: extraInfo = [ts1, pos1, ts2, pos2, ...], extraStrInfo = []
+        // With a WITH clause: extraInfo = [ts1, pos1, ts2, pos2, ..., fpp_bits],
+        // extraStrInfo = [bloomFilterColumns, lossyColumns] (either string may be null).
+        // Without a WITH clause: extraInfo = [ts1, pos1, ts2, pos2, ...], extraStrInfo = [].
         CharSequence bloomFilterColumns = null;
+        CharSequence lossyColumns = null;
         double fpp = Double.NaN;
         int partitionCount;
 
         if (toParquet && activeExtraStrInfo.size() > 0) {
             bloomFilterColumns = activeExtraStrInfo.getStrA(0);
+            if (activeExtraStrInfo.size() > 1) {
+                lossyColumns = activeExtraStrInfo.getStrA(1);
+            }
             fpp = Double.longBitsToDouble(extraInfo.getQuick(extraInfo.size() - 1));
             partitionCount = (extraInfo.size() - 1) / 2;
         } else {
@@ -520,7 +525,7 @@ public class AlterOperation extends AbstractOperation implements Mutable {
             long partitionTimestamp = extraInfo.getQuick(i * 2);
             final boolean result;
             if (toParquet) {
-                result = svc.convertPartitionNativeToParquet(partitionTimestamp, bloomFilterColumns, fpp);
+                result = svc.convertPartitionNativeToParquet(partitionTimestamp, bloomFilterColumns, fpp, lossyColumns);
             } else {
                 result = svc.convertPartitionParquetToNative(partitionTimestamp);
             }

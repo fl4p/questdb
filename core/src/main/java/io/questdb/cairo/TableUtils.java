@@ -1693,6 +1693,68 @@ public final class TableUtils {
         return config;
     }
 
+    /**
+     * Looks up the lossy keep-bits override for {@code columnName} in a
+     * {@code "name:bits, name:bits"} spec (the CONVERT ... WITH (lossy=...) option).
+     * Returns the keep-bits, or -1 when {@code spec} is null or the column is not
+     * listed. Allocation-free: matches column-name regions in place. Partition
+     * conversion is a rare admin operation, so re-scanning per column is fine.
+     */
+    public static int lossyKeepBitsForColumn(@Nullable CharSequence spec, CharSequence columnName) {
+        if (spec == null) {
+            return -1;
+        }
+        final int len = spec.length();
+        final int nameLength = columnName.length();
+        int i = 0;
+        while (i < len) {
+            while (i < len && (spec.charAt(i) == ',' || spec.charAt(i) == ' ' || spec.charAt(i) == '\t')) {
+                i++;
+            }
+            final int nameStart = i;
+            while (i < len && spec.charAt(i) != ':' && spec.charAt(i) != ',') {
+                i++;
+            }
+            int nameEnd = i;
+            while (nameEnd > nameStart && (spec.charAt(nameEnd - 1) == ' ' || spec.charAt(nameEnd - 1) == '\t')) {
+                nameEnd--;
+            }
+            int bits = -1;
+            if (i < len && spec.charAt(i) == ':') {
+                i++;
+                int bitsStart = i;
+                while (i < len && spec.charAt(i) != ',') {
+                    i++;
+                }
+                int bitsEnd = i;
+                while (bitsStart < bitsEnd && (spec.charAt(bitsStart) == ' ' || spec.charAt(bitsStart) == '\t')) {
+                    bitsStart++;
+                }
+                while (bitsEnd > bitsStart && (spec.charAt(bitsEnd - 1) == ' ' || spec.charAt(bitsEnd - 1) == '\t')) {
+                    bitsEnd--;
+                }
+                try {
+                    bits = Numbers.parseInt(spec, bitsStart, bitsEnd);
+                } catch (NumericException e) {
+                    bits = -1;
+                }
+            }
+            if (bits >= 0 && nameEnd - nameStart == nameLength) {
+                boolean match = true;
+                for (int k = 0; k < nameLength; k++) {
+                    if (spec.charAt(nameStart + k) != columnName.charAt(k)) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return bits;
+                }
+            }
+        }
+        return -1;
+    }
+
     public static void parseBloomFilterColumnIndexes(RecordMetadata metadata, CharSequence bloomFilterColumns, DirectIntList indexes) {
         int start = 0;
         int len = bloomFilterColumns.length();
@@ -1775,6 +1837,7 @@ public final class TableUtils {
             @Nullable CharSequence bloomFilterColumns,
             double bloomFilterFpp,
             DirectIntList bloomFilterIndexes,
+            @Nullable CharSequence lossyColumns,
             long squashTracker
     ) {
         final FilesFacade ff = configuration.getFilesFacade();
@@ -1821,7 +1884,13 @@ public final class TableUtils {
                     final long columnNameTxn = columnVersionReader.getColumnNameTxn(partitionTimestamp, columnId);
                     final long columnTop = columnVersionReader.getColumnTop(partitionTimestamp, columnId);
                     final long columnRowCount = (columnTop != -1) ? partitionRowCount - columnTop : 0;
-                    final int parquetEncodingConfig = metadata.getColumnMetadata(columnIndex).getParquetEncodingConfig();
+                    // One-shot per-conversion lossy override (CONVERT ... WITH (lossy='col:n')):
+                    // replace the column's stored config with a pco LOSSY(n) config just for
+                    // this conversion, without persisting it to the table metadata.
+                    final int lossyOverrideKeepBits = lossyKeepBitsForColumn(lossyColumns, columnName);
+                    final int parquetEncodingConfig = lossyOverrideKeepBits >= 0
+                            ? packParquetConfig(0, 0, 0, false, lossyOverrideKeepBits)
+                            : metadata.getColumnMetadata(columnIndex).getParquetEncodingConfig();
 
                     if (columnRowCount > 0) {
                         if (ColumnType.isSymbol(columnType)) {
