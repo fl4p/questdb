@@ -52,6 +52,41 @@ public class InfluxQueryProcessorTest extends AbstractBootstrapTest {
     }
 
     @Test
+    public void testAggregates() throws Exception {
+        // distinct timestamps within the base bucket make first()/last() deterministic
+        TestUtils.assertMemoryLeak(() -> {
+            try (final TestServerMain serverMain = startWithEnvVariables()) {
+                final int port = serverMain.getHttpServerPort();
+                try (Sender sender = Sender.builder(Sender.Transport.HTTP).address("localhost:" + port).build()) {
+                    sender.table("agg").doubleColumn("value", 1.0).doubleColumn("v2", 10.0).at(BASE_MS, ChronoUnit.MILLIS);
+                    sender.table("agg").doubleColumn("value", 5.0).doubleColumn("v2", 50.0).at(BASE_MS + 1_000, ChronoUnit.MILLIS);
+                    sender.table("agg").doubleColumn("value", 3.0).doubleColumn("v2", 30.0).at(BASE_MS + 10_000, ChronoUnit.MILLIS);
+                    sender.flush();
+                }
+                serverMain.awaitTable("agg");
+                serverMain.assertSql("SELECT count() FROM agg", "count\n3\n");
+
+                final String window = " FROM \"agg\" WHERE time >= 1704067200000ms AND time <= 1704067210000ms GROUP BY time(10s) fill(none)";
+                try (HttpClient client = HttpClientFactory.newPlainTextInstance()) {
+                    // all six pass-through aggregates in one query; count yields a bare integer (LONG)
+                    assertQuery(client, port,
+                            "SELECT sum(\"value\"), count(\"value\"), min(\"value\"), max(\"value\"), first(\"value\"), last(\"value\")" + window,
+                            "{\"results\":[{\"statement_id\":0,\"series\":[{\"name\":\"agg\",\"columns\":[\"time\",\"sum\",\"count\",\"min\",\"max\",\"first\",\"last\"],\"values\":[" +
+                                    "[1704067200000,6.0,2,1.0,5.0,1.0,5.0]," +
+                                    "[1704067210000,3.0,1,3.0,3.0,3.0,3.0]]}]}]}");
+
+                    // two aggregates of the same function get disambiguated column labels (mean, mean_v2)
+                    assertQuery(client, port,
+                            "SELECT mean(\"value\"), mean(\"v2\")" + window,
+                            "{\"results\":[{\"statement_id\":0,\"series\":[{\"name\":\"agg\",\"columns\":[\"time\",\"mean\",\"mean_v2\"],\"values\":[" +
+                                    "[1704067200000,3.0,30.0]," +
+                                    "[1704067210000,3.0,30.0]]}]}]}");
+                }
+            }
+        });
+    }
+
+    @Test
     public void testChunkedResume() throws Exception {
         // small send buffer forces the response to span many chunks, exercising the
         // bookmark/resetToBookmark resume path in InfluxQueryProcessorState
