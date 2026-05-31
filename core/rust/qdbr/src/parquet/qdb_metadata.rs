@@ -81,6 +81,11 @@ pub enum QdbMetaColFormat {
     /// is the same as the QuestDB's global dict key.
     /// Used for symbol columns.
     LocalKeyIsGlobal = 1,
+
+    /// The FLOAT/DOUBLE column's data pages hold a pco (pcodec) blob rather than
+    /// a standard Parquet encoding. QuestDB's reader must pco-decode the page
+    /// bytes back to the logical type; external Parquet tools cannot read it.
+    PcoEncoded = 2,
 }
 
 impl Serialize for QdbMetaColFormat {
@@ -100,6 +105,7 @@ impl<'de> Deserialize<'de> for QdbMetaColFormat {
         let format = u8::deserialize(deserializer)?;
         match format {
             1 => Ok(QdbMetaColFormat::LocalKeyIsGlobal),
+            2 => Ok(QdbMetaColFormat::PcoEncoded),
             _ => Err(serde::de::Error::custom(format!(
                 "unsupported format: {format}"
             ))),

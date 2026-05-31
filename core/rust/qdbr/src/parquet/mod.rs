@@ -23,6 +23,7 @@
  ******************************************************************************/
 pub(crate) mod error;
 pub(crate) mod io;
+pub(crate) mod pco_codec;
 pub mod qdb_metadata;
 
 pub use qdb_metadata::{QdbMetaCol, QdbMetaColFormat};
