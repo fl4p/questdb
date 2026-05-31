@@ -2,8 +2,9 @@
 
 Uses the ``influxdb`` client library, imported lazily so v2-only users do not
 need it installed. Schema comes from ``SHOW TAG KEYS`` / ``SHOW FIELD KEYS``;
-data is streamed with chunked ``SELECT *`` queries at nanosecond epoch
-precision; principals come from ``SHOW USERS`` / ``SHOW GRANTS``.
+data is read with a per-measurement ``SELECT *`` at nanosecond epoch precision
+(chunked mode is avoided -- it triggers a msgpack bug in influxdb-python 5.x);
+principals come from ``SHOW USERS`` / ``SHOW GRANTS``.
 """
 
 from __future__ import annotations
@@ -90,36 +91,36 @@ class V1Reader(InfluxReader):
         self._client.switch_database(scope)
         tag_set = set(schema.tag_keys)
         field_set = set(schema.field_types)
-        # SELECT * returns time + tags + fields. chunked=True streams ResultSets
-        # so a large measurement never materializes fully in memory.
-        generator = self._client.query(
+        # SELECT * returns time + tags + fields in each row. We deliberately do
+        # NOT use chunked=True: with influxdb-python 5.x + a msgpack response the
+        # client raises msgpack ExtraData on chunked reads (and otherwise yields
+        # raw lists, not ResultSets). The whole measurement is therefore read in
+        # one query; very large measurements are held in memory (see README).
+        result_set = self._client.query(
             f'SELECT * FROM {_ident(measurement)}',
             epoch="ns",
-            chunked=True,
-            chunk_size=10_000,
         )
-        for result_set in generator:
-            for point in result_set.get_points():
-                ts_ns = point.get("time")
-                if ts_ns is None:
-                    continue  # a point with no timestamp cannot be placed
-                tags = {}
-                fields = {}
-                for key, value in point.items():
-                    if key == "time" or value is None:
-                        continue  # skip the timestamp col and sparse/absent values
-                    if key in tag_set:
-                        sval = str(value)
-                        if sval == "":
-                            continue  # empty tag -> no SYMBOL
-                        tags[key] = sval
-                    elif key in field_set:
-                        fields[key] = value
-                    else:
-                        # Column neither in tag nor field schema (e.g. a tag with
-                        # no values at schema time). Default to field.
-                        fields[key] = value
-                yield Row(table=measurement, tags=tags, fields=fields, ts_ns=int(ts_ns))
+        for point in result_set.get_points():
+            ts_ns = point.get("time")
+            if ts_ns is None:
+                continue  # a point with no timestamp cannot be placed
+            tags = {}
+            fields = {}
+            for key, value in point.items():
+                if key == "time" or value is None:
+                    continue  # skip the timestamp col and sparse/absent values
+                if key in tag_set:
+                    sval = str(value)
+                    if sval == "":
+                        continue  # empty tag -> no SYMBOL
+                    tags[key] = sval
+                elif key in field_set:
+                    fields[key] = value
+                else:
+                    # Column neither in tag nor field schema (e.g. a tag with
+                    # no values at schema time). Default to field.
+                    fields[key] = value
+            yield Row(table=measurement, tags=tags, fields=fields, ts_ns=int(ts_ns))
 
     def principals(self) -> List[Principal]:
         principals: List[Principal] = []
