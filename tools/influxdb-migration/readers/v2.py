@@ -2,15 +2,16 @@
 
 Uses the ``influxdb-client`` library, imported lazily. Buckets play the role of
 v1 databases (one bucket -> one ``<bucket>_`` table prefix). Schema comes from
-the Flux ``schema.tagKeys`` / ``schema.fieldKeys`` helpers; data is read in
-time windows so memory stays bounded; principals are derived from API tokens
-(authorizations), since v2 has no per-database READ/WRITE user model.
+the Flux ``schema.tagKeys`` / ``schema.fieldKeys`` helpers; data is streamed
+record-by-record via ``query_stream`` so a large bucket never materializes in
+memory; principals are derived from API tokens (authorizations), since v2 has
+no per-database READ/WRITE user model.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Iterator, List, Optional
 
 from model import (
@@ -45,7 +46,6 @@ class V2Reader(InfluxReader):
         url: str,
         token: str,
         org: str,
-        window: timedelta = timedelta(days=1),
         timeout_ms: int = 120_000,
     ):
         try:
@@ -57,7 +57,6 @@ class V2Reader(InfluxReader):
             ) from exc
 
         self._org = org
-        self._window = window
         self._client = InfluxDBClient(url=url, token=token, org=org, timeout=timeout_ms)
         self._query_api = self._client.query_api()
 
@@ -68,9 +67,12 @@ class V2Reader(InfluxReader):
         return [b.name for b in buckets if not b.name.startswith("_")]
 
     def measurements(self, scope: str) -> List[str]:
+        # start: 0 covers all of time. The schema.* helpers otherwise default to
+        # the last 30 days, which silently misses older data (and would report
+        # no measurements/tags/fields for a backfill).
         flux = (
             f'import "influxdata/influxdb/schema"\n'
-            f'schema.measurements(bucket: "{_esc(scope)}")'
+            f'schema.measurements(bucket: "{_esc(scope)}", start: 0)'
         )
         return [r["_value"] for r in self._flat_records(flux)]
 
@@ -79,7 +81,7 @@ class V2Reader(InfluxReader):
         tag_flux = (
             f'import "influxdata/influxdb/schema"\n'
             f'schema.measurementTagKeys(bucket: "{_esc(scope)}", '
-            f'measurement: "{_esc(measurement)}")'
+            f'measurement: "{_esc(measurement)}", start: 0)'
         )
         ts.tag_keys = [
             r["_value"]
@@ -89,7 +91,7 @@ class V2Reader(InfluxReader):
         field_flux = (
             f'import "influxdata/influxdb/schema"\n'
             f'schema.measurementFieldKeys(bucket: "{_esc(scope)}", '
-            f'measurement: "{_esc(measurement)}")'
+            f'measurement: "{_esc(measurement)}", start: 0)'
         )
         for r in self._flat_records(field_flux):
             # Field types are inferred per row from the actual _value during the
@@ -98,42 +100,38 @@ class V2Reader(InfluxReader):
         return ts
 
     def rows(self, scope: str, measurement: str, schema: TableSchema) -> Iterator[Row]:
-        oldest = self._oldest(scope, measurement)
-        if oldest is None:
-            return
-        start = oldest
-        now = datetime.now(timezone.utc)
         tag_set = set(schema.tag_keys)
-        while start < now:
-            stop = min(start + self._window, now)
-            flux = (
-                f'from(bucket: "{_esc(scope)}")\n'
-                f"  |> range(start: {_rfc3339(start)}, stop: {_rfc3339(stop)})\n"
-                f'  |> filter(fn: (r) => r._measurement == "{_esc(measurement)}")\n'
-                f'  |> pivot(rowKey: ["_time"], columnKey: ["_field"], '
-                f"valueColumn: \"_value\")"
-            )
-            for record in self._flat_records(flux):
-                ts_ns = _ns(record.get("_time"))
-                if ts_ns is None:
+        # Stream the whole measurement over all time. query_stream() yields one
+        # FluxRecord at a time, so a large bucket never materializes in memory;
+        # range(start: 0) lets InfluxDB default the stop bound to now(). pivot
+        # turns the long _field/_value form into one row per timestamp + tagset.
+        flux = (
+            f'from(bucket: "{_esc(scope)}")\n'
+            f"  |> range(start: 0)\n"
+            f'  |> filter(fn: (r) => r._measurement == "{_esc(measurement)}")\n'
+            f'  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")'
+        )
+        for record in self._query_api.query_stream(flux, org=self._org):
+            rec = record.values
+            ts_ns = _ns(rec.get("_time"))
+            if ts_ns is None:
+                continue
+            tags = {}
+            fields = {}
+            for key, value in rec.items():
+                if key in _RESERVED or key.startswith("_") or value is None:
                     continue
-                tags = {}
-                fields = {}
-                for key, value in record.items():
-                    if key in _RESERVED or key.startswith("_") or value is None:
+                if key in tag_set:
+                    sval = str(value)
+                    if sval == "":
                         continue
-                    if key in tag_set:
-                        sval = str(value)
-                        if sval == "":
-                            continue
-                        tags[key] = sval
-                        continue
-                    fields[key] = value
-                    ft = _PY_TYPE_MAP.get(type(value))
-                    if ft is not None:
-                        schema.field_types[key] = ft
-                yield Row(table=measurement, tags=tags, fields=fields, ts_ns=ts_ns)
-            start = stop
+                    tags[key] = sval
+                    continue
+                fields[key] = value
+                ft = _PY_TYPE_MAP.get(type(value))
+                if ft is not None:
+                    schema.field_types[key] = ft
+            yield Row(table=measurement, tags=tags, fields=fields, ts_ns=ts_ns)
 
     def principals(self) -> List[Principal]:
         principals: List[Principal] = []
@@ -144,12 +142,12 @@ class V2Reader(InfluxReader):
             return principals
         bucket_id_to_name = self._bucket_id_index()
         for auth in auths or []:
-            # Name the acl.conf user after the token's user/description.
-            name = (
-                getattr(auth, "user", None)
-                or getattr(auth, "description", None)
-                or getattr(auth, "id", "token")
-            )
+            # Name the acl.conf user after the token's DESCRIPTION: it is unique
+            # per token, whereas auth.user is the owner and is shared across all
+            # of that user's tokens (so naming by user collides). Fall back to a
+            # token-id-based name when a token has no description.
+            desc = (getattr(auth, "description", None) or "").strip()
+            name = desc or ("token-" + str(getattr(auth, "id", "") or "unknown")[:12])
             is_admin = _is_all_access(auth)
             principal = Principal(name=name, is_admin=is_admin)
             if not is_admin:
@@ -187,21 +185,6 @@ class V2Reader(InfluxReader):
         except Exception:  # noqa: BLE001
             return {}
 
-    def _oldest(self, scope: str, measurement: str) -> Optional[datetime]:
-        # Find the earliest timestamp so windowing starts at real data, not an
-        # arbitrary epoch that would scan years of empty ranges.
-        flux = (
-            f'from(bucket: "{_esc(scope)}")\n'
-            f"  |> range(start: 0)\n"
-            f'  |> filter(fn: (r) => r._measurement == "{_esc(measurement)}")\n'
-            f'  |> keep(columns: ["_time"])\n'
-            f"  |> first()"
-        )
-        records = self._flat_records(flux)
-        if not records:
-            return None
-        return _to_dt(records[0].get("_time"))
-
     def _flat_records(self, flux: str):
         tables = self._query_api.query(flux, org=self._org)
         out = []
@@ -235,10 +218,6 @@ def _is_all_access(auth) -> bool:
 
 def _esc(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
-def _rfc3339(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _to_dt(value) -> Optional[datetime]:

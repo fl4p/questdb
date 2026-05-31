@@ -138,18 +138,28 @@ only by the server account.
 
 ## Caveats
 
-- **Timestamp precision:** timestamps are read at nanoseconds; QuestDB stores
-  microseconds by default, so sub-microsecond precision is lost unless the
-  target column is a nanosecond timestamp.
-- **Re-runs append.** ILP does not deduplicate; running twice duplicates rows.
-  Pre-create tables with `DEDUP UPSERT KEYS(timestamp, <tags>)` for idempotent
-  re-runs.
+- **Timestamp precision:** timestamps are read at nanoseconds. Recent QuestDB
+  creates a nanosecond timestamp column on first ILP write, so precision is
+  preserved; on a build that stores microseconds, sub-microsecond precision is
+  lost.
+- **Re-runs append.** ILP does not deduplicate, so a second run duplicates rows.
+  By default the tool runs a pre-flight check and **refuses** when a target
+  table already holds data (exit 3); pass `--allow-duplicate-rows` to override,
+  or pre-create tables with `DEDUP UPSERT KEYS(timestamp, <tags>)`. The check
+  reuses any `username`/`password`/`token` in `--questdb-ilp`, and is skipped
+  for non-HTTP ILP transports (with a warning).
+- **Batching:** the ILP `Sender` buffers and auto-flushes; `--batch-size N` sets
+  `auto_flush_rows` so a batch flushes every N rows.
 - **ILP ingestion bypasses ACL** (it uses the existing ILP auth), so the
   migration itself is unaffected by `acl.conf`; the ACL only governs later
   HTTP/`/query`/REST reads.
 - **v2 tokens are not users.** v2 principals are derived from API
-  authorizations and named after the token user/description — an approximation
-  of the v1 per-database user model.
+  authorizations and named after the token **description** (unique per token;
+  the owning user is shared across a user's tokens) — an approximation of the
+  v1 per-database user model.
+
+Validated end to end against InfluxDB 1.8 and 2.7.12 -> QuestDB, with
+`questdb` 4.1.0, `influxdb` 5.3.2, `influxdb-client` 1.50.0.
 
 ## Verify after a run
 

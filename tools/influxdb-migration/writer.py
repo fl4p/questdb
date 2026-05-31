@@ -23,11 +23,17 @@ log = logging.getLogger("influx_migrate.writer")
 class QuestDBWriter:
     """Writes :class:`Row` objects into QuestDB via ILP, or counts them (dry run)."""
 
-    def __init__(self, conf: str, dry_run: bool = False):
+    def __init__(self, conf: str, dry_run: bool = False, batch_size: int = 0):
+        # batch_size maps to the ILP client's auto_flush_rows: the Sender buffers
+        # rows and flushes a batch every N. Inject it into the conf string unless
+        # the caller already set an auto_flush option there.
+        if batch_size and "auto_flush" not in conf:
+            sep = "" if conf.rstrip().endswith(";") else ";"
+            conf = conf.rstrip() + sep + f"auto_flush_rows={batch_size};"
         self._conf = conf
         self._dry_run = dry_run
-        self._sender = None
         self._stats: Dict[str, MigrationStats] = {}
+        self._sender = None
         if not dry_run:
             try:
                 from questdb.ingress import Sender  # lazy import

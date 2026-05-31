@@ -1,8 +1,13 @@
-# QuestDB ILP ingestion client (required for any real run).
-questdb>=2.0.0
+# Version bounds reflect the API surface validated end to end against real
+# servers (InfluxDB 1.8 + 2.7.12 -> QuestDB). Tested exact versions are noted
+# per line; the lower bounds pin the API actually exercised.
+
+# QuestDB ILP ingestion client (required for any real run). The Sender
+# from_conf/.row/.at API used here is 4.x. Tested: 4.1.0.
+questdb>=4.0,<5
 
 # InfluxDB source clients. Install only the one matching your source version;
 # they are imported lazily, so a v1-only migration does not need influxdb-client
 # and a v2-only migration does not need influxdb.
-influxdb>=5.3.1          # InfluxDB 1.x source
-influxdb-client>=1.40.0  # InfluxDB 2.x source
+influxdb>=5.3.2          # InfluxDB 1.x source; tested 5.3.2 (chunked mode avoided)
+influxdb-client>=1.50.0  # InfluxDB 2.x source; tested 1.50.0

@@ -42,7 +42,6 @@ import argparse
 import json
 import logging
 import sys
-from datetime import timedelta
 from typing import Dict, List, Optional
 
 from acl import AclNameCollision, build_entries, render, render_credentials_csv
@@ -80,6 +79,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if use_prefix and not _validate_scopes(scopes):
             return 2  # hard-fail: an invalid db/bucket name was found
 
+        if not _idempotency_preflight(reader, scopes, args, use_prefix):
+            return 3  # target tables already hold data; re-run would duplicate
+
         log.info("scopes to migrate: %s", ", ".join(scopes))
         manifest = _migrate_data(reader, scopes, args, use_prefix)
         _write_manifest(manifest, args)
@@ -110,10 +112,108 @@ def _validate_scopes(scopes: List[str]) -> bool:
     return not bad
 
 
+def _idempotency_preflight(
+    reader: InfluxReader, scopes: List[str], args, use_prefix: bool
+) -> bool:
+    """Refuse to run if any target table already holds data.
+
+    ILP ingestion appends, so a second run duplicates rows. Returns True (proceed)
+    when nothing is at risk; False (abort) when a non-empty target table exists
+    and --allow-duplicate-rows was not given. Skipped for --dry-run, when the
+    user opted into duplicates, or when the QuestDB target is reached over a
+    non-HTTP transport (no query endpoint to check against -- warned, not fatal).
+    """
+    if args.dry_run or args.allow_duplicate_rows:
+        return True
+    base = _http_base_from_ilp(args.questdb_ilp)
+    if base is None:
+        log.warning(
+            "cannot check for existing rows over a non-HTTP ILP transport; "
+            "re-running appends and may duplicate data (use --allow-duplicate-rows "
+            "to silence this)"
+        )
+        return True
+    auth = _ilp_auth_header(args.questdb_ilp)
+    non_empty: List[str] = []
+    for scope in scopes:
+        for measurement in _select(reader.measurements(scope), args.measurements):
+            table = table_name(args.table_name_template, scope, measurement, use_prefix)
+            if _table_row_count(base, table, auth) > 0:
+                non_empty.append(table)
+    if non_empty:
+        log.error(
+            "target tables already contain data: %s. ILP appends, so re-running "
+            "would DUPLICATE rows. Drop/dedup them, or pass --allow-duplicate-rows "
+            "to proceed anyway. Aborting.",
+            ", ".join(sorted(set(non_empty))),
+        )
+        return False
+    return True
+
+
+def _http_base_from_ilp(conf: str) -> Optional[str]:
+    """Derive an http(s)://host:port base from a questdb ILP conf string.
+
+    Returns None for tcp transports (no HTTP query endpoint available)."""
+    import re
+
+    proto = conf.split("::", 1)[0].strip().lower() if "::" in conf else ""
+    if proto not in ("http", "https"):
+        return None
+    m = re.search(r"addr=([^;]+)", conf)
+    if not m:
+        return None
+    return f"{'https' if proto == 'https' else 'http'}://{m.group(1).strip()}"
+
+
+def _ilp_auth_header(conf: str) -> Optional[str]:
+    """Build an HTTP Authorization header from the ILP conf, if it carries auth.
+
+    Supports HTTP basic (``username``/``password``) and token (``token``) auth so
+    the pre-flight count query can read tables on an ACL-protected target."""
+    import base64
+    import re
+
+    tok = re.search(r"(?:^|;)token=([^;]+)", conf)
+    if tok:
+        return "Bearer " + tok.group(1).strip()
+    user = re.search(r"(?:^|;)username=([^;]+)", conf)
+    pwd = re.search(r"(?:^|;)password=([^;]+)", conf)
+    if user and pwd:
+        raw = f"{user.group(1).strip()}:{pwd.group(1).strip()}".encode("utf-8")
+        return "Basic " + base64.b64encode(raw).decode("ascii")
+    return None
+
+
+def _table_row_count(base: str, table: str, auth: Optional[str] = None) -> int:
+    """Return the row count of a QuestDB table, or 0 if it does not exist."""
+    import urllib.parse
+    import urllib.request
+
+    # Quote the table name as a SQL string literal (single quotes) for FROM.
+    q = "SELECT count() FROM '" + table.replace("'", "''") + "'"
+    url = base.rstrip("/") + "/exec?" + urllib.parse.urlencode({"query": q})
+    req = urllib.request.Request(url)
+    if auth:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - table absent returns 4xx; treat as empty
+        return 0
+    dataset = payload.get("dataset") or []
+    if dataset and dataset[0]:
+        try:
+            return int(dataset[0][0])
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def _migrate_data(
     reader: InfluxReader, scopes: List[str], args, use_prefix: bool
 ) -> List[dict]:
-    writer = QuestDBWriter(args.questdb_ilp, dry_run=args.dry_run)
+    writer = QuestDBWriter(args.questdb_ilp, dry_run=args.dry_run, batch_size=args.batch_size)
     manifest: List[dict] = []
     planned: Dict[str, str] = {}
     try:
@@ -261,7 +361,6 @@ def _build_reader(source_type: str, args) -> InfluxReader:
         url=args.influx_url,
         token=args.influx_token,
         org=args.influx_org,
-        window=timedelta(hours=args.window_hours),
     )
 
 
@@ -328,13 +427,24 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     src.add_argument("--influx-password", default="", help="v1 password")
     src.add_argument("--influx-token", default="", help="v2 API token")
     src.add_argument("--influx-org", default="", help="v2 organization")
-    src.add_argument("--window-hours", type=int, default=24, help="v2 read window size")
 
     tgt = p.add_argument_group("target (QuestDB)")
     tgt.add_argument(
         "--questdb-ilp",
         required=True,
         help="questdb client conf string, e.g. 'http::addr=localhost:9000;'",
+    )
+    tgt.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="ILP auto_flush_rows: flush a batch every N rows (0 = client default)",
+    )
+    tgt.add_argument(
+        "--allow-duplicate-rows",
+        action="store_true",
+        help="skip the pre-flight check that refuses to write into a non-empty "
+        "target table (ILP appends, so re-running otherwise duplicates rows)",
     )
 
     sel = p.add_argument_group("selection")
