@@ -1,0 +1,8 @@
+# QuestDB ILP ingestion client (required for any real run).
+questdb>=2.0.0
+
+# InfluxDB source clients. Install only the one matching your source version;
+# they are imported lazily, so a v1-only migration does not need influxdb-client
+# and a v2-only migration does not need influxdb.
+influxdb>=5.3.1          # InfluxDB 1.x source
+influxdb-client>=1.40.0  # InfluxDB 2.x source
