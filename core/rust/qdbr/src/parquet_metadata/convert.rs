@@ -150,6 +150,9 @@ pub fn convert_from_parquet(
             if col_meta.format == Some(QdbMetaColFormat::LocalKeyIsGlobal) {
                 flags = flags.with_local_key_is_global();
             }
+            if col_meta.format == Some(QdbMetaColFormat::PcoEncoded) {
+                flags = flags.with_pco_encoded();
+            }
             if col_meta.ascii == Some(true) {
                 flags = flags.with_ascii();
             }

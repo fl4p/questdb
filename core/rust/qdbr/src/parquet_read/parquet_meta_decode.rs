@@ -89,6 +89,8 @@ pub fn decode_row_group(
 
         let format = if flags.is_local_key_global() {
             Some(QdbMetaColFormat::LocalKeyIsGlobal)
+        } else if flags.is_pco_encoded() {
+            Some(QdbMetaColFormat::PcoEncoded)
         } else {
             None
         };
@@ -211,6 +213,8 @@ pub fn decode_row_group_filtered<const FILL_NULLS: bool>(
             .unwrap_or("<unknown>");
         let format = if flags.is_local_key_global() {
             Some(QdbMetaColFormat::LocalKeyIsGlobal)
+        } else if flags.is_pco_encoded() {
+            Some(QdbMetaColFormat::PcoEncoded)
         } else {
             None
         };

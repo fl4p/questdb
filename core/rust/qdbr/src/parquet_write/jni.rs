@@ -721,6 +721,18 @@ fn build_column_infos_from_partition<'a>(
                 flags = flags.with_local_key_is_global();
             }
 
+            if matches!(
+                col.data_type.tag(),
+                qdb_core::col_type::ColumnTypeTag::Float
+                    | qdb_core::col_type::ColumnTypeTag::Double
+            ) && col.parquet_encoding_config.is_pco()
+            {
+                // FLOAT/DOUBLE pages hold a pco blob; the in-table page-frame
+                // decoder reads this flag to pco-decode. Mirrors the QdbMeta
+                // PcoEncoded marker written into the parquet footer.
+                flags = flags.with_pco_encoded();
+            }
+
             if let Some(scs) = sorting_columns {
                 if let Some(sc) = scs.iter().find(|sc| sc.column_idx == i as i32) {
                     if sc.descending {

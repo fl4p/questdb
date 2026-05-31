@@ -552,7 +552,8 @@ impl TryFrom<u8> for FieldRepetition {
 /// - bit 1: IS_ASCII (varchar columns)
 /// - bits 2-3: FIELD_REPETITION (2 bits)
 /// - bit 4: DESCENDING (for sorted columns)
-/// - bits 5-31: reserved
+/// - bit 5: PCO_ENCODED (FLOAT/DOUBLE pages hold a pco blob)
+/// - bits 6-31: reserved
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct ColumnFlags(pub i32);
 
@@ -562,6 +563,7 @@ impl ColumnFlags {
     const REPETITION_SHIFT: u32 = 2;
     const REPETITION_MASK: i32 = 0b11 << Self::REPETITION_SHIFT;
     const DESCENDING_BIT: i32 = 1 << 4;
+    const PCO_ENCODED_BIT: i32 = 1 << 5;
 
     pub const fn new() -> Self {
         Self(0)
@@ -584,8 +586,16 @@ impl ColumnFlags {
         self.0 & Self::DESCENDING_BIT != 0
     }
 
+    pub const fn is_pco_encoded(self) -> bool {
+        self.0 & Self::PCO_ENCODED_BIT != 0
+    }
+
     pub const fn with_local_key_is_global(self) -> Self {
         Self(self.0 | Self::LOCAL_KEY_IS_GLOBAL_BIT)
+    }
+
+    pub const fn with_pco_encoded(self) -> Self {
+        Self(self.0 | Self::PCO_ENCODED_BIT)
     }
 
     pub const fn with_ascii(self) -> Self {
@@ -791,6 +801,14 @@ mod tests {
         let f = ColumnFlags::new().with_descending();
         assert!(f.is_descending());
         assert_eq!(f.0, 1 << 4);
+
+        let f = ColumnFlags::new().with_pco_encoded();
+        assert!(f.is_pco_encoded());
+        assert_eq!(f.0, 1 << 5);
+        // pco does not alias the other single-bit flags
+        assert!(!f.is_local_key_global());
+        assert!(!f.is_ascii());
+        assert!(!f.is_descending());
     }
 
     #[test]
