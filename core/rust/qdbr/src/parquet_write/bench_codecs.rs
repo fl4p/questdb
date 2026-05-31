@@ -524,3 +524,79 @@ fn run_pco_real_bench() {
         }
     }
 }
+
+/// pco bytes/value for the SAME logical values stored as f32 vs f64.
+/// Regime 1: f32-origin values (exactly representable in both widths), so the
+///   f32 and f64 columns carry identical information -- isolates container width.
+/// Regime 2: genuine 52-bit f64 random walks; the f32 column is a lossy cast,
+///   reported with its realized max rel err so the comparison stays honest.
+#[test]
+#[ignore = "benchmark; run in release with --ignored --nocapture"]
+fn run_pco_f32_vs_f64_bench() {
+    println!("\n# pco density: same values as f32 vs f64");
+    println!("bytes/value via pco-8 (lossless w.r.t. the stored value). RUNS={RUNS}.");
+
+    // Regime 1: identical f32-precision values in both containers.
+    if let Some(f32_data) = load_npy_f32("/tmp/arcticbench/sample.npy") {
+        println!(
+            "\n## Regime 1 -- f32-origin prices (n={}, identical info in both widths)",
+            f32_data.len()
+        );
+        println!("\n| keep_bits | f32 B/val | f64 B/val | f64/f32 |");
+        println!("|---|---|---|---|");
+        for keep in [23u32, 16, 12, 11] {
+            let r32: Vec<f32> = f32_data.iter().map(|&x| round_f32(x, keep)).collect();
+            let r64: Vec<f64> = r32.iter().map(|&x| x as f64).collect();
+            let (b32, _, _) = bench_pco(&r32);
+            let (b64, _, _) = bench_pco(&r64);
+            let bpv32 = b32 as f64 / r32.len() as f64;
+            let bpv64 = b64 as f64 / r64.len() as f64;
+            let keep_disp = if keep >= 23 {
+                "full".to_string()
+            } else {
+                keep.to_string()
+            };
+            println!(
+                "| {} | {:.3} | {:.3} | {:.2}x |",
+                keep_disp,
+                bpv32,
+                bpv64,
+                bpv64 / bpv32,
+            );
+        }
+    } else {
+        println!("\n## Regime 1 -- skipped (no /tmp/arcticbench/sample.npy)");
+    }
+
+    // Regime 2: genuine 52-bit f64; the f32 path is a lossy cast.
+    for (name, data) in [
+        (
+            "price-like (geometric random walk)",
+            gen_price_like(0xC0FFEE),
+        ),
+        ("qty-like (heavy-tailed)", gen_qty_like(0xBADF00D)),
+    ] {
+        let as_f32: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+        // realized error of the lossy f32 cast vs the genuine f64 source:
+        let mut max = 0.0_f64;
+        for (&o, &c) in data.iter().zip(as_f32.iter()) {
+            if o == 0.0 {
+                continue;
+            }
+            let e = (((c as f64) - o) / o).abs();
+            if e > max {
+                max = e;
+            }
+        }
+        let (b32, _, _) = bench_pco(&as_f32);
+        let (b64, _, _) = bench_pco(&data);
+        let bpv32 = b32 as f64 / as_f32.len() as f64;
+        let bpv64 = b64 as f64 / data.len() as f64;
+        println!("\n## Regime 2 -- {name} (n={}, genuine f64)", data.len());
+        println!("\n| stored as | B/val | max rel err vs f64 source |");
+        println!("|---|---|---|");
+        println!("| f64 (lossless) | {:.3} | 0 |", bpv64);
+        println!("| f32 (lossy cast) | {:.3} | {:.2e} |", bpv32, max);
+        println!("(f64/f32 ratio = {:.2}x)", bpv64 / bpv32);
+    }
+}
