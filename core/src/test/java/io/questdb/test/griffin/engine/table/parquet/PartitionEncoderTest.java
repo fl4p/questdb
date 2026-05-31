@@ -315,6 +315,60 @@ public class PartitionEncoderTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testLossyPcoRoundTrip() throws Exception {
+        // End-to-end: a DOUBLE column declared with PARQUET(LOSSY(10)) and no explicit
+        // encoding uses the pco codec (the default lossy back end). The values come back
+        // rounded - low 42 mantissa bits cleared, within the 2^-(10+1) relative error
+        // bound - decoded through QuestDB's own reader, since pco columns are not
+        // readable by external Parquet tools.
+        assertMemoryLeak(() -> {
+            inputRoot = root;
+            execute("CREATE TABLE x (" +
+                    " px DOUBLE PARQUET(LOSSY(10))," +
+                    " ts TIMESTAMP" +
+                    ") TIMESTAMP(ts) PARTITION BY MONTH");
+            execute("INSERT INTO x SELECT" +
+                    " x * 0.1 + 1.0," +
+                    " timestamp_sequence('2015-01-01', 1_000_000)" +
+                    " FROM long_sequence(1000)");
+
+            try (
+                    Path path = new Path();
+                    PartitionDescriptor partitionDescriptor = new PartitionDescriptor();
+                    TableReader reader = engine.getReader("x")
+            ) {
+                path.of(root).concat("x.parquet").$();
+                PartitionEncoder.populateFromTableReader(reader, partitionDescriptor, 0);
+                PartitionEncoder.encode(partitionDescriptor, path);
+
+                final double bound = Math.pow(2, -(10 + 1)) * 1.000_001;
+                final long dropMask = (1L << (52 - 10)) - 1;
+                boolean anyChanged = false;
+                int n = 0;
+                try (
+                        RecordCursorFactory factory = select("SELECT px FROM read_parquet('x.parquet')", sqlExecutionContext);
+                        RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+                ) {
+                    final Record rec = cursor.getRecord();
+                    while (cursor.hasNext()) {
+                        double got = rec.getDouble(0);
+                        double orig = (n + 1) * 0.1 + 1.0;
+                        Assert.assertEquals("low mantissa bits not cleared at row " + n, 0L, Double.doubleToLongBits(got) & dropMask);
+                        double rel = Math.abs((got - orig) / orig);
+                        Assert.assertTrue("rel err " + rel + " exceeds " + bound + " at row " + n, rel <= bound);
+                        if (got != orig) {
+                            anyChanged = true;
+                        }
+                        n++;
+                    }
+                }
+                Assert.assertEquals(1000, n);
+                Assert.assertTrue("rounding had no effect; config did not reach the encoder", anyChanged);
+            }
+        });
+    }
+
+    @Test
     public void testSymbolCompressionOnly() throws Exception {
         assertMemoryLeak(() -> {
             inputRoot = root;
