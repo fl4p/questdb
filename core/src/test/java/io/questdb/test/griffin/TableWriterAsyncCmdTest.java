@@ -30,6 +30,9 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.sql.OperationFuture;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.CompiledQuery;
 import io.questdb.griffin.CompiledQueryImpl;
 import io.questdb.griffin.SqlCompiler;
@@ -61,6 +64,56 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     private final SCSequence commandReplySequence = new SCSequence();
     private final int engineCmdQueue = engine.getConfiguration().getWriterCommandQueueCapacity();
     private final int engineEventQueue = engine.getConfiguration().getWriterCommandQueueCapacity();
+
+    @Test
+    public void testAsyncConvertPartitionToParquetWithLossyNoBloom() throws Exception {
+        // A held (contended) writer forces the CONVERT command through the writer
+        // command queue, which binary-serializes extraStrInfo = [null bloom, 'px:10']
+        // and deserializes via DirectCharSequenceList. Before the of() null-length
+        // fix this threw "invalid alter statement serialized to writer queue [13]" or
+        // misparsed the lossy spec. The in-thread (BYPASS WAL, uncontended) path uses
+        // ObjCharSequenceList and would not exercise this.
+        assertMemoryLeak(() -> {
+            execute("create table x (px double, ts timestamp) timestamp(ts) partition by DAY bypass wal", sqlExecutionContext);
+            execute("insert into x select x * 0.1 + 1.0, timestamp_sequence('2024-06-10', 60000000L) from long_sequence(500)", sqlExecutionContext);
+            execute("insert into x select x * 0.1 + 1.0, timestamp_sequence('2024-06-12', 60000000L) from long_sequence(500)", sqlExecutionContext);
+
+            OperationFuture fut = null;
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                try (TableWriter writer = getWriter("x")) {
+                    // Writer is held, so the ALTER is published to the command queue
+                    // (binary serialize) rather than applied in-thread.
+                    CompiledQuery cc = compiler.compile(
+                            "alter table x convert partition to parquet list '2024-06-10' with (lossy = 'px:10')",
+                            sqlExecutionContext
+                    );
+                    fut = cc.execute(commandReplySequence);
+                    writer.tick();
+                }
+                fut.await();
+            } finally {
+                if (fut != null) {
+                    fut.close();
+                }
+            }
+
+            // The day-1 partition converted (and rounded) without a serde corruption.
+            engine.releaseAllReaders();
+            final long dropMask = (1L << (52 - 10)) - 1;
+            int n = 0;
+            try (
+                    RecordCursorFactory factory = select("select px from x where ts < '2024-06-11'");
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    Assert.assertEquals("low mantissa bits not cleared at row " + n, 0L, Double.doubleToLongBits(rec.getDouble(0)) & dropMask);
+                    n++;
+                }
+            }
+            Assert.assertEquals(500, n);
+        });
+    }
 
     @Test
     public void testAsyncAlterCommandInvalidSerialisation() throws Exception {

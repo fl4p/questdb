@@ -511,9 +511,13 @@ public class AlterOperation extends AbstractOperation implements Mutable {
         int partitionCount;
 
         if (toParquet && activeExtraStrInfo.size() > 0) {
+            // getStrA and getStrB are distinct flyweights; the DirectCharSequenceList
+            // (async writer-command path) reuses one DirectString per accessor, so
+            // bloom and lossy must use different accessors or the second read would
+            // alias and overwrite the first.
             bloomFilterColumns = activeExtraStrInfo.getStrA(0);
             if (activeExtraStrInfo.size() > 1) {
-                lossyColumns = activeExtraStrInfo.getStrA(1);
+                lossyColumns = activeExtraStrInfo.getStrB(1);
             }
             fpp = Double.longBitsToDouble(extraInfo.getQuick(extraInfo.size() - 1));
             partitionCount = (extraInfo.size() - 1) / 2;
@@ -931,8 +935,18 @@ public class AlterOperation extends AbstractOperation implements Mutable {
                 if (lo + Integer.BYTES > hi) {
                     throw CairoException.critical(0).put("invalid alter statement serialized to writer queue [12]");
                 }
-                int stringSize = 2 * buffer.getInt(lo);
+                final int charCount = buffer.getInt(lo);
                 lo += 4;
+                if (charCount < 0) {
+                    // A null string was serialized as a NULL_LEN (-1) header with no
+                    // payload (see MemoryA.putStr). Materialize it as an empty string
+                    // and consume only the header, otherwise a negative byte count
+                    // would move the read cursor backwards and corrupt later entries.
+                    final long address = buffer.addressOf(lo);
+                    offsets.add(address, address);
+                    continue;
+                }
+                int stringSize = 2 * charCount;
                 if (lo + stringSize > hi) {
                     throw CairoException.critical(0).put("invalid alter statement serialized to writer queue [13]");
                 }

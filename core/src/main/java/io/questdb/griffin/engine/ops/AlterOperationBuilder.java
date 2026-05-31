@@ -351,9 +351,12 @@ public class AlterOperationBuilder implements Mutable {
     public void setParquetConversionOptions(@Nullable CharSequence bloomFilterColumns, double fpp, @Nullable CharSequence lossyColumns) {
         // extraStrInfo[0] = bloom filter columns, extraStrInfo[1] = lossy override
         // columns; fpp stays the last entry of extraInfo (AlterOperation reads it
-        // from the tail). Either string may be null.
-        extraStrInfo.add(bloomFilterColumns);
-        extraStrInfo.add(lossyColumns);
+        // from the tail). Substitute "" for an absent option rather than null: the
+        // async writer-command path serializes these strings (TableWriterTask.putStr
+        // NPEs on null), and an empty string is treated downstream exactly like an
+        // absent one (empty bloom -> use metadata; empty lossy -> no override).
+        extraStrInfo.add(bloomFilterColumns != null ? bloomFilterColumns : "");
+        extraStrInfo.add(lossyColumns != null ? lossyColumns : "");
         extraInfo.add(Double.doubleToLongBits(fpp));
     }
 
