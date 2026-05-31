@@ -55,7 +55,11 @@ public final class AclPGAuthenticatorFactory implements PGAuthenticatorFactory {
             PGCircuitBreakerRegistry registry,
             OptionsListener optionsListener
     ) {
-        // A fresh matcher per connection: it holds no native buffers, so there is nothing to share or close.
+        // Ownership contract: AclUsernamePasswordMatcher holds no native memory (only an AclStore
+        // reference and a DirectUtf8String flyweight), so it is created fresh per connection and
+        // passed with matcherOwned=false -- there is nothing to close. If this matcher ever gains a
+        // native buffer or pooled resource, make it QuietCloseable and pass matcherOwned=true so
+        // PGCleartextPasswordAuthenticator releases it on connection close.
         final UsernamePasswordMatcher matcher = new AclUsernamePasswordMatcher(aclStore);
 
         // HexTestsCircuitBreakRegistry implies we are either recording or replaying a hex test.

@@ -61,6 +61,7 @@ public class PGAclAuthTest extends AbstractBootstrapTest {
                     "user.bob.prefix=projecta_\n";
 
     @Before
+    @Override
     public void setUp() {
         super.setUp();
         TestUtils.unchecked(() -> {
@@ -68,6 +69,8 @@ public class PGAclAuthTest extends AbstractBootstrapTest {
             final File aclFile = new File(new File(root, "conf"), "acl.conf");
             Files.write(aclFile.toPath(), ACL.getBytes(StandardCharsets.UTF_8));
         });
+        // Mirrors the AbstractBootstrapTest convention (see PgBootstrapTest): re-point the shared
+        // static dbPath at <root>/db before each test. Safe under the serial JUnit 4 runner.
         dbPath.parent().$();
     }
 
