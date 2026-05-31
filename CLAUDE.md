@@ -10,6 +10,62 @@ with native C/C++ libraries for performance-critical operations. It features
 column-oriented storage, SIMD-accelerated vector execution, and specialized
 time-series SQL extensions.
 
+## Fork overview
+
+This checkout is the `fl4p/questdb` fork (`origin` = upstream `questdb/questdb`,
+`fork` = `fl4p/questdb`). It adds storage, protocol, and operations features on
+top of upstream, aimed at high-volume financial/crypto time-series and at running
+QuestDB as a drop-in InfluxDB replacement. The README's "What's different in this
+fork" section is the user-facing summary; this section is the map for working in
+the code.
+
+All of these features are already merged into the fork's `master` (squash-merged,
+so the old pre-merge feature branches — `parquet-delta-timestamp`,
+`parquet-numeric-encodings`, `influxdb-v1-query-api`, `acl-prefix-scoping`,
+`influxdb-migration` — are stale duplicates whose content already lives on
+`master`; don't re-merge them). The fork's `master` is `fork/master`; local
+`master` tracks `origin/master` (upstream) but currently equals `fork/master`,
+sitting ~23 commits ahead of upstream. Push fork work to `fork`, never `origin`.
+
+- **Parquet float compression.** Extends the native → Parquet conversion path
+  only (`TableWriter.convertPartitionNativeToParquet`,
+  `TableUtils.produceParquetFromNative`) — never the native `.d` hot path.
+  - `pco` fitted float codec for `FLOAT`/`DOUBLE` — opt-in via `PARQUET(PCO)`
+    (encoding id 6, FLOAT/DOUBLE only). Rust wrapper in
+    `core/rust/qdbr/.../parquet_write/` (pco crate `1.0.2`). pco is opt-in, NOT
+    the blanket default. The pco marker must propagate through the `_pm`
+    `ColumnFlags` sidecar (`PCO_ENCODED` bit) or in-table scans
+    (`ParquetPartitionDecoder.decodeRowGroup` → `parquet_meta_decode`) misread the
+    blob as PLAIN — always test in-table scans, not just `read_parquet`.
+  - Lossy mantissa rounding via `PARQUET(LOSSY(n))` (keep top `n` mantissa bits);
+    combine as `PARQUET(PCO, LOSSY(n))`. One-shot override:
+    `CONVERT PARTITION TO PARQUET … WITH (lossy = 'col:bits, …')` (applied at
+    encode time, not persisted to column metadata). Rust engine in
+    `parquet_write/lossy.rs`.
+  - Standard Parquet encodings: designated timestamp defaults to
+    `DELTA_BINARY_PACKED`; `BYTE_STREAM_SPLIT` encoder/decoder for `FLOAT`/`DOUBLE`.
+  - Server config `cairo.partition.encoder.parquet.float.encoding`
+    (`default`|`plain`|`byte_stream_split`/`bss`|`pco`) sets the FLOAT default at
+    conversion time. Validated/rejected for non-FLOAT in `PropServerConfiguration`.
+  - Docs: `docs/lossy-float-compression.md`. Lossless half is upstream PR #7189.
+  - When changing the Rust codec, test through JNI with the local-Java-test
+    workflow (JDK 25 + dylib swap).
+- **InfluxDB v1 `/query` frontend, file-based ACL, and the migration tool** are
+  also on `master` (merged as PRs #1/#2/#3). They are part of the fork's "drop-in
+  InfluxDB replacement" story and share the `<db>_` prefix contract:
+  - InfluxQL `/query` endpoint (Grafana drop-in) in package
+    `io.questdb.cutlass.influxdb` (`InfluxQlTranslator`, `InfluxQueryProcessor`).
+    Translates the Grafana builder subset to QuestDB `SAMPLE BY … FILL(…) ALIGN TO
+    CALENDAR` and streams InfluxDB v1 JSON.
+  - File-based ACL runtime in `cairo/security/` (`AclStore`,
+    `PrefixAwareSecurityContext`) + `cutlass/http/MultiUserHttpAuthenticator`,
+    wired via `FactoryProviderImpl`. Reads `conf/acl.conf`; absent = stock
+    single-user. Enforcement is engine-side, so prefix scoping holds across
+    `/query`, REST `/exec`, and pg-wire. Docs: `docs/ACL.md`.
+  - InfluxDB → QuestDB migration CLI at `tools/influxdb-migration/`.
+    Tables are `<db>_<measurement>` (single underscore) — a naming contract shared
+    by the `/query` `?db=` prefix mapping and ACL prefixes.
+
 ## Coding guidelines
 
 Java class members are grouped by kind (static vs. instance) and visibility, and

@@ -40,6 +40,90 @@ QuestDB is hardware efficient, with quick setup and operational efficiency.
 
 <p>&nbsp;</p>
 
+## What's different in this fork
+
+This is a fork of QuestDB (`fl4p/questdb`) that adds storage, protocol, and
+operations features aimed at high-volume financial/crypto time-series and at
+running QuestDB as a drop-in InfluxDB replacement. All of these features are
+merged into this fork's `master`. A shared `<db>_` table-prefix contract ties the
+InfluxDB pieces (query frontend, access control, migration) together.
+
+### Storage and deployment
+
+#### Storage: Parquet float compression
+
+The fork extends the native → Parquet conversion path (`ALTER TABLE … CONVERT
+PARTITION TO PARQUET`) with float-focused encodings, configurable per column via
+a `PARQUET(…)` clause or via server config. None of this touches the native `.d`
+hot path — it applies only when freezing cold partitions to Parquet, where slower
+access is already an accepted tradeoff.
+
+- **`pco` fitted float codec.** Integrates the [pcodec](https://github.com/pcodec/pcodec)
+  fitted numeric codec for `FLOAT`/`DOUBLE` columns. On real crypto price/quantity
+  data it reaches ~22x compression — smaller than alternatives such as Arctic's
+  log-quantized codecs while encoding several times faster and degrading
+  gracefully on extreme-range inputs. Opt in with `PARQUET(PCO)`.
+- **Lossy compression.** `PARQUET(LOSSY(n))` keeps only the top `n` mantissa bits
+  of each float before encoding (controlled relative-error rounding), which
+  compresses the zeroed low bytes far better. Combine with pco
+  (`PARQUET(PCO, LOSSY(n))`) for lossy fitted compression, or use `LOSSY(n)` alone
+  for a standard, interoperable Parquet encoding. A one-shot
+  `CONVERT PARTITION TO PARQUET … WITH (lossy = 'col:bits, …')` override applies
+  lossy settings to a single conversion without persisting them to column
+  metadata.
+- **Delta / byte-stream-split timestamp & float encodings.** Designated-timestamp
+  columns default to Parquet `DELTA_BINARY_PACKED`, and a `BYTE_STREAM_SPLIT`
+  encoder/decoder is available for `FLOAT`/`DOUBLE` — both standard Parquet
+  encodings that improve ratio for monotonic timestamps and floating-point data.
+- **Server-configurable default float encoding.** `cairo.partition.encoder.parquet.float.encoding`
+  (`default` | `plain` | `byte_stream_split`/`bss` | `pco`) sets the encoding for
+  `FLOAT` columns at conversion time without per-column DDL.
+
+See [`docs/lossy-float-compression.md`](docs/lossy-float-compression.md) and
+upstream PR [#7189](https://github.com/questdb/questdb/pull/7189) (lossless
+encodings) for details.
+
+#### Deployment: multi-project docker-compose
+
+A docker-compose setup runs one isolated QuestDB instance per project, each built
+from this repo's source with its own data directory and ports — real isolation
+(data, restart, upgrade, blast radius) without a shared namespace. See
+[`DOCKER_PROJECTS.md`](DOCKER_PROJECTS.md).
+
+### InfluxDB compatibility
+
+Together these make up the fork's "drop-in InfluxDB replacement" story.
+
+#### Protocol: InfluxDB v1 frontend (Grafana drop-in)
+
+An InfluxQL `/query` HTTP endpoint (alongside the existing ILP `/write` and
+`/ping`) lets QuestDB act as a drop-in InfluxDB v1 datasource for Grafana. A
+hand-written translator maps the Grafana query-builder subset (`SHOW
+MEASUREMENTS/TAG KEYS/TAG VALUES/FIELD KEYS/…`, and `SELECT agg(…) … GROUP BY
+time()[, tag] fill()`) to QuestDB SQL (`SAMPLE BY … FILL(…) ALIGN TO CALENDAR`)
+and streams InfluxDB v1 JSON back. Measurement maps to table, tag to `SYMBOL`
+column, and Influx `time` to the designated timestamp.
+
+#### Operations: file-based ACL
+
+A file-based, engine-enforced access-control runtime (`conf/acl.conf`) adds
+multi-user authentication with per-user, prefix-scoped, read-only/read-write
+table access. Enforcement lives in the security context, so the prefix rule holds
+uniformly across the InfluxDB `/query`, REST `/exec`, and PostgreSQL wire
+protocols — a user cannot escape their table prefix by switching protocol or
+changing `?db=`. With no `acl.conf` present, behavior is the stock single-user
+build. This fills a gap in open-source QuestDB, which ships only ACL stubs and has
+a single flat table namespace with no per-table access control.
+
+#### Tooling: InfluxDB → QuestDB migration
+
+A Python migration CLI reads InfluxDB v1 (InfluxQL chunked `SELECT *`) or v2
+(windowed Flux) and writes to QuestDB over the official ILP client. Tables follow
+a `<db>_<measurement>` naming contract that lines up with the `/query` endpoint's
+`?db=` prefix mapping and with ACL prefixes, so migration, querying, and access
+control all agree on the same prefix. The tool emits migration manifests and ACL
+principal artifacts to bootstrap the prefix-scoped ACL above.
+
 ## Benefits of QuestDB
 
 Feature highlights include:
