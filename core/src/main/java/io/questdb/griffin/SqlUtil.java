@@ -1453,8 +1453,14 @@ public class SqlUtil {
                 throw SqlException.position(lexer.getPosition()).put("BLOOM_FILTER or LOSSY expected");
             }
             if (SqlKeywords.isBloomFilterKeyword(tok)) {
+                if (bloomFilter) {
+                    throw SqlException.position(lexer.lastTokenPosition()).put("BLOOM_FILTER specified more than once");
+                }
                 bloomFilter = true;
             } else if (SqlKeywords.isLossyKeyword(tok)) {
+                if (lossyKeepBits != 0) {
+                    throw SqlException.position(lexer.lastTokenPosition()).put("LOSSY specified more than once");
+                }
                 lossyKeepBits = parseLossyKeepBits(lexer, columnType, lexer.lastTokenPosition());
             } else {
                 throw SqlException.position(lexer.lastTokenPosition()).put("BLOOM_FILTER or LOSSY expected");

@@ -171,7 +171,7 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
                 );
                 Assert.fail();
             } catch (SqlException e) {
-                TestUtils.assertContains(e.getFlyweightMessage(), "')' expected");
+                TestUtils.assertContains(e.getFlyweightMessage(), "BLOOM_FILTER or LOSSY expected");
             }
         });
     }
@@ -188,7 +188,7 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
                 );
                 Assert.fail();
             } catch (SqlException e) {
-                TestUtils.assertContains(e.getFlyweightMessage(), "')' expected");
+                TestUtils.assertContains(e.getFlyweightMessage(), "BLOOM_FILTER or LOSSY expected");
             }
         });
     }
@@ -205,7 +205,7 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
                 );
                 Assert.fail();
             } catch (SqlException e) {
-                TestUtils.assertContains(e.getFlyweightMessage(), "')' expected");
+                TestUtils.assertContains(e.getFlyweightMessage(), "BLOOM_FILTER specified more than once");
             }
         });
     }
@@ -746,8 +746,8 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
     public void testSetParquetBloomFilterBeforeCompression() throws Exception {
         assertFailure(
                 "ALTER TABLE x ALTER COLUMN i SET PARQUET(BLOOM_FILTER, ZSTD)",
-                53,
-                "')' expected"
+                55,
+                "BLOOM_FILTER or LOSSY expected"
         );
     }
 
@@ -755,8 +755,8 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
     public void testSetParquetBloomFilterBeforeCompressionAfterDefault() throws Exception {
         assertFailure(
                 "ALTER TABLE x ALTER COLUMN i SET PARQUET(default, BLOOM_FILTER, ZSTD)",
-                62,
-                "')' expected"
+                64,
+                "BLOOM_FILTER or LOSSY expected"
         );
     }
 
@@ -764,8 +764,8 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
     public void testSetParquetBloomFilterBeforeEncoding() throws Exception {
         assertFailure(
                 "ALTER TABLE x ALTER COLUMN i SET PARQUET(BLOOM_FILTER, PLAIN)",
-                53,
-                "')' expected"
+                55,
+                "BLOOM_FILTER or LOSSY expected"
         );
     }
 
@@ -788,8 +788,8 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
     public void testSetParquetBloomFilterDuplicate() throws Exception {
         assertFailure(
                 "ALTER TABLE x ALTER COLUMN i SET PARQUET(PLAIN, BLOOM_FILTER, BLOOM_FILTER)",
-                60,
-                "')' expected"
+                62,
+                "BLOOM_FILTER specified more than once"
         );
     }
 
@@ -797,8 +797,8 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
     public void testSetParquetBloomFilterJunkAfter() throws Exception {
         assertFailure(
                 "ALTER TABLE x ALTER COLUMN i SET PARQUET(PLAIN, BLOOM_FILTER, junk)",
-                60,
-                "')' expected"
+                62,
+                "BLOOM_FILTER or LOSSY expected"
         );
     }
 
@@ -874,12 +874,19 @@ public class AlterTableAlterColumnTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testSetParquetByteStreamSplitRejectedForFloat() throws Exception {
-        assertFailure(
-                "ALTER TABLE x ALTER COLUMN e SET PARQUET(BYTE_STREAM_SPLIT)",
-                41,
-                "encoding 'BYTE_STREAM_SPLIT' is not valid for column type"
-        );
+    public void testSetParquetByteStreamSplitForFloat() throws Exception {
+        // BYTE_STREAM_SPLIT is a valid encoding for FLOAT (and DOUBLE) columns.
+        assertMemoryLeak(() -> {
+            createX();
+
+            execute("ALTER TABLE x ALTER COLUMN e SET PARQUET(BYTE_STREAM_SPLIT)");
+
+            try (TableWriter writer = getWriter("x")) {
+                int colIndex = writer.getMetadata().getColumnIndex("e");
+                int config = writer.getMetadata().getColumnMetadata(colIndex).getParquetEncodingConfig();
+                Assert.assertEquals(ParquetEncoding.ENCODING_BYTE_STREAM_SPLIT, TableUtils.getParquetConfigEncoding(config));
+            }
+        });
     }
 
     @Test
