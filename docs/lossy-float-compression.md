@@ -2,7 +2,13 @@
 
 ## Status
 
-Design proposal. No implementation yet.
+PR 1 (lossless prerequisites: DELTA_BINARY_PACKED default for designated
+timestamp, BYTE_STREAM_SPLIT for FLOAT/DOUBLE) is implemented and open as
+PR #7189. PR 2 (Tier A mantissa bit-rounding) and the `LOSSY(n)` DDL surface are
+implemented locally on the lossy branch, gated on PR #7189 merging first. The
+high-ratio internal codec (PR 3) remains a proposal; the real-data benchmark below
+redirects it from the originally planned Tier B (mu-law/LnQ int16) toward
+integrating the `pco` crate.
 
 ## Summary
 
@@ -352,7 +358,130 @@ Codec and precision stay orthogonal knobs (no auto-switching the codec when loss
 is enabled). The default codec recommendation maps onto possible named presets
 later: `balanced` = zstd, `archive` = gzip.
 
-### PR 3 — Tier B: mu-law companded narrow-int codec
+### Real-data head-to-head vs arctic
+
+A benchmark ran arctic's actual Cython `LnQ16` codecs against several OURS variants
+on four real crypto tick columns exported from a TickStore: BCH/USDC (9.1M rows),
+FX_BTC_JPY (42.9M), XBTUSD (50M), and BTCUSDT (50M, a contiguous slice of a 918M-row
+column spanning 1e-20 to 814084). Both price (positive) and quantity (signed)
+columns were tested. The harness lives at `/tmp/arcticbench/bench.py` (not in the
+repo); it drives the real `int_coding` Cython module and runs every OURS variant
+through the same numpy proxy of the Rust pipeline. The OURS keep-bits knob is
+coarser than arctic's continuous `loss` parameter, so matched precision is
+approximate -- OURS generally carries slightly more precision than the arctic row
+it is compared against. Timings are a single pass (`runs=1`); take them as
+order-of-magnitude, not micro-benchmark precision.
+
+Variants measured per column, at each matched precision:
+
+- `OURS bss <comp>-<lvl>` -- round -> BYTE_STREAM_SPLIT -> entropy coder, sweeping
+  zstd {1,3,9,19}, gzip {6,9}, lz4 {0,9}, brotli {6,9}.
+- `OURS logq` -- round -> log-quantize + delta + zigzag (arctic's transform) ->
+  BYTE_STREAM_SPLIT -> zstd-9. Positive-only.
+- `OURS xor` / `OURS delta` -- round -> XOR-with-previous / first-difference of the
+  bit pattern -> BYTE_STREAM_SPLIT -> zstd-9.
+- `pcodec` -- round -> pcodec (a fitted numeric codec, Apache-2.0 Rust crate `pco`),
+  level 8. Lossless on the rounded array; degrades gracefully on all inputs.
+
+Three conclusions hold across every dataset.
+
+**1. The entropy coder is not the lever.** Sweeping zstd up to level 19, gzip 9,
+and brotli 9 buys only ~20-30% over zstd-1, at 10-100x the encode cost (zstd-19 hit
+197 s on a 50M column; gzip-9 142 s). None of them close the gap to arctic. lz4 is
+strictly worse on ratio. So a stronger general-purpose compressor is a dead end --
+keep zstd at a low level for the standard-Parquet path.
+
+**2. arctic's advantage is the transform, and a fitted codec captures it.** On lossy
+price columns -- the realistic case -- `logq` (arctic's own log transform under our
+back end) and especially `pcodec` beat arctic on ratio while encoding far faster.
+Bytes per value, encode ms in parens:
+
+| Dataset | precision | arctic | best `bss` | `logq` zstd-9 | pcodec |
+|---|---|---|---|---|---|
+| BCH px | ~190 ppm | 0.222 (1196) | 0.242 zstd-19 (11451) | 0.196 (511) | 0.177 (200) |
+| BCH px | ~120 ppm | 0.349 (3062) | 0.343 zstd-19 (11939) | 0.276 (636) | 0.262 (206) |
+| FX px | ~190 ppm | 0.152 (3531) | 0.165 zstd-19 (37300) | 0.132 (2062) | 0.123 (788) |
+| FX px | ~120 ppm | 0.261 (17090) | 0.252 zstd-19 (57090) | 0.202 (2218) | 0.192 (919) |
+| XBTUSD px | ~15 ppm | 0.357 (9355) | 0.438 zstd-19 (58058) | 0.342 (3063) | 0.334 (933) |
+| XBTUSD px | ~190 ppm | 0.097 (2267) | 0.106 zstd-19 (32464) | 0.083 (1739) | 0.076 (754) |
+| XBTUSD px | ~120 ppm | 0.173 (12874) | 0.166 zstd-19 (38441) | 0.132 (2738) | 0.123 (1124) |
+| XBTUSD qty (signed) | ~120 ppm | 1.164 (16539) | 1.224 zstd-19 (197814) | N/A | 0.870 (1576) |
+
+On these lossy points pcodec is 1.07-1.41x smaller than arctic and encodes 3-18x
+faster (decode 4-10x faster). `logq` trails pcodec but also beats arctic, which is
+the direct proof that the transform -- not the entropy stage -- was the gap.
+
+**3. arctic still wins on lossless / coarse-integer columns, but is fragile.** When
+data sits on an integer grid and is stored losslessly, arctic's delta+varint wins
+ratio; pcodec cannot match it there, though it stays 5-16x faster:
+
+| Dataset | arctic | `logq` | pcodec | winner |
+|---|---|---|---|---|
+| BCH px lossless | 0.573 | 1.078 | 1.191 | arctic 1.85x |
+| FX px lossless | 0.487 | 0.865 | 0.882 | arctic 1.80x |
+| BTCUSDT px (1e-20 - 814k) | 0.074 | 0.148 | 0.101 | arctic 1.36x |
+| BCH qty lossless (signed) | 2.005 | N/A | 2.666 | arctic 1.33x |
+| FX qty lossless (signed) | 1.663 | N/A | 2.044 | arctic 1.23x |
+| BTCUSDT qty lossless (signed) | 1.188 | N/A | 1.398 | arctic 1.18x |
+
+But arctic's ratio comes with a robustness cost. On BTCUSDT px (1e-20 to 814084),
+only `LnQ185` survived (0.074, lossless); `LnQ25`/`LnQ15` silently produced
+774-885% max relative error (the log-quantizer overflows int16) and the signed
+`LnQ15gz` crashed outright (`1e-20 maps to -40241 < 0`). Both arctic and pcodec also
+emit a proprietary blob, not a standard Parquet encoding -- so files written that
+way are readable only by the writer, not by external Parquet tools.
+
+Design implication. Two regimes:
+
+- Standard-Parquet path (files must stay readable by external tools): confined to
+  standard encodings, so `round -> BYTE_STREAM_SPLIT -> zstd` is the ceiling. That
+  is what PR 2 ships. It gives up 1.3-2.9x of ratio versus arctic on smooth/coarse
+  data in exchange for bounded error, valid IEEE-754, fast encode, and robustness.
+- QuestDB-internal path (Parquet files never leave QuestDB): `round -> pcodec` is
+  the stronger option -- smaller than arctic on the realistic lossy case, 3-18x
+  faster, and robust where arctic's log codecs fail. Adopting it means vetting the
+  `pco` crate as a `qdbr` dependency, and confirming it returns `Result`/`Option`
+  (never panics) on malformed input, since a panic across JNI aborts the JVM. This
+  supersedes the parked Tier B (an LnQ-style int16 codec): pcodec gets arctic-class
+  ratios on lossy data without inheriting the log quantizer's failure modes.
+
+Confirmed through the real encoder. The proxy numbers above were re-measured with
+the real `pco` crate against the real QuestDB Parquet writer/reader
+(`bench_codecs::run_pco_real_bench`, f32 columns), and match to the third decimal.
+Lossless `pco` (no rounding) beats round-trip BSS+zstd on every real column --
+BCH px 1.191 vs 1.963 (1.65x), BTCUSDT px 0.101 vs 0.244 (2.4x), FX px 0.882 vs
+1.798 (2.0x), XBTUSD qty 0.878 vs 1.498 (1.7x) bytes/value -- by 1.16-2.4x, and
+decodes ~1.5-2x faster. Under rounding it wins by 1.3-2.1x almost everywhere; the
+sole exception is the extreme-range BTCUSDT px column under aggressive rounding
+(keep=11: BSS+zstd 0.021 vs pco 0.030), where rounding collapses the near-constant
+column into long runs that zstd's LZ stage compresses better than pco's per-value
+model. pco encode runs ~1.3-1.6x slower than zstd level 1. So pco is the right
+default for the lossy path and a strong option for lossless float columns too,
+with BSS+zstd retained as the standard-Parquet fallback.
+
+### PR 3 — high-ratio internal codec (superseded direction)
+
+The original plan here was Tier B, a mu-law / LnQ companded int16/int32 codec, to
+close the ratio gap to arctic on smooth columns. The real-data benchmark above
+redirects this: `round -> pcodec` reaches arctic-class (and on lossy data,
+better-than-arctic) ratios without the log quantizer's failure modes, and the
+`logq` result shows a hand-rolled int16 codec would at best match `pcodec` while
+carrying more implementation and read-path risk. So if a high-ratio
+QuestDB-internal codec is pursued, the recommended form is integrating the `pco`
+crate behind the existing `LOSSY(n)` knob, not building Tier B. Either way it is a
+larger change than PR 2:
+
+- Both produce a non-standard Parquet representation, so the Parquet reader must
+  recognize the column and invert it on read, materializing a `DOUBLE`/`FLOAT` for
+  the rest of the engine. The logical column type is unchanged; only the physical
+  representation differs.
+- Files written this way are not readable by external Parquet tools. This path is
+  only appropriate when the Parquet files stay internal to QuestDB.
+- Predicate pushdown / page-stats pruning must account for the transform (for a
+  monotonic transform like log, min/max still map correctly, but the comparison
+  must be done in the right space).
+
+The mu-law specifics below are retained for reference only.
 
 - Encode `Double`/`Float` as a companded int16/int32 column plus the metadata
   needed to invert (`mu`, `Xmax` from page stats, `n`).
