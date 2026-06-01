@@ -15,11 +15,23 @@ import unittest
 
 import pivot_lp
 from pivot_lp import (
+    SchemaCoercer,
     _ThrottledFeeder,
     _WalThrottle,
     merge_stream,
     parse_interval_ns,
 )
+
+# measurement -> {column: kind} used by the SchemaCoercer tests below.
+_SCHEMA = {
+    "batmon": {
+        "voltage": "float",
+        "num_samples": "float",
+        "voltage_cell000": "int",
+        "problem_code": "int",
+        "switches_charge": "bool",
+    }
+}
 
 
 class _CountingFeeder:
@@ -274,6 +286,118 @@ class ThrottledFeederTests(unittest.TestCase):
         )
         feeder.flush()  # nothing buffered
         self.assertEqual(calls["n"], 0)
+
+
+class SchemaCoercerTests(unittest.TestCase):
+    def setUp(self):
+        self.co = SchemaCoercer({k: dict(v) for k, v in _SCHEMA.items()})
+
+    def test_drops_unknown_column(self):
+        self.assertIsNone(self.co.transform_fields("batmon", "temperatures_200=3.5"))
+
+    def test_all_fields_dropped_returns_none(self):
+        self.assertIsNone(
+            self.co.transform_fields("batmon", "temperatures_1=1,temperatures_2=2")
+        )
+
+    def test_unknown_measurement_passthrough(self):
+        self.assertEqual(self.co.transform_fields("other", "x=1,y=2"), "x=1,y=2")
+
+    def test_bool_true_false_forms(self):
+        self.assertEqual(self.co.transform_fields("batmon", "switches_charge=1"), "switches_charge=t")
+        self.assertEqual(self.co.transform_fields("batmon", "switches_charge=0"), "switches_charge=f")
+        self.assertEqual(self.co.transform_fields("batmon", "switches_charge=0.0"), "switches_charge=f")
+        self.assertEqual(self.co.transform_fields("batmon", "switches_charge=t"), "switches_charge=t")
+        self.assertEqual(self.co.transform_fields("batmon", "switches_charge=false"), "switches_charge=f")
+
+    def test_int_from_integer_and_float_tokens(self):
+        self.assertEqual(self.co.transform_fields("batmon", "voltage_cell000=3200i"), "voltage_cell000=3200i")
+        self.assertEqual(self.co.transform_fields("batmon", "problem_code=5"), "problem_code=5i")
+
+    def test_float_keeps_and_strips_trailing_i(self):
+        self.assertEqual(self.co.transform_fields("batmon", "voltage=13.5"), "voltage=13.5")
+        self.assertEqual(self.co.transform_fields("batmon", "num_samples=7i"), "num_samples=7")
+
+    def test_mixed_line_drops_and_coerces(self):
+        out = self.co.transform_fields(
+            "batmon",
+            "voltage=13.5,temperatures_9=1,switches_charge=1,voltage_cell000=3200i",
+        )
+        self.assertEqual(out, "voltage=13.5,switches_charge=t,voltage_cell000=3200i")
+
+    def test_warns_once_per_column_on_bool_mismatch(self):
+        with self.assertLogs(pivot_lp.log, level="WARNING") as cm:
+            self.co.transform_fields("batmon", "switches_charge=2")  # nonzero -> t, warn
+            self.co.transform_fields("batmon", "switches_charge=3")  # still coerced, NO 2nd warn
+        self.assertEqual(len(cm.records), 1)
+        self.assertEqual(self.co.transform_fields("batmon", "switches_charge=2"), "switches_charge=t")
+
+    def test_warns_once_on_fractional_int(self):
+        with self.assertLogs(pivot_lp.log, level="WARNING") as cm:
+            self.assertEqual(self.co.transform_fields("batmon", "voltage_cell000=3.7"), "voltage_cell000=3i")
+            self.co.transform_fields("batmon", "voltage_cell000=4.2")
+        self.assertEqual(len(cm.records), 1)
+
+    def test_non_numeric_into_typed_column_is_dropped(self):
+        with self.assertLogs(pivot_lp.log, level="WARNING"):
+            self.assertIsNone(self.co.transform_fields("batmon", "voltage_cell000=oops"))
+
+    def test_dropped_cols_deduped(self):
+        self.co.transform_fields("batmon", "temperatures_1=1")
+        self.co.transform_fields("batmon", "temperatures_1=2")
+        self.co.transform_fields("batmon", "temperatures_2=3")
+        self.assertEqual(self.co.dropped_cols, {("batmon", "temperatures_1"), ("batmon", "temperatures_2")})
+
+
+class MergeStreamSchemaTests(unittest.TestCase):
+    def _coercer(self):
+        return SchemaCoercer({k: dict(v) for k, v in _SCHEMA.items()})
+
+    def test_exact_mode_drops_and_coerces(self):
+        # long-format field-lines (one field each), adjacent for one point
+        lines = [
+            "batmon,did=A voltage=13.5 1000",
+            "batmon,did=A temperatures_9=22.0 1000",
+            "batmon,did=A switches_charge=1 1000",
+            "batmon,did=A voltage_cell000=3200i 1000",
+        ]
+        feeder = _CountingFeeder()
+        pts, fl = merge_stream(iter(lines), "x_", feeder, 0, self._coercer())
+        self.assertEqual(pts, 1)
+        self.assertEqual(fl, 4)
+        self.assertEqual(len(feeder.lines), 1)
+        body = feeder.lines[0]
+        self.assertNotIn("temperatures_9", body)
+        self.assertIn("switches_charge=t", body)
+        self.assertIn("voltage_cell000=3200i", body)
+        self.assertIn("voltage=13.5", body)
+
+    def test_exact_mode_point_with_only_dropped_fields_is_skipped(self):
+        lines = [
+            "batmon,did=A temperatures_9=1 1000",
+            "batmon,did=A temperatures_8=2 1000",
+        ]
+        feeder = _CountingFeeder()
+        pts, _ = merge_stream(iter(lines), "x_", feeder, 0, self._coercer())
+        self.assertEqual(pts, 0)
+        self.assertEqual(feeder.lines, [])
+
+    def test_downsample_mode_drops_and_coerces(self):
+        # two samples in one 10s bucket; last value per field kept
+        lines = [
+            "batmon,did=A switches_charge=0 1000000000",
+            "batmon,did=A temperatures_9=5 1000000000",
+            "batmon,did=A switches_charge=1 2000000000",
+            "batmon,did=A voltage_cell000=3201i 2000000000",
+        ]
+        feeder = _CountingFeeder()
+        pts, _ = merge_stream(iter(lines), "x_", feeder, 10_000_000_000, self._coercer())
+        self.assertEqual(pts, 1)
+        body = feeder.lines[0]
+        self.assertNotIn("temperatures_9", body)
+        self.assertIn("switches_charge=t", body)  # last value wins
+        self.assertIn("voltage_cell000=3201i", body)
+        self.assertTrue(body.endswith(" 10000000000"))  # right-labeled bucket end
 
 
 if __name__ == "__main__":

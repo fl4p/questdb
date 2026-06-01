@@ -41,7 +41,12 @@ import urllib.request
 from typing import Dict, List, Optional
 
 from bulk_v1 import _IlpHttpFeeder, parse_basic_or_token_auth, rewrite_line
-from qdb_admin import IndexSpecError, ensure_indexed_table, parse_index_spec
+from qdb_admin import (
+    IndexSpecError,
+    ensure_indexed_table,
+    parse_index_spec,
+    parse_schema_columns,
+)
 
 log = logging.getLogger("influx_migrate.pivot")
 
@@ -220,8 +225,145 @@ def parse_interval_ns(spec: str) -> int:
     return int(s)
 
 
+class SchemaCoercer:
+    """Allow-lists and type-coerces LP field tokens against a parsed schema.
+
+    Built from ``{measurement: {column: kind}}`` (kind in
+    ``bool``/``int``/``float``/``str``, as produced by
+    :func:`qdb_admin.parse_schema_columns`, keyed by source MEASUREMENT rather
+    than table). For each field token it:
+
+    * drops the column if it is absent from that measurement's schema (so
+      spurious source fields -- e.g. ``temperatures_8..254`` -- never reach the
+      server and cannot auto-create columns);
+    * coerces a BOOLEAN column to ``t``/``f`` and an INT/LONG column to ``Ni``
+      (ILP refuses to write a float into a BOOLEAN/INT column and rejects the
+      whole row, so the value MUST already match the column type);
+    * strips a stray integer ``i`` suffix from a float column, and passes
+      ``str`` columns through verbatim.
+
+    It warns at most ONCE PER (measurement, column): once the first time a column
+    is dropped, and once when a value does not cleanly match its declared type
+    (a non-0/1 number coerced to BOOLEAN, a fractional value truncated to INT, or
+    an unparseable/string value that gets dropped). A measurement with no schema
+    entry is passed through unchanged.
+    """
+
+    def __init__(self, by_measurement: Dict[str, Dict[str, str]]):
+        self._schema = by_measurement
+        self._warned = set()
+        self.dropped_cols = set()
+
+    def _warn_once(self, key, msg, *args) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            log.warning(msg, *args)
+
+    @staticmethod
+    def _to_number(value: str) -> float:
+        # LP integer fields carry a trailing 'i'; strip it before parsing.
+        if value and value[-1] in "iI":
+            value = value[:-1]
+        return float(value)
+
+    def transform_fields(self, measurement: str, fields: str) -> Optional[str]:
+        """Return the filtered/coerced field set, or None if nothing survives."""
+        cols = self._schema.get(measurement)
+        if cols is None:
+            return fields
+        out: List[str] = []
+        for tok in fields.split(","):
+            name, eq, value = tok.partition("=")
+            if not eq:
+                out.append(tok)
+                continue
+            kind = cols.get(name)
+            if kind is None:
+                if (measurement, name) not in self.dropped_cols:
+                    self.dropped_cols.add((measurement, name))
+                    log.info(
+                        "schema: dropping column not in schema [%s.%s]",
+                        measurement,
+                        name,
+                    )
+                continue
+            if kind == "bool":
+                coerced = self._to_bool(measurement, name, value)
+            elif kind == "int":
+                coerced = self._to_int(measurement, name, value)
+            elif kind == "float":
+                coerced = self._to_float(value)
+            else:
+                coerced = value
+            if coerced is not None:
+                out.append(name + "=" + coerced)
+        return ",".join(out) if out else None
+
+    def _to_bool(self, measurement: str, name: str, value: str) -> Optional[str]:
+        low = value.lower()
+        if low in ("t", "true"):
+            return "t"
+        if low in ("f", "false"):
+            return "f"
+        try:
+            number = self._to_number(value)
+        except ValueError:
+            self._warn_once(
+                (measurement, name, "bool"),
+                "schema: %s.%s is BOOLEAN but value %r is not 0/1/t/f; dropping",
+                measurement,
+                name,
+                value,
+            )
+            return None
+        if number not in (0.0, 1.0):
+            self._warn_once(
+                (measurement, name, "bool"),
+                "schema: %s.%s is BOOLEAN but value %s is not 0/1; nonzero->t",
+                measurement,
+                name,
+                value,
+            )
+        return "t" if number != 0.0 else "f"
+
+    def _to_int(self, measurement: str, name: str, value: str) -> Optional[str]:
+        try:
+            number = self._to_number(value)
+        except ValueError:
+            self._warn_once(
+                (measurement, name, "int"),
+                "schema: %s.%s is INT/LONG but value %r is not numeric; dropping",
+                measurement,
+                name,
+                value,
+            )
+            return None
+        truncated = int(number)
+        if float(truncated) != number:
+            self._warn_once(
+                (measurement, name, "int"),
+                "schema: %s.%s is INT/LONG but value %s is fractional; truncating",
+                measurement,
+                name,
+                value,
+            )
+        return str(truncated) + "i"
+
+    @staticmethod
+    def _to_float(value: str) -> str:
+        # An integer source field (Ni) into a FLOAT column: drop the 'i' so ILP
+        # reads it as a float. int->float is lossless, so no warning.
+        if value and value[-1] in "iI":
+            return value[:-1]
+        return value
+
+
 def merge_stream(
-    lines, prefix: str, feeder: Optional["_IlpHttpFeeder"], interval_ns: int = 0
+    lines,
+    prefix: str,
+    feeder: Optional["_IlpHttpFeeder"],
+    interval_ns: int = 0,
+    coercer: Optional["SchemaCoercer"] = None,
 ):
     """Merge single-field LP lines into wide points; feed or count.
 
@@ -264,6 +406,8 @@ def merge_stream(
                 return
             ts_label = str(cur_bucket + interval_ns)
             for head, fmap in acc.items():
+                if not fmap:
+                    continue
                 out = rewrite_line(
                     head + " " + ",".join(fmap.values()) + " " + ts_label, prefix
                 )
@@ -291,6 +435,11 @@ def merge_stream(
                 # ts is non-decreasing, so the prior bucket is now complete.
                 flush_bucket()
                 cur_bucket = bucket
+            if coercer is not None:
+                tfields = coercer.transform_fields(head.split(",", 1)[0], fields)
+                if tfields is None:
+                    continue
+                fields = tfields
             fmap = acc.get(head)
             if fmap is None:
                 fmap = {}
@@ -309,7 +458,7 @@ def merge_stream(
 
     def flush_point():
         nonlocal points
-        if cur_head is None or cur_ts is None:
+        if cur_head is None or cur_ts is None or not cur_fields:
             return
         out = rewrite_line(
             cur_head + " " + ",".join(cur_fields) + " " + cur_ts, prefix
@@ -327,12 +476,16 @@ def merge_stream(
             continue
         head, fields, ts = parts
         field_lines += 1
+        if coercer is not None:
+            fields = coercer.transform_fields(head.split(",", 1)[0], fields)
         key = (head, ts)
         if key != cur_key:
             flush_point()
-            cur_head, cur_key, cur_ts, cur_fields = head, key, ts, [fields]
+            cur_head, cur_key, cur_ts = head, key, ts
+            cur_fields = [fields] if fields else []
         else:
-            cur_fields.append(fields)
+            if fields:
+                cur_fields.append(fields)
     flush_point()
     if feeder is not None:
         feeder.flush()
@@ -352,6 +505,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.index and not args.create_table:
         log.error("--index requires --create-table NAME (the table to pre-create)")
         return 2
+
+    coercer: Optional[SchemaCoercer] = None
+    if args.schema_file:
+        try:
+            with open(args.schema_file, encoding="utf-8") as fh:
+                tables = parse_schema_columns(fh.read())
+        except OSError as exc:
+            log.error("cannot read --schema-file %s: %s", args.schema_file, exc)
+            return 2
+        if not tables:
+            log.error("no CREATE TABLE statements found in %s", args.schema_file)
+            return 2
+        by_measurement = {
+            (table[len(prefix):] if prefix and table.startswith(prefix) else table): cols
+            for table, cols in tables.items()
+        }
+        coercer = SchemaCoercer(by_measurement)
+        log.info(
+            "schema: enforcing %d table(s) from %s on measurements %s",
+            len(tables),
+            args.schema_file,
+            sorted(by_measurement),
+        )
 
     feeder: Optional[_IlpHttpFeeder] = None
     if not args.dry_run:
@@ -422,7 +598,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     )
             yield line
 
-    points, field_lines = merge_stream(ticking(sys.stdin), prefix, feeder, interval_ns)
+    points, field_lines = merge_stream(
+        ticking(sys.stdin), prefix, feeder, interval_ns, coercer
+    )
+    if coercer is not None and coercer.dropped_cols:
+        log.info(
+            "schema: dropped %d distinct spurious column(s) not in the schema",
+            len(coercer.dropped_cols),
+        )
     verb = "[dry-run] would write" if args.dry_run else "wrote"
     log.info(
         "%s %s %s points from %s field-lines (%.1fx reduction)",
@@ -478,6 +661,15 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         "--partition-by",
         default="DAY",
         help="PARTITION BY unit for --create-table (default DAY).",
+    )
+    p.add_argument(
+        "--schema-file",
+        default="",
+        help="path to a CREATE TABLE schema (e.g. tables.sql). Enforces it on "
+        "the feed: drops any source field NOT in the schema (so spurious columns "
+        "cannot auto-create) and coerces values to the declared type -- BOOLEAN "
+        "to t/f, INT/LONG to integer (Ni). The source measurement maps to a table "
+        "by adding --prefix. Warns once per column on a type mismatch.",
     )
     p.add_argument(
         "--max-pending-rows",

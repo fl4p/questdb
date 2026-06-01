@@ -16,6 +16,7 @@ from qdb_admin import (
     build_create_table_ddl,
     ensure_indexed_table,
     parse_index_spec,
+    parse_schema_columns,
 )
 
 
@@ -156,6 +157,56 @@ class EnsureIndexedTableTests(unittest.TestCase):
         qdb_admin.urllib.request.urlopen = boom
         with self.assertRaises(SystemExit):
             ensure_indexed_table("http://qdb:9000", None, "tbl", [])
+
+
+class ParseSchemaColumnsTests(unittest.TestCase):
+    SCHEMA = """
+    -- a comment line, and an inline -- note
+    CREATE TABLE 'batmon_tele_batmon' (
+        timestamp TIMESTAMP,
+        device SYMBOL,
+        did SYMBOL INDEX,
+        voltage FLOAT,
+        voltage_cell000 INT,
+        problem_code LONG,
+        switches_charge BOOLEAN
+    ) timestamp(timestamp) PARTITION BY DAY;
+
+    CREATE TABLE 'batmon_tele_cells' (
+        timestamp TIMESTAMP,
+        cell_index SYMBOL,
+        voltage INT
+    ) timestamp(timestamp) PARTITION BY DAY;
+    """
+
+    def test_tables_and_kinds(self):
+        tables = parse_schema_columns(self.SCHEMA)
+        self.assertEqual(set(tables), {"batmon_tele_batmon", "batmon_tele_cells"})
+        b = tables["batmon_tele_batmon"]
+        self.assertEqual(b["device"], "str")
+        self.assertEqual(b["did"], "str")  # SYMBOL INDEX -> str (index ignored)
+        self.assertEqual(b["voltage"], "float")
+        self.assertEqual(b["voltage_cell000"], "int")
+        self.assertEqual(b["problem_code"], "int")  # LONG -> int kind
+        self.assertEqual(b["switches_charge"], "bool")
+
+    def test_designated_timestamp_excluded(self):
+        b = parse_schema_columns(self.SCHEMA)["batmon_tele_batmon"]
+        self.assertNotIn("timestamp", b)
+
+    def test_cells(self):
+        c = parse_schema_columns(self.SCHEMA)["batmon_tele_cells"]
+        self.assertEqual(c, {"cell_index": "str", "voltage": "int"})
+
+    def test_if_not_exists_and_unquoted_name(self):
+        tables = parse_schema_columns(
+            "CREATE TABLE IF NOT EXISTS t (timestamp TIMESTAMP, x INT) "
+            "timestamp(timestamp) PARTITION BY DAY"
+        )
+        self.assertEqual(tables, {"t": {"x": "int"}})
+
+    def test_empty_input_yields_no_tables(self):
+        self.assertEqual(parse_schema_columns("-- just a comment\n"), {})
 
 
 if __name__ == "__main__":

@@ -103,6 +103,39 @@ it will not add an index to a table that already lacks one. Either drop and
 re-create from the schema, or `ALTER TABLE <t> ALTER COLUMN <c> ADD INDEX`
 separately.
 
+## Schema enforcement (opt-in)
+
+When the target tables are pre-created with a tighter schema than the source
+(narrower numeric types, BOOLEAN flags, a curated subset of columns), pass that
+schema to `pivot_lp.py` so the feed matches it exactly:
+
+```bash
+... | pivot_lp.py --prefix batmon_tele_ --downsample 20s \
+      --schema-file schema/tables.sql
+```
+
+`--schema-file` parses the `CREATE TABLE` statements and, per source
+measurement (table name minus `--prefix`):
+
+- **Drops any field not in the schema** so it cannot auto-create a column. This
+  is the safe way to keep unwanted columns out. Do **not** instead set
+  `line.auto.create.new.columns=false`: that does not silently skip an unknown
+  column, it makes the ILP appender reject the **whole row**, so a single stray
+  field drops every row that carries it.
+- **Coerces each value to the declared column type**: `BOOLEAN` -> `t`/`f`
+  (`0`->`f`, nonzero->`t`), `INT`/`LONG`/`SHORT`/`BYTE` -> integer `Ni`,
+  `FLOAT`/`DOUBLE` -> float (a stray integer `i` is stripped). This is required
+  because ILP will not write a float into a BOOLEAN or INT column -- a type
+  mismatch rejects the row, same as an unknown column.
+- `SYMBOL`/string columns and the designated timestamp pass through; tags arrive
+  in the LP head, not as field tokens, so they are never coerced.
+
+It **warns once per column** (not per row) when a value does not cleanly match
+its type -- a non-`0/1` number coerced to BOOLEAN, a fractional value truncated
+to INT, or a non-numeric value that gets dropped -- and logs each dropped column
+once. The schema parser handles simple `name TYPE [INDEX ...]` column lists; a
+type carrying a comma (e.g. `DECIMAL(10,2)`) is not supported.
+
 ## Artifacts (the ACL seam)
 
 Every run writes two machine-readable files so the ACL is generated from what

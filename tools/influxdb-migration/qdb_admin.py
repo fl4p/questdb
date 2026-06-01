@@ -34,6 +34,27 @@ log = logging.getLogger("influx_migrate.qdb_admin")
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _VALID_TIMESTAMP_TYPES = ("TIMESTAMP", "TIMESTAMP_NS")
 
+# QuestDB column type -> the LP coercion "kind" the import pipeline enforces.
+# Anything not listed (SYMBOL, STRING, VARCHAR, CHAR, TIMESTAMP, DATE, UUID,
+# arrays, ...) maps to "str": passed through verbatim (tags arrive in the LP
+# head, not as field tokens, so they are never coerced anyway).
+_TYPE_KIND = {
+    "BOOLEAN": "bool",
+    "BYTE": "int",
+    "SHORT": "int",
+    "INT": "int",
+    "LONG": "int",
+    "FLOAT": "float",
+    "DOUBLE": "float",
+}
+
+_CREATE_TABLE_RE = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?['\"]?"
+    r"([A-Za-z_][A-Za-z0-9_]*)['\"]?\s*\((.*?)\)\s*"
+    r"timestamp\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 # (column, capacity-or-None)
 IndexSpec = Tuple[str, Optional[int]]
 
@@ -164,3 +185,32 @@ def ensure_indexed_table(
     )
     log.info("ensured table %s with indexed columns: %s", table, cols or "(none)")
     return ddl
+
+
+def parse_schema_columns(sql_text: str) -> "dict[str, dict[str, str]]":
+    """Parse ``CREATE TABLE`` statements into ``{table: {column: kind}}``.
+
+    ``kind`` is one of ``bool`` / ``int`` / ``float`` / ``str`` (see
+    :data:`_TYPE_KIND`). The designated timestamp column is excluded -- in line
+    protocol the timestamp is the trailing element, never a field token, so it is
+    not part of the field allow-list. Line (``--``) comments are stripped first.
+
+    The body is split on commas, so a column type carrying a comma (e.g.
+    ``DECIMAL(10,2)``) is not supported here; this parser targets the simple
+    ``name TYPE [INDEX ...]`` column lists the migration emits.
+    """
+    text = re.sub(r"--[^\n]*", "", sql_text)
+    out: "dict[str, dict[str, str]]" = {}
+    for match in _CREATE_TABLE_RE.finditer(text):
+        table, body, ts_col = match.group(1), match.group(2), match.group(3)
+        cols: "dict[str, str]" = {}
+        for coldef in body.split(","):
+            tokens = coldef.split()
+            if len(tokens) < 2:
+                continue
+            name, type_name = tokens[0], tokens[1].upper()
+            if name == ts_col:
+                continue
+            cols[name] = _TYPE_KIND.get(type_name, "str")
+        out[table] = cols
+    return out
