@@ -22,12 +22,13 @@ so the test suite can exercise the DDL generation without a live QuestDB.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 log = logging.getLogger("influx_migrate.qdb_admin")
 
@@ -51,12 +52,56 @@ _TYPE_KIND = {
 _CREATE_TABLE_RE = re.compile(
     r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?['\"]?"
     r"([A-Za-z_][A-Za-z0-9_]*)['\"]?\s*\((.*?)\)\s*"
-    r"timestamp\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)",
+    r"timestamp\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)"
+    r"(?:\s+PARTITION\s+BY\s+([A-Za-z]+))?",
     re.IGNORECASE | re.DOTALL,
 )
 
 # (column, capacity-or-None)
 IndexSpec = Tuple[str, Optional[int]]
+
+
+class ColumnDef(NamedTuple):
+    """One parsed column: its name, the verbatim type/modifier text, and flags.
+
+    ``definition`` is everything after the column name up to the comma (e.g.
+    ``"SYMBOL INDEX CAPACITY 2048"`` or ``"DOUBLE"``), preserved verbatim so the
+    complete-DDL builder re-emits the exact declared type without re-deriving it.
+    ``kind`` is the LP coercion kind (see :data:`_TYPE_KIND`). ``is_symbol`` marks
+    a tag column (filled from the LP tag set), as opposed to a field column.
+    """
+
+    name: str
+    definition: str
+    kind: str
+    is_symbol: bool
+    indexed: bool
+
+
+class TableSchema(NamedTuple):
+    """A parsed CREATE TABLE: ordered columns plus designated-timestamp info.
+
+    ``columns`` is in declared order and INCLUDES the designated timestamp column.
+    ``partition_by`` is the unit from the DDL, or None if the statement omitted it.
+    """
+
+    name: str
+    columns: List[ColumnDef]
+    timestamp_col: str
+    timestamp_type: str
+    partition_by: Optional[str]
+
+    def symbol_columns(self) -> List[str]:
+        """Tag (SYMBOL) column names, in declared order, excluding the timestamp."""
+        return [c.name for c in self.columns if c.is_symbol and c.name != self.timestamp_col]
+
+    def field_columns(self) -> List[str]:
+        """Non-tag, non-timestamp column names (the pivoted measurement fields)."""
+        return [
+            c.name
+            for c in self.columns
+            if not c.is_symbol and c.name != self.timestamp_col
+        ]
 
 
 class IndexSpecError(ValueError):
@@ -163,6 +208,26 @@ def ensure_indexed_table(
     ddl = build_create_table_ddl(
         table, index_specs, timestamp_col, timestamp_type, partition_by, wal
     )
+    _exec_ddl(base_url, auth, ddl, table, timeout)
+    cols = ", ".join(
+        "%s%s" % (n, "(cap %d)" % c if c else "") for n, c in index_specs
+    )
+    log.info("ensured table %s with indexed columns: %s", table, cols or "(none)")
+    return ddl
+
+
+def _exec_ddl(
+    base_url: str,
+    auth: Optional[str],
+    ddl: str,
+    table: str,
+    timeout: float = 60.0,
+) -> None:
+    """POST a DDL statement to QuestDB's ``/exec``; raise SystemExit on failure.
+
+    Aborting loudly on an HTTP/transport error keeps a misconfigured pre-create
+    from silently proceeding into a missing or mismatched table.
+    """
     url = base_url.rstrip("/") + "/exec?" + urllib.parse.urlencode({"query": ddl})
     req = urllib.request.Request(url)
     if auth:
@@ -180,11 +245,82 @@ def ensure_indexed_table(
         raise SystemExit(
             "QuestDB /exec unreachable for CREATE TABLE: %s" % exc.reason
         ) from exc
-    cols = ", ".join(
-        "%s%s" % (n, "(cap %d)" % c if c else "") for n, c in index_specs
+
+
+def ensure_full_table(
+    base_url: str,
+    auth: Optional[str],
+    schema: TableSchema,
+    timestamp_type: Optional[str] = None,
+    partition_by: Optional[str] = None,
+    dedup: bool = True,
+    wal: bool = True,
+    timeout: float = 60.0,
+) -> str:
+    """Build and execute a complete CREATE TABLE for ``schema`` (idempotent).
+
+    Returns the DDL run. Used by the COPY path, which needs the full column list
+    to exist before the import (COPY validates the CSV header and cannot auto-add
+    columns). ``CREATE TABLE IF NOT EXISTS`` makes re-runs a no-op and leaves an
+    existing table untouched.
+    """
+    ddl = build_full_create_table_ddl(schema, timestamp_type, partition_by, dedup, wal)
+    _exec_ddl(base_url, auth, ddl, schema.name, timeout)
+    log.info(
+        "ensured full table %s (%d columns, %d tag(s))",
+        schema.name,
+        len(schema.columns),
+        len(schema.symbol_columns()),
     )
-    log.info("ensured table %s with indexed columns: %s", table, cols or "(none)")
     return ddl
+
+
+def parse_schema_tables(sql_text: str) -> Dict[str, TableSchema]:
+    """Parse ``CREATE TABLE`` statements into ``{table: TableSchema}``.
+
+    Preserves column order, the verbatim type/modifier text per column, the
+    designated timestamp column and its type, and the ``PARTITION BY`` unit (None
+    if absent). Line (``--``) comments are stripped first. The body is split on
+    commas, so a column type carrying a comma (e.g. ``DECIMAL(10,2)``) is not
+    supported; this targets the simple ``name TYPE [INDEX ...]`` column lists the
+    migration emits.
+    """
+    text = re.sub(r"--[^\n]*", "", sql_text)
+    out: Dict[str, TableSchema] = {}
+    for match in _CREATE_TABLE_RE.finditer(text):
+        table, body, ts_col = match.group(1), match.group(2), match.group(3)
+        partition_by = match.group(4).upper() if match.group(4) else None
+        columns: List[ColumnDef] = []
+        ts_type = "TIMESTAMP"
+        for coldef in body.split(","):
+            coldef = coldef.strip()
+            tokens = coldef.split()
+            if len(tokens) < 2:
+                continue
+            name, type_name = tokens[0], tokens[1].upper()
+            definition = coldef[len(name):].strip()
+            upper_tokens = [t.upper() for t in tokens[1:]]
+            is_symbol = type_name == "SYMBOL"
+            indexed = "INDEX" in upper_tokens
+            columns.append(
+                ColumnDef(
+                    name=name,
+                    definition=definition,
+                    kind=_TYPE_KIND.get(type_name, "str"),
+                    is_symbol=is_symbol,
+                    indexed=indexed,
+                )
+            )
+            if name == ts_col:
+                ts_type = type_name
+        out[table] = TableSchema(
+            name=table,
+            columns=columns,
+            timestamp_col=ts_col,
+            timestamp_type=ts_type,
+            partition_by=partition_by,
+        )
+    return out
 
 
 def parse_schema_columns(sql_text: str) -> "dict[str, dict[str, str]]":
@@ -193,24 +329,149 @@ def parse_schema_columns(sql_text: str) -> "dict[str, dict[str, str]]":
     ``kind`` is one of ``bool`` / ``int`` / ``float`` / ``str`` (see
     :data:`_TYPE_KIND`). The designated timestamp column is excluded -- in line
     protocol the timestamp is the trailing element, never a field token, so it is
-    not part of the field allow-list. Line (``--``) comments are stripped first.
-
-    The body is split on commas, so a column type carrying a comma (e.g.
-    ``DECIMAL(10,2)``) is not supported here; this parser targets the simple
-    ``name TYPE [INDEX ...]`` column lists the migration emits.
+    not part of the field allow-list. Thin view over :func:`parse_schema_tables`.
     """
-    text = re.sub(r"--[^\n]*", "", sql_text)
     out: "dict[str, dict[str, str]]" = {}
-    for match in _CREATE_TABLE_RE.finditer(text):
-        table, body, ts_col = match.group(1), match.group(2), match.group(3)
-        cols: "dict[str, str]" = {}
-        for coldef in body.split(","):
-            tokens = coldef.split()
-            if len(tokens) < 2:
-                continue
-            name, type_name = tokens[0], tokens[1].upper()
-            if name == ts_col:
-                continue
-            cols[name] = _TYPE_KIND.get(type_name, "str")
-        out[table] = cols
+    for table, schema in parse_schema_tables(sql_text).items():
+        out[table] = {
+            c.name: c.kind
+            for c in schema.columns
+            if c.name != schema.timestamp_col
+        }
     return out
+
+
+def build_full_create_table_ddl(
+    schema: TableSchema,
+    timestamp_type: Optional[str] = None,
+    partition_by: Optional[str] = None,
+    dedup: bool = True,
+    wal: bool = True,
+) -> str:
+    """Build a complete idempotent CREATE TABLE re-emitting every parsed column.
+
+    Unlike :func:`build_create_table_ddl` (which declares only the timestamp and
+    indexed columns and lets the ILP feed auto-create the rest), this emits the
+    FULL column list so QuestDB's COPY -- which validates the CSV header against an
+    existing table and cannot auto-add columns mid-import -- has a complete target.
+
+    ``timestamp_type`` overrides the designated timestamp's declared type (e.g.
+    force ``TIMESTAMP_NS``); ``partition_by`` overrides the unit. When ``dedup`` is
+    set and there is at least one tag column, appends
+    ``DEDUP UPSERT KEYS(<timestamp>, <tags...>)`` so a resumed/re-run import is
+    idempotent on the (timestamp, tag-set) key. Raises :class:`IndexSpecError` on
+    an unknown timestamp type, an empty table, or a missing PARTITION BY.
+    """
+    if not schema.name or not schema.name.strip():
+        raise IndexSpecError("table name is required")
+    ts_type = (timestamp_type or schema.timestamp_type).strip().upper()
+    if ts_type not in _VALID_TIMESTAMP_TYPES:
+        raise IndexSpecError(
+            "timestamp_type must be one of %s, got %r"
+            % (", ".join(_VALID_TIMESTAMP_TYPES), ts_type)
+        )
+    part = (partition_by or schema.partition_by or "").strip().upper()
+    if not part:
+        raise IndexSpecError(
+            "PARTITION BY is required (none in DDL for %r, none overridden)"
+            % schema.name
+        )
+    col_lines: List[str] = []
+    for col in schema.columns:
+        if col.name == schema.timestamp_col:
+            col_lines.append("    %s %s" % (col.name, ts_type))
+        else:
+            col_lines.append("    %s %s" % (col.name, col.definition))
+    wal_clause = " WAL" if wal else ""
+    ddl = (
+        "CREATE TABLE IF NOT EXISTS '%s' (\n%s\n) timestamp(%s) PARTITION BY %s%s"
+        % (schema.name, ",\n".join(col_lines), schema.timestamp_col, part, wal_clause)
+    )
+    if dedup:
+        keys = [schema.timestamp_col] + schema.symbol_columns()
+        ddl += "\nDEDUP UPSERT KEYS(%s)" % ", ".join(keys)
+    return ddl
+
+
+def fetch_table_schema(
+    base_url: str,
+    auth: Optional[str],
+    table: str,
+    timeout: float = 60.0,
+) -> Optional[TableSchema]:
+    """Read an existing table's schema from QuestDB via ``SHOW COLUMNS``.
+
+    Returns a :class:`TableSchema` reflecting the live table -- column order,
+    types, which column is the designated timestamp, and which columns are SYMBOL
+    (tags) -- so the CSV pivot can build a header that COPY will accept WITHOUT a
+    schema file. Returns None when the table does not exist. Raises SystemExit on
+    any other HTTP/transport error so a real failure is not silently treated as
+    "no such table".
+
+    ``partition_by`` is left None (``SHOW COLUMNS`` does not report it); callers
+    that only need the column set for an existing table do not pre-create it, so
+    the partitioning is irrelevant here.
+    """
+    sql = "SHOW COLUMNS FROM '%s'" % table
+    url = base_url.rstrip("/") + "/exec?" + urllib.parse.urlencode({"query": sql})
+    req = urllib.request.Request(url)
+    if auth:
+        req.add_header("Authorization", auth)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            doc = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")
+        if "does not exist" in detail or "table does not exist" in detail.lower():
+            return None
+        raise SystemExit(
+            "QuestDB SHOW COLUMNS failed for %r (HTTP %d): %s"
+            % (table, exc.code, detail.strip())
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(
+            "QuestDB /exec unreachable for SHOW COLUMNS: %s" % exc.reason
+        ) from exc
+
+    idx = {c["name"]: i for i, c in enumerate(doc.get("columns", []))}
+    name_i = idx.get("column")
+    type_i = idx.get("type")
+    indexed_i = idx.get("indexed")
+    designated_i = idx.get("designated")
+    if name_i is None or type_i is None:
+        raise SystemExit(
+            "QuestDB SHOW COLUMNS for %r returned unexpected columns: %s"
+            % (table, list(idx))
+        )
+    columns: List[ColumnDef] = []
+    ts_col = "timestamp"
+    ts_type = "TIMESTAMP"
+    for row in doc.get("dataset", []):
+        name = row[name_i]
+        type_name = str(row[type_i]).upper()
+        is_symbol = type_name == "SYMBOL"
+        indexed = bool(row[indexed_i]) if indexed_i is not None else False
+        definition = "SYMBOL" if is_symbol else type_name
+        if indexed:
+            definition += " INDEX"
+        columns.append(
+            ColumnDef(
+                name=name,
+                definition=definition,
+                kind=_TYPE_KIND.get(type_name, "str"),
+                is_symbol=is_symbol,
+                indexed=indexed,
+            )
+        )
+        if designated_i is not None and bool(row[designated_i]):
+            ts_col = name
+            ts_type = type_name
+    if not columns:
+        return None
+    return TableSchema(
+        name=table,
+        columns=columns,
+        timestamp_col=ts_col,
+        timestamp_type=ts_type,
+        partition_by=None,
+    )

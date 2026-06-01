@@ -136,6 +136,58 @@ to INT, or a non-numeric value that gets dropped -- and logs each dropped column
 once. The schema parser handles simple `name TYPE [INDEX ...]` column lists; a
 type carrying a comma (e.g. `DECIMAL(10,2)`) is not supported.
 
+## Fast bulk load via COPY (`bulk_copy.py`)
+
+For a one-shot historical backfill, `bulk_copy.py` is the fastest path. Instead of
+feeding ILP-over-HTTP, it pivots the export into one wide **CSV per measurement**
+and hands each file to QuestDB's parallel `COPY`. This exploits how both databases
+store data: the export is series-major (one field per line), and `COPY`
+(`ParallelCsvFileImporter`) is built for **unordered** CSV — it sorts each
+partition by timestamp in parallel and writes column files directly. The effect:
+
+- **No global external sort.** `COPY` does the per-partition sort itself, so the
+  expensive `sort -S 1G` of the whole export is gone. The pivot writes rows in any
+  order.
+- **No ILP re-parse, no WAL throttle, no O3 rewrites.** `COPY` bypasses the WAL
+  sequencer and out-of-order partition rewrites entirely.
+- **Idempotent resumes.** Pre-created tables carry `DEDUP UPSERT KEYS(timestamp,
+  <tags>)`, so a re-run or resume cannot duplicate rows.
+
+```bash
+# v2 bucket piped in, downsampled to 20s, schema from a CREATE TABLE file
+influxd inspect export-lp --bucket-id B --engine-path /data/engine --output-path - \
+  | grep -E '^(batmon|cells),' \
+  | python3 bulk_copy.py --from-stdin --prefix batmon_tele_ --downsample 20s \
+      --schema-file tm-tables.sql --copy-root /var/lib/questdb/import \
+      --questdb-url http://localhost:9000 --user admin --password secret
+```
+
+The CSVs must be staged **under the server's `cairo.sql.copy.root`** (`COPY`
+resolves `FROM` paths relative to it), so run this on the QuestDB host;
+`--copy-root` is that local path and `--copy-subdir` the staging directory beneath
+it. `COPY` is single-flight, so measurements load serially: the tool pivots the
+whole export, then per measurement pre-creates the table (complete, empty,
+partitioned), issues `COPY`, polls `sys.text_import_log` to completion, and deletes
+the staged CSV. The source can be `--from-stdin`, `--lp-file PATH`, or a built-in
+v1 export (`--database`/`--datadir`/`--waldir`). Use `--dry-run` to write the CSVs
+and print the `COPY` statements without executing them.
+
+Schema resolution is flexible: columns/types/partitioning come from
+`--schema-file` first, and any measurement absent from it falls back to an
+**existing table's live schema** read from QuestDB (`--no-schema-from-table`
+disables the fallback). Timestamps are written as ISO-8601 nanoseconds and parsed
+into a `TIMESTAMP_NS` column via `FORMAT 'yyyy-MM-ddTHH:mm:ss.SSSUUUNNNZ'`; for a
+microsecond `TIMESTAMP` column use `--copy-timestamp-format
+'yyyy-MM-ddTHH:mm:ss.SSSUUUZ'`.
+
+**Before relying on the no-global-sort pivot**, run `verify_series_major.sh` on a
+sample export to confirm it is series-major (every measurement+tagset contiguous).
+If it is not, keep the `awk`-prepend sort from `import_batmon.sh` ahead of the
+pivot — `COPY` still sorts each partition, so the main win holds either way.
+`import_batmon_copy.sh` is a ready-to-edit runbook. Keep the ILP path
+(`pivot_lp.py`) for small incremental top-ups, deduplicated on the overlap by the
+table's `DEDUP UPSERT KEYS`.
+
 ## Artifacts (the ACL seam)
 
 Every run writes two machine-readable files so the ACL is generated from what

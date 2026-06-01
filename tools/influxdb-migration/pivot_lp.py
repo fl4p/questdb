@@ -33,19 +33,25 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from bulk_v1 import _IlpHttpFeeder, parse_basic_or_token_auth, rewrite_line
+from csv_pivot import CsvSink
 from qdb_admin import (
     IndexSpecError,
+    TableSchema,
+    ensure_full_table,
     ensure_indexed_table,
+    fetch_table_schema,
     parse_index_spec,
     parse_schema_columns,
+    parse_schema_tables,
 )
 
 log = logging.getLogger("influx_migrate.pivot")
@@ -364,10 +370,25 @@ def merge_stream(
     feeder: Optional["_IlpHttpFeeder"],
     interval_ns: int = 0,
     coercer: Optional["SchemaCoercer"] = None,
+    on_progress: Optional["Callable[[int], None]"] = None,
+    sink=None,
 ):
     """Merge single-field LP lines into wide points; feed or count.
 
     Returns (points, field_lines).
+
+    Each merged point is handed to a sink as ``emit(head, field_tokens, ts)``
+    where ``head`` is ``measurement,tags`` (unprefixed), ``field_tokens`` is the
+    list of ``name=value`` field strings, and ``ts`` is the epoch timestamp. The
+    default sink (when ``sink`` is None) rebuilds the prefixed line-protocol line
+    and feeds it to ``feeder`` -- the original behaviour. A CSV sink
+    (:class:`csv_pivot.CsvSink`) instead writes a wide CSV row per point. ``sink``
+    takes precedence over ``feeder``/``prefix`` when given.
+
+    ``on_progress``, if given, is called with the running field-line count once
+    every 200k lines -- a cheap heartbeat folded into the existing loop counter
+    so there is no per-line generator/dict overhead (the wrapper it replaces was
+    ~38% of pivot CPU). The callback itself rate-limits its own logging.
 
     EXACT mode (``interval_ns == 0``) groups by the exact ``(head, timestamp)``
     -- a faithful pivot. It only needs each point's field lines to be ADJACENT,
@@ -396,6 +417,19 @@ def merge_stream(
     points = 0
     field_lines = 0
 
+    if sink is not None:
+        emit = sink.emit
+        finish = sink.close
+    else:
+        def emit(head, tokens, ts):
+            out = rewrite_line(head + " " + ",".join(tokens) + " " + ts, prefix)
+            if feeder is not None:
+                feeder.add(out)
+
+        def finish():
+            if feeder is not None:
+                feeder.flush()
+
     if interval_ns:
         cur_bucket: Optional[int] = None
         acc: Dict[str, Dict[str, str]] = {}  # head -> {field_name: "name=value"}
@@ -408,11 +442,7 @@ def merge_stream(
             for head, fmap in acc.items():
                 if not fmap:
                     continue
-                out = rewrite_line(
-                    head + " " + ",".join(fmap.values()) + " " + ts_label, prefix
-                )
-                if feeder is not None:
-                    feeder.add(out)
+                emit(head, fmap.values(), ts_label)
                 points += 1
             acc.clear()
 
@@ -429,6 +459,8 @@ def merge_stream(
             except ValueError:
                 continue
             field_lines += 1
+            if on_progress is not None and field_lines % 200_000 == 0:
+                on_progress(field_lines)
             if cur_bucket is None:
                 cur_bucket = bucket
             elif bucket != cur_bucket:
@@ -447,8 +479,7 @@ def merge_stream(
             for tok in fields.split(","):
                 fmap[tok.split("=", 1)[0]] = tok
         flush_bucket()
-        if feeder is not None:
-            feeder.flush()
+        finish()
         return points, field_lines
 
     cur_key = None
@@ -460,11 +491,7 @@ def merge_stream(
         nonlocal points
         if cur_head is None or cur_ts is None or not cur_fields:
             return
-        out = rewrite_line(
-            cur_head + " " + ",".join(cur_fields) + " " + cur_ts, prefix
-        )
-        if feeder is not None:
-            feeder.add(out)
+        emit(cur_head, cur_fields, cur_ts)
         points += 1
 
     for raw in lines:
@@ -476,6 +503,8 @@ def merge_stream(
             continue
         head, fields, ts = parts
         field_lines += 1
+        if on_progress is not None and field_lines % 200_000 == 0:
+            on_progress(field_lines)
         if coercer is not None:
             fields = coercer.transform_fields(head.split(",", 1)[0], fields)
         key = (head, ts)
@@ -487,9 +516,98 @@ def merge_stream(
             if fields:
                 cur_fields.append(fields)
     flush_point()
-    if feeder is not None:
-        feeder.flush()
+    finish()
     return points, field_lines
+
+
+def _make_on_progress() -> "Callable[[int], None]":
+    """Build a heartbeat callback for merge_stream that self-limits to once/2s."""
+    t0 = time.monotonic()
+    last = [0.0]
+
+    def on_progress(n: int) -> None:
+        now = time.monotonic()
+        if now - last[0] >= 2.0:
+            last[0] = now
+            el = now - t0
+            rate = n / el if el > 0 else 0.0
+            log.info(
+                "progress: read %s field-lines | %s lines/s",
+                "{:,}".format(n),
+                "{:,}".format(int(rate)),
+            )
+
+    return on_progress
+
+
+def _run_csv(args: argparse.Namespace, prefix: str, interval_ns: int) -> int:
+    """CSV-emit mode: pivot into per-measurement wide CSVs for QuestDB COPY.
+
+    Resolves each measurement's schema from the --schema-file first, then (unless
+    --no-csv-schema-from-table) by reading an EXISTING table's schema from
+    QuestDB. A measurement with neither is skipped. The ILP-targeting SchemaCoercer
+    is NOT used here -- CsvSink does its own per-column, CSV-shaped formatting and
+    the schema column set is the allow-list (unknown fields are simply not emitted).
+    """
+    file_schemas: Dict[str, TableSchema] = {}
+    if args.schema_file:
+        try:
+            with open(args.schema_file, encoding="utf-8") as fh:
+                tables = parse_schema_tables(fh.read())
+        except OSError as exc:
+            log.error("cannot read --schema-file %s: %s", args.schema_file, exc)
+            return 2
+        if not tables:
+            log.error("no CREATE TABLE statements found in %s", args.schema_file)
+            return 2
+        for table, schema in tables.items():
+            meas = table[len(prefix):] if prefix and table.startswith(prefix) else table
+            file_schemas[meas] = schema
+        log.info(
+            "csv: schema for %d measurement(s) from %s: %s",
+            len(file_schemas),
+            args.schema_file,
+            sorted(file_schemas),
+        )
+
+    auth = parse_basic_or_token_auth(args.user, args.password, args.token)
+
+    if args.csv_create_tables and file_schemas:
+        # Pre-create complete, empty, partitioned targets so a later COPY accepts
+        # the CSV header. Uses each table's own declared types (the schema file is
+        # authoritative); idempotent CREATE TABLE IF NOT EXISTS leaves an existing
+        # table untouched.
+        for schema in file_schemas.values():
+            ensure_full_table(args.questdb_url, auth, schema)
+
+    def resolve(measurement: str) -> Optional[TableSchema]:
+        schema = file_schemas.get(measurement)
+        if schema is not None:
+            return schema
+        if args.csv_schema_from_table:
+            return fetch_table_schema(args.questdb_url, auth, prefix + measurement)
+        return None
+
+    os.makedirs(args.csv_out_dir, exist_ok=True)
+    sink = CsvSink(
+        args.csv_out_dir,
+        resolve,
+        prefix=prefix,
+        delimiter=args.csv_delimiter,
+        timestamp_mode=args.csv_timestamp_mode,
+    )
+    points, field_lines = merge_stream(
+        sys.stdin, prefix, None, interval_ns, None, _make_on_progress(), sink
+    )
+    log.info(
+        "csv: wrote %s %s points to %d file(s) from %s field-lines (%.1fx reduction)",
+        "{:,}".format(points),
+        "downsampled" if interval_ns else "wide",
+        len(sink.paths),
+        "{:,}".format(field_lines),
+        (field_lines / points) if points else 0.0,
+    )
+    return 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -502,6 +620,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     interval_ns = parse_interval_ns(args.downsample)
     if interval_ns:
         log.info("downsampling to a fixed %s grid (last value per field per bucket)", args.downsample)
+    if args.csv_out_dir:
+        return _run_csv(args, prefix, interval_ns)
     if args.index and not args.create_table:
         log.error("--index requires --create-table NAME (the table to pre-create)")
         return 2
@@ -578,28 +698,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             feeder = _IlpHttpFeeder(args.questdb_url, args.batch_size, auth)
 
-    # Wrap the input so we can log a heartbeat without buffering the stream.
-    t0 = time.monotonic()
-    state = {"n": 0, "last": 0.0}
-
-    def ticking(src):
-        for line in src:
-            state["n"] += 1
-            if state["n"] % 200_000 == 0:
-                now = time.monotonic()
-                if now - state["last"] >= 2.0:
-                    state["last"] = now
-                    el = now - t0
-                    rate = state["n"] / el if el > 0 else 0.0
-                    log.info(
-                        "progress: read %s field-lines | %s lines/s",
-                        "{:,}".format(state["n"]),
-                        "{:,}".format(int(rate)),
-                    )
-            yield line
-
+    # Heartbeat without buffering the stream: merge_stream calls this every 200k
+    # field-lines (folded into its existing counter -- no per-line wrapper).
     points, field_lines = merge_stream(
-        ticking(sys.stdin), prefix, feeder, interval_ns, coercer
+        sys.stdin, prefix, feeder, interval_ns, coercer, _make_on_progress()
     )
     if coercer is not None and coercer.dropped_cols:
         log.info(
@@ -635,6 +737,44 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     )
     p.add_argument("--questdb-url", default="http://localhost:9000")
     p.add_argument("--batch-size", type=int, default=10_000)
+    p.add_argument(
+        "--csv-out-dir",
+        default="",
+        help="CSV mode: write wide rows to one CSV file per measurement in this "
+        "directory (the QuestDB COPY input root) instead of feeding ILP. The file "
+        "is named <prefix><measurement>.csv. Column set/order/types come from "
+        "--schema-file, or (per measurement) from an existing table's schema. "
+        "Feed these to QuestDB's parallel COPY -- it sorts each partition itself, "
+        "so the output need not be time-ordered.",
+    )
+    p.add_argument(
+        "--csv-delimiter",
+        default=",",
+        help="CSV field delimiter for --csv-out-dir (default ',').",
+    )
+    p.add_argument(
+        "--csv-timestamp-mode",
+        default="iso-ns",
+        choices=("iso-ns", "epoch-ns"),
+        help="CSV timestamp encoding: 'iso-ns' writes "
+        "yyyy-MM-ddTHH:mm:ss.SSSSSSSSSZ (match with COPY FORMAT); 'epoch-ns' "
+        "writes the raw nanosecond integer. Default iso-ns.",
+    )
+    p.add_argument(
+        "--csv-create-tables",
+        action="store_true",
+        help="CSV mode: pre-create each --schema-file table (complete, empty, "
+        "partitioned, with DEDUP UPSERT KEYS) before writing, so a later COPY has "
+        "a valid target. Off by default (the orchestrator usually does this).",
+    )
+    p.add_argument(
+        "--no-csv-schema-from-table",
+        dest="csv_schema_from_table",
+        action="store_false",
+        help="CSV mode: do NOT fall back to reading an existing table's schema "
+        "from QuestDB for a measurement absent from --schema-file (default: do).",
+    )
+    p.set_defaults(csv_schema_from_table=True)
     p.add_argument(
         "--create-table",
         default="",
