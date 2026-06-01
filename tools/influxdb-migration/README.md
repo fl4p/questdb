@@ -138,15 +138,19 @@ type carrying a comma (e.g. `DECIMAL(10,2)`) is not supported.
 
 ## Fast bulk load via COPY (`bulk_copy.py`)
 
-For a one-shot historical backfill, `bulk_copy.py` is the fastest path. Instead of
-feeding ILP-over-HTTP, it pivots the export into one wide **CSV per measurement**
-and hands each file to QuestDB's parallel `COPY` (`ParallelCsvFileImporter`), which
-writes column files directly. Versus the ILP path this drops:
+For a one-shot historical backfill, `bulk_copy.py` is an alternative to the ILP
+path. It pivots the export into one wide **CSV per measurement** and hands each
+file to QuestDB's parallel `COPY` (`ParallelCsvFileImporter`), which writes column
+files directly. Versus the ILP path it drops:
 
 - **The ILP re-parse, the WAL sequencer, O3 partition rewrites, and the WAL-apply
   throttle.** `COPY` writes columns directly and sorts each partition itself.
 - **Idempotent resumes.** Pre-created tables carry `DEDUP UPSERT KEYS(timestamp,
   <tags>)`, so a re-run or resume cannot duplicate rows.
+
+**This is an operational improvement, not a throughput one** — benchmarks (below)
+show it is not faster than ILP for this workload. Choose it for the synchronous,
+throttle-free, O3-free ingest, not for speed.
 
 **The timestamp sort stays.** `COPY` sorts each *partition* for its own column
 writes, but that is not a substitute for the pivot's pre-merge sort: the downsample
@@ -192,6 +196,38 @@ sort | `bulk_copy.py`). `verify_series_major.sh` reports whether an export is
 series-major if you want to understand its ordering, but the sort is required
 regardless. Keep the ILP path (`pivot_lp.py`) for small incremental top-ups,
 deduplicated on the overlap by the table's `DEDUP UPSERT KEYS`.
+
+### Performance (measured on the real batmon bucket)
+
+Both the ILP and COPY paths are **producer-bound** — the single-threaded Python
+pivot plus output generation dominates; the ingest is not the bottleneck. End-to-end
+on a sorted slice (`bench_copy_vs_ilp.sh`):
+
+| slice | OLD ILP | NEW COPY |
+|-------|---------|----------|
+| 2h (258k rows) | 7,242 rows/s | 5,930 rows/s (~18% slower) |
+| 10h (1.46M rows) | 10,983 rows/s | 7,526 rows/s (~31% slower) |
+
+COPY's *pure* column-write is the fastest ingest measured (~90k rows/s from
+`sys.text_import_log`, ~2x ILP; `symbol_table_merge` is a non-issue at 8-15ms), but
+generating the wide CSV in Python adds ~70% over the bare pivot and erases that lead,
+and the gap grows with scale. ILP's line generation is lighter and, on pre-sorted
+input, WAL apply keeps up. So COPY's column-write ceiling only surfaces with a
+**compiled producer**.
+
+Two measured levers:
+
+- **PyPy** — running either path under `pypy3` (no code changes) gives ~1.7-1.9x
+  end-to-end and narrows the COPY-vs-ILP gap to ~7% (it accelerates the
+  string-heavy CSV producer most). Lowest-effort win.
+- **DuckDB -> Parquet** — a DuckDB `time_bucket`+`last()` pivot to Parquet, loaded
+  via `INSERT INTO t SELECT * FROM read_parquet(...)` into a pre-created partitioned
+  WAL table, measured ~2-2.5x over ILP and **bit-for-bit equal** to `pivot_lp`
+  output. The throughput winner, but with caveats that
+  erode the gain at scale: DuckDB groups the whole input (high RSS -> time-chunking
+  mandatory on a small box), `read_parquet` only resolves under the import root
+  (file staging into the QuestDB container), and the `INSERT` applies via WAL
+  asynchronously. Prototype a per-day windowed run and measure before adopting.
 
 ## Artifacts (the ACL seam)
 
