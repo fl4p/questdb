@@ -45,6 +45,33 @@ class InfluxReader(abc.ABC):
         measurement; the orchestrator rewrites it to the prefixed table name.
         """
 
+    def plan_windows(self, scope: str, measurement: str) -> List[object]:
+        """Split a measurement into independent read units for parallelism.
+
+        Returns a list of opaque "window" tokens, each readable independently via
+        :meth:`rows_window`. The orchestrator runs the units across a thread pool,
+        so a reader that splits a measurement here (e.g. into time windows aligned
+        with InfluxDB's time-sharded storage) gets intra-measurement parallelism.
+
+        The default returns a single ``None`` token -- the whole measurement as
+        one unit -- so a reader that does not override this still parallelizes
+        *across* measurements. An empty list means the measurement has no data.
+        """
+        return [None]
+
+    def rows_window(
+        self, scope: str, measurement: str, schema: TableSchema, window: object
+    ) -> Iterator[Row]:
+        """Stream the rows of one :meth:`plan_windows` token.
+
+        The default ignores the token and streams the whole measurement via
+        :meth:`rows`, so a reader that does not override :meth:`plan_windows`
+        still works under the parallel orchestrator (one unit per measurement).
+        Overriders MUST keep windows non-overlapping and exhaustive so every
+        point is read exactly once.
+        """
+        return self.rows(scope, measurement, schema)
+
     @abc.abstractmethod
     def principals(self) -> List[Principal]:
         """List users/tokens and their grants for acl.conf generation."""

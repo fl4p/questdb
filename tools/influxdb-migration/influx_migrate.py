@@ -39,9 +39,13 @@ Examples
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
 from acl import AclNameCollision, build_entries, render, render_credentials_csv
@@ -213,38 +217,181 @@ def _table_row_count(base: str, table: str, auth: Optional[str] = None) -> int:
 def _migrate_data(
     reader: InfluxReader, scopes: List[str], args, use_prefix: bool
 ) -> List[dict]:
-    writer = QuestDBWriter(args.questdb_ilp, dry_run=args.dry_run, batch_size=args.batch_size)
-    manifest: List[dict] = []
+    # Plan phase (single thread): resolve each measurement's schema + target
+    # table, then split it into independent read units via plan_windows(). For
+    # v2 a unit is a time window (mapped onto Influx time-sharding); for v1 it is
+    # the whole measurement. Units are the granularity of parallelism.
     planned: Dict[str, str] = {}
-    try:
-        for scope in scopes:
-            measurements = _select(reader.measurements(scope), args.measurements)
-            tables: List[str] = []
-            for measurement in measurements:
-                schema = reader.schema(scope, measurement)
-                resolved = table_name(
-                    args.table_name_template, scope, measurement, use_prefix
-                )
-                tables.append(resolved)
-                planned[f"{scope}.{measurement}"] = resolved
-                log.info("migrating %s.%s -> table %s", scope, measurement, resolved)
-                for row in reader.rows(scope, measurement, schema):
-                    row.table = resolved
-                    writer.write(row, schema)
-                writer.flush()
-            manifest.append(
-                {
-                    "influx_db": scope,
-                    "prefixed": use_prefix,
-                    "prefix": scope_prefix(scope) if use_prefix else "",
-                    "tables": tables,
-                }
+    manifest: List[dict] = []
+    units: List[tuple] = []
+    for scope in scopes:
+        measurements = _select(reader.measurements(scope), args.measurements)
+        tables: List[str] = []
+        for measurement in measurements:
+            schema = reader.schema(scope, measurement)
+            resolved = table_name(
+                args.table_name_template, scope, measurement, use_prefix
             )
-    finally:
-        writer.close()
+            tables.append(resolved)
+            planned[f"{scope}.{measurement}"] = resolved
+            for window in reader.plan_windows(scope, measurement):
+                units.append((scope, measurement, resolved, schema, window))
+        manifest.append(
+            {
+                "influx_db": scope,
+                "prefixed": use_prefix,
+                "prefix": scope_prefix(scope) if use_prefix else "",
+                "tables": tables,
+            }
+        )
 
-    _report(writer.stats(), planned, args.dry_run)
+    workers = max(1, args.workers)
+    log.info(
+        "planned %d table(s), %d read window(s) across %d scope(s); %d worker thread(s)",
+        len(planned),
+        len(units),
+        len(scopes),
+        workers,
+    )
+
+    progress = _Progress(len(units), args.expect_rows, args.dry_run)
+    tls = threading.local()
+    writers: List[QuestDBWriter] = []
+    writers_lock = threading.Lock()
+
+    def _thread_writer() -> QuestDBWriter:
+        # One Sender per worker thread: the questdb Sender is not thread-safe, so
+        # each thread owns its own ILP connection. Concurrent ILP-over-HTTP into
+        # QuestDB is fine -- O3 absorbs the out-of-order arrival across windows.
+        w = getattr(tls, "writer", None)
+        if w is None:
+            w = QuestDBWriter(
+                args.questdb_ilp, dry_run=args.dry_run, batch_size=args.batch_size
+            )
+            tls.writer = w
+            with writers_lock:
+                writers.append(w)
+        return w
+
+    def _run_unit(unit: tuple) -> None:
+        scope, measurement, resolved, base_schema, window = unit
+        # Per-unit schema copy: the reader refines field_types from live values as
+        # it streams, so a schema shared across threads would be a write race.
+        schema = copy.deepcopy(base_schema)
+        writer = _thread_writer()
+        pending = 0
+        try:
+            for row in reader.rows_window(scope, measurement, schema, window):
+                row.table = resolved
+                writer.write(row, schema)
+                pending += 1
+                if pending >= 5_000:
+                    progress.add_rows(pending)
+                    pending = 0
+            writer.flush()
+        finally:
+            progress.add_rows(pending)
+        progress.window_done()
+
+    try:
+        if units:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(_run_unit, u) for u in units]
+                for fut in futures:
+                    try:
+                        fut.result()
+                    except Exception as exc:  # noqa: BLE001 - log + count, keep going
+                        progress.window_failed()
+                        log.error("read window failed: %s", exc)
+    finally:
+        merged = _merge_stats(writers)
+        for w in writers:
+            w.close()
+
+    progress.finish()
+    if progress.failures:
+        log.error(
+            "%d/%d read window(s) FAILED; migrated data may be INCOMPLETE -- "
+            "investigate before relying on the target (re-run is blocked by the "
+            "idempotency guard unless you drop/dedup first)",
+            progress.failures,
+            len(units),
+        )
+    _report(merged, planned, args.dry_run)
     return manifest
+
+
+class _Progress:
+    """Thread-safe progress meter: a throttled 'data is flowing' heartbeat."""
+
+    def __init__(self, total_windows: int, expect_rows: int, dry_run: bool):
+        self._lock = threading.Lock()
+        self._rows = 0
+        self._windows_done = 0
+        self._total = total_windows
+        self._expect = expect_rows
+        self._dry_run = dry_run
+        self._t0 = time.monotonic()
+        self._last = 0.0
+        self.failures = 0
+
+    def add_rows(self, n: int) -> None:
+        if n <= 0:
+            return
+        with self._lock:
+            self._rows += n
+            self._maybe_log(False)
+
+    def window_done(self) -> None:
+        with self._lock:
+            self._windows_done += 1
+            self._maybe_log(False)
+
+    def window_failed(self) -> None:
+        with self._lock:
+            self.failures += 1
+
+    def finish(self) -> None:
+        with self._lock:
+            self._maybe_log(True)
+
+    def _maybe_log(self, force: bool) -> None:
+        # Caller holds self._lock. Throttle to one line every 2s so a fast stream
+        # does not drown the log, but slow enough work still ticks regularly.
+        now = time.monotonic()
+        if not force and now - self._last < 2.0:
+            return
+        self._last = now
+        elapsed = now - self._t0
+        rate = self._rows / elapsed if elapsed > 0 else 0.0
+        verb = "read" if self._dry_run else "wrote"
+        pct = ""
+        if self._expect > 0:
+            pct = " (~%.0f%% of %s)" % (
+                100.0 * self._rows / self._expect,
+                f"{self._expect:,}",
+            )
+        log.info(
+            "progress: %s %s rows | %s rows/s | %d/%d windows%s",
+            verb,
+            f"{self._rows:,}",
+            f"{int(rate):,}",
+            self._windows_done,
+            self._total,
+            pct,
+        )
+
+
+def _merge_stats(writers: List[QuestDBWriter]) -> Dict[str, MigrationStats]:
+    """Sum the per-thread writers' per-table stats into one map."""
+    merged: Dict[str, MigrationStats] = {}
+    for w in writers:
+        for table, st in w.stats().items():
+            m = merged.setdefault(table, MigrationStats())
+            m.rows += st.rows
+            m.fields_skipped_null += st.fields_skipped_null
+            m.tags_skipped_empty += st.tags_skipped_empty
+    return merged
 
 
 def _write_manifest(manifest: List[dict], args) -> None:
@@ -346,6 +493,8 @@ def _report(stats: Dict[str, MigrationStats], planned: Dict[str, str], dry_run: 
 
 def _build_reader(source_type: str, args) -> InfluxReader:
     if source_type == "v1":
+        from datetime import timedelta
+
         from readers.v1 import V1Reader
 
         return V1Reader(
@@ -353,6 +502,8 @@ def _build_reader(source_type: str, args) -> InfluxReader:
             username=args.influx_user,
             password=args.influx_password,
             page_size=args.page_size,
+            window=timedelta(minutes=args.v1_window_minutes),
+            pool_maxsize=args.workers,
         )
     from readers.v2 import V2Reader
 
@@ -365,6 +516,7 @@ def _build_reader(source_type: str, args) -> InfluxReader:
         token=args.influx_token,
         org=args.influx_org,
         window=timedelta(minutes=args.v2_window_minutes),
+        pool_maxsize=args.workers,
     )
 
 
@@ -438,6 +590,14 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         help="v1 read pagination: rows per SELECT page (bounds reader memory)",
     )
     src.add_argument(
+        "--v1-window-minutes",
+        type=int,
+        default=360,
+        help="v1 read time-window size in minutes: a measurement's data span is "
+        "split into windows of this size, the unit of intra-measurement "
+        "parallelism (lower this to spread very dense data across more workers)",
+    )
+    src.add_argument(
         "--v2-window-minutes",
         type=int,
         default=60,
@@ -463,6 +623,22 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         action="store_true",
         help="skip the pre-flight check that refuses to write into a non-empty "
         "target table (ILP appends, so re-running otherwise duplicates rows)",
+    )
+    tgt.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="parallel worker threads. Each v2 time-window (or v1 measurement) "
+        "is an independent unit run on its own thread + ILP Sender, overlapping "
+        "Influx reads with QuestDB writes. The work is I/O-bound (waiting on "
+        "Influx/QuestDB), so threads, not processes, are the right tool.",
+    )
+    tgt.add_argument(
+        "--expect-rows",
+        type=int,
+        default=0,
+        help="approximate total point count; only used to show a percentage in "
+        "the progress heartbeat (0 = omit the percentage)",
     )
 
     sel = p.add_argument_group("selection")
