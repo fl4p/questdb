@@ -67,6 +67,42 @@ that is not already a clean `[A-Za-z0-9_]` identifier is **rejected** — the ru
 stops with a non-zero exit and names the offender, so it can be renamed upstream
 (this guarantees the operator's Grafana `?db=` always equals the table prefix).
 
+## Indexing (opt-in)
+
+ILP auto-create **never adds indexes**, so a freshly imported table has none.
+To index a tag you must pre-create the table with that column declared
+`SYMBOL INDEX` *before* the first write. The bulk wide-pivot path (`pivot_lp.py`)
+does this on request:
+
+```bash
+... | pivot_lp.py --prefix batmon_tele_ --downsample 20s \
+      --create-table batmon_tele_batmon \
+      --index 'did,uid,addrh:2048,slug' \
+      --timestamp-type TIMESTAMP --partition-by DAY
+```
+
+This runs a `CREATE TABLE IF NOT EXISTS` with the designated timestamp plus the
+named indexed columns; every other tag/field column still auto-creates from the
+feed. `--index` entries are `col` or `col:capacity` (the SYMBOL index capacity
+hint). The shared builder lives in `qdb_admin.py`.
+
+Guidance — **do not index every tag**. A QuestDB `SYMBOL` is already
+dictionary-encoded, so a non-indexed equality filter is a cheap vectorized scan
+(pruned by the timestamp partition). An index only pays off for a *selective*
+filter on a *large* table, and it costs disk plus per-commit maintenance —
+expensive for high-cardinality tags. Index only the tags you actually filter or
+group by. (InfluxDB indexes the whole tag set by default; QuestDB's model is
+different, which is why this is opt-in.)
+
+QuestDB has **no composite (multi-column) index** — each named column gets its
+own single-column index. For a multi-tag filter, index the most selective column
+and let the rest be scan filters.
+
+Caveat: `CREATE TABLE IF NOT EXISTS` leaves an **existing** table untouched, so
+it will not add an index to a table that already lacks one. Either drop and
+re-create from the schema, or `ALTER TABLE <t> ALTER COLUMN <c> ADD INDEX`
+separately.
+
 ## Artifacts (the ACL seam)
 
 Every run writes two machine-readable files so the ACL is generated from what
