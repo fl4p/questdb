@@ -52,7 +52,9 @@ To make a pco column smaller, reduce the information it carries:
 - **Round floats to a lossless fixed-point grid.** If a value is only meaningful
   to 0.01, store `round(x*100)` as an integer -- pco then sees a low-entropy
   integer stream instead of noisy IEEE mantissas. (Measured: a near-integer
-  "float" column dropped from ~1.0 bytes/value as f32 to ~0.03 as scaled int.)
+  "float" column dropped from ~1.0 bytes/value as f32 to ~0.03 as a *whole-unit*
+  int -- but most of that win is dropping precision, not the type change; see
+  Rule 3 for the split.)
 - **Drop noise bits you do not need** via `PARQUET(PCO, LOSSY(n))` for FLOAT /
   DOUBLE (keep the top `n` mantissa bits). This is the precision lever made
   explicit; it trades a bounded relative error for density.
@@ -83,11 +85,41 @@ there anyway).
 
 ## Rule 3 -- Store integer-valued floats as integers
 
-Columns declared `FLOAT`/`DOUBLE` that actually hold whole numbers (counts,
-flags, fixed-point sensor readings) compress far better as `INT`/`LONG`, and the
-conversion is lossless. This is usually a bigger win than any width tweak, and it
-is exactly what SHORT/INT pco support unlocks. Verify losslessness
-(`round(x*scale) / scale == x`) before changing the type.
+Columns declared `FLOAT`/`DOUBLE` that actually hold whole numbers or fixed
+decimals (counts, flags, fixed-point sensor readings) compress better as
+`INT`/`LONG`, losslessly. Verify losslessness (`round(x*scale) / scale == x`)
+before changing the type. But be clear about *why* and *how much*, because it is
+easy to overstate.
+
+**Why a "nice" decimal does not compress well as a float.** A value like
+`104.910` has no exact binary representation -- `0.001` is a non-terminating
+binary fraction -- so IEEE-754 stores `104.90999...` with pseudo-random low
+mantissa bits encoding the rounding. pco faithfully preserves those bits, and
+they cost entropy: the decimal "niceness" is **invisible to a binary codec**.
+pco's float-multiplier mode is supposed to factor out a common base like
+`0.001`, but it cannot when the base is not exactly representable, and `f32`'s
+short mantissa actively breaks the grid at large magnitude (measured: at ~1.6e6
+the stored `f32` misses the milli-grid by up to 0.5). A wide dynamic range makes
+it worse -- the values spread across many binary exponents, each its own latent.
+Counter-intuitively, **`f64` can compress such data worse than `f32`** (measured
+6.75 vs 3.12 bytes/value on wide-range `k/1000`): more mantissa bits give the
+non-terminating binary more room to fill with noise.
+
+**Two separate levers -- do not conflate them.** Converting a fractional float to
+a scaled int mixes two effects:
+
+- *Representation* (float -> scaled int at the **same** precision): exact integer
+  values and one clean latent stream instead of sign/exponent/mantissa. Real but
+  **modest** -- measured `f32` 1.012 -> `int(x1000)` 0.719 bytes/value, ~1.4x.
+- *Precision* (storing **fewer** low-order digits because they are noise): the
+  large win, but **lossy** -- `int(x1000)` 0.719 -> whole-unit `int` 0.026, ~27x.
+  Only valid if those digits really are noise (often true at high magnitude,
+  where `f32` could not hold them anyway).
+
+So: type the column as `INT`/`LONG` for the lossless representation gain, then
+decide the *scale* (how many decimals to keep) as a precision call per Rule 2 --
+and measure, since on signed/noisy columns rounding can grow the blob. The
+dramatic ratios come from the precision decision, not the type change.
 
 ## Rule 4 -- Let pco do the delta; don't pre-transform
 
