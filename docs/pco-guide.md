@@ -1,0 +1,131 @@
+# Using pco effectively in QuestDB
+
+pco is QuestDB's fitted numeric codec, opt-in per column via `PARQUET(PCO)`. It
+applies **only on the native -> Parquet conversion path** (converted partitions),
+never to the native `.d` hot store, and a pco column is readable only by QuestDB.
+Eligible types: `FLOAT`, `DOUBLE`, `SHORT`, `INT`, `LONG`, `TIMESTAMP`, `DATE`.
+
+This guide is the practical model for *when pco helps and how to feed it*. It is
+general; the numbers cited are illustrative measurements, not a dataset report.
+
+## The one mental model
+
+pco's compressed size tracks the **entropy of the values** -- after it applies
+its own automatic delta and "common-multiple" (int-mult) detection and bins the
+residuals. It does **not** track the storage width. Two corollaries drive
+everything below:
+
+1. The same values stored as `i16`, `i32`, or `i64` produce a **byte-for-byte
+   identical** pco blob. (Measured: a millivolt column compressed to 0.122
+   bytes/value as LONG, INT, and SHORT alike.)
+2. The lever you *do* control is how many distinct values there are -- precision
+   and noise -- not how many bytes each nominally occupies.
+
+## Rule 1 -- Do not downcast integers for Parquet density. SHORT earns nothing here.
+
+For the **Parquet layer**, narrowing an integer column (LONG -> INT -> SHORT)
+does not shrink the file:
+
+- pco is width-agnostic (corollary 1), so the compressed payload is identical.
+- Even *uncompressed*, Parquet has no 16-bit integer: QuestDB writes `SHORT`,
+  `BYTE`, and `CHAR` as the Parquet `INT32` physical type. So a SHORT column is
+  already 4 bytes per value in Parquet before pco, same as INT.
+
+So for Parquet, **SHORT (and BYTE) offer no size advantage over INT** -- with or
+without pco. Their genuine 2-byte / 1-byte footprint exists **only in the native
+`.d` files** (the hot, not-yet-converted partitions). If a partition's lifetime
+is mostly Parquet, pick the integer type for *semantics*, not for width.
+
+Practical reading: choosing SHORT specifically to make Parquet smaller is a
+no-op. Choose SHORT only when the native `.d` footprint matters (recent data,
+high ingest rate) and the column has no NULLs and a safe 16-bit range.
+
+> Why SHORT pco support still exists: a column that *is* SHORT (chosen for the
+> `.d` win) must still be encodable with pco when its partition converts -- and
+> it now is. The feature makes SHORT *work* with pco; it does not make SHORT a
+> way to *get* smaller pco.
+
+## Rule 2 -- The real lever is precision/entropy, not width
+
+To make a pco column smaller, reduce the information it carries:
+
+- **Round floats to a lossless fixed-point grid.** If a value is only meaningful
+  to 0.01, store `round(x*100)` as an integer -- pco then sees a low-entropy
+  integer stream instead of noisy IEEE mantissas. (Measured: a near-integer
+  "float" column dropped from ~1.0 bytes/value as f32 to ~0.03 as scaled int.)
+- **Drop noise bits you do not need** via `PARQUET(PCO, LOSSY(n))` for FLOAT /
+  DOUBLE (keep the top `n` mantissa bits). This is the precision lever made
+  explicit; it trades a bounded relative error for density.
+
+Precision reduction shrinks pco because it collapses distinct values. Width
+reduction does not, because pco never charged you for the width.
+
+## Rule 3 -- Store integer-valued floats as integers
+
+Columns declared `FLOAT`/`DOUBLE` that actually hold whole numbers (counts,
+flags, fixed-point sensor readings) compress far better as `INT`/`LONG`, and the
+conversion is lossless. This is usually a bigger win than any width tweak, and it
+is exactly what SHORT/INT pco support unlocks. Verify losslessness
+(`round(x*scale) / scale == x`) before changing the type.
+
+## Rule 4 -- Let pco do the delta; don't pre-transform
+
+pco auto-deltas and detects common multiples. A manual delta pass before pco
+earns essentially nothing (measured: delta+pco within ~1% of bare pco). Feeding
+it "pre-helped" data adds code and risk for no gain. Hand pco the raw values.
+
+## Rule 5 -- NULL and the no-null types
+
+`SHORT`, `BYTE`, `CHAR` have **no NULL** in QuestDB -- a missing value reads back
+as 0. A column with real NULLs must use a type that has a NULL sentinel
+(`INT` = i32::MIN, `LONG` = i64::MIN, floats = NaN), regardless of range or
+compression. pco compresses the repeated NULL sentinel almost for free, so a
+mostly-null INT column is still tiny -- you do not need SHORT to make it small.
+
+This often decides SHORT-vs-INT on its own: if the column can be null, it is INT.
+
+## Rule 6 -- Sorted, monotonic, regular, or low-cardinality -> near zero
+
+The designated timestamp, any monotonic counter, a regular sampling grid, or a
+near-constant column all collapse to ~0 bytes/value under pco's delta + int-mult.
+Two consequences:
+
+- These columns are already free; there is nothing to optimize.
+- **Reduced timestamp precision (ms/s) only helps when the timestamps carry
+  sub-second entropy** -- irregular, microsecond-resolution event times. A
+  downsampled or whole-second grid sees no benefit (measured: us = ms = s,
+  identical, on a whole-second multi-device grid). Do not reach for a
+  millisecond timestamp to shrink a regular series; it is already ~0.
+
+## Rule 7 -- No extra compression on top
+
+QuestDB writes pco pages **uncompressed**: pco output is already entropy-coded,
+so a Parquet codec (zstd/snappy) on top wastes CPU and can grow the page. Do not
+pair `PARQUET(PCO, ZSTD(...))`.
+
+## Quick recipe
+
+1. Numeric column: pick the smallest type that holds the range **with headroom
+   for glitches/outliers** and supports NULL if the column can be null. For
+   Parquet size this is a semantic choice, not a compression one -- don't pick
+   SHORT *for* pco.
+2. Float that is integer-valued or fixed-precision: store it as `INT`/`LONG` or
+   lossless fixed-point, then `PARQUET(PCO)`.
+3. Float that is genuinely fractional and tolerant: `PARQUET(PCO, LOSSY(n))`.
+4. Timestamp / monotonic / sorted: leave at native precision, `PARQUET(PCO)` (or
+   the default delta). Don't reduce precision unless you have measured
+   sub-second entropy.
+5. Never stack a Parquet compressor on a pco column.
+
+## What changes between `.d` and Parquet (summary)
+
+| concern                     | native `.d`            | Parquet + pco                 |
+|-----------------------------|------------------------|-------------------------------|
+| SHORT/BYTE physical width   | 2 B / 1 B (real win)   | INT32 / always 4 B (no win)   |
+| integer width vs size       | narrower = smaller     | width-agnostic (same size)    |
+| what shrinks the column     | type width             | value entropy / precision     |
+| NULL on SHORT/BYTE/CHAR     | none (reads 0)         | none (reads 0)                |
+
+The short version: **for Parquet, choose column types by range and NULL
+semantics; choose pco settings by precision. Width is the `.d` story, entropy is
+the pco story.**
