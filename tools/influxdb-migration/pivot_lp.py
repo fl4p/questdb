@@ -272,6 +272,43 @@ class SchemaCoercer:
             value = value[:-1]
         return float(value)
 
+    def _coerce_token(self, measurement: str, cols: Dict[str, str], tok: str) -> Optional[str]:
+        """Filter/coerce ONE ``name=value`` token against ``cols``.
+
+        Returns the (possibly rewritten) token, or None when the column is not
+        in the schema (dropped) or the value cannot be coerced to its declared
+        type. ``cols`` is passed in so the caller resolves the per-measurement
+        schema dict once per line instead of once per token. A token without an
+        ``=`` (no field value) passes through verbatim.
+        """
+        name, eq, value = tok.partition("=")
+        if not eq:
+            return tok
+        kind = cols.get(name)
+        if kind is None:
+            if (measurement, name) not in self.dropped_cols:
+                self.dropped_cols.add((measurement, name))
+                log.info(
+                    "schema: dropping column not in schema [%s.%s]",
+                    measurement,
+                    name,
+                )
+            return None
+        if kind == "bool":
+            coerced = self._to_bool(measurement, name, value)
+        elif kind == "int":
+            coerced = self._to_int(measurement, name, value)
+        elif kind == "float":
+            coerced = self._to_float(value)
+        else:
+            return tok
+        if coerced is None:
+            return None
+        # Avoid rebuilding the token string when the value was unchanged (the
+        # common case for already-canonical int/float literals): return the
+        # original token instead of re-concatenating name + "=" + value.
+        return tok if coerced is value else name + "=" + coerced
+
     def transform_fields(self, measurement: str, fields: str) -> Optional[str]:
         """Return the filtered/coerced field set, or None if nothing survives."""
         cols = self._schema.get(measurement)
@@ -279,30 +316,9 @@ class SchemaCoercer:
             return fields
         out: List[str] = []
         for tok in fields.split(","):
-            name, eq, value = tok.partition("=")
-            if not eq:
-                out.append(tok)
-                continue
-            kind = cols.get(name)
-            if kind is None:
-                if (measurement, name) not in self.dropped_cols:
-                    self.dropped_cols.add((measurement, name))
-                    log.info(
-                        "schema: dropping column not in schema [%s.%s]",
-                        measurement,
-                        name,
-                    )
-                continue
-            if kind == "bool":
-                coerced = self._to_bool(measurement, name, value)
-            elif kind == "int":
-                coerced = self._to_int(measurement, name, value)
-            elif kind == "float":
-                coerced = self._to_float(value)
-            else:
-                coerced = value
+            coerced = self._coerce_token(measurement, cols, tok)
             if coerced is not None:
-                out.append(name + "=" + coerced)
+                out.append(coerced)
         return ",".join(out) if out else None
 
     def _to_bool(self, measurement: str, name: str, value: str) -> Optional[str]:
@@ -333,6 +349,22 @@ class SchemaCoercer:
         return "t" if number != 0.0 else "f"
 
     def _to_int(self, measurement: str, name: str, value: str) -> Optional[str]:
+        # Fast path: a value already in LP integer form (optional '-', all
+        # digits, trailing 'i') is the common case for INT/LONG columns from
+        # export-lp. It is already exactly what ILP wants, so skip the
+        # float->int->str round trip (float parsing dominated the coercer's
+        # CPU). lstrip('-') then isdigit() rejects '', '-', floats ('3.7'),
+        # scientific notation, and non-numerics, which all fall through to the
+        # slow, fully-validating path below.
+        if value and (value[-1] == "i" or value[-1] == "I"):
+            digits = value[:-1]
+            mag = digits[1:] if (digits[:1] == "-") else digits
+            # Require canonical form (no leading zeros, except a lone "0") so the
+            # fast path's output is byte-identical to str(int(...)); anything
+            # else (floats, '+', leading zeros, empty) falls through to the slow
+            # path that normalizes and warns as before.
+            if mag.isdigit() and (mag == "0" or mag[0] != "0") and digits != "-0":
+                return digits + "i"
         try:
             number = self._to_number(value)
         except ValueError:
@@ -430,6 +462,27 @@ def merge_stream(
             if feeder is not None:
                 feeder.flush()
 
+    # The source measurement of a head (``measurement,tags``) is the substring
+    # before the first comma -- constant per series and, in this workload, the
+    # same one or two measurements across billions of lines. Cache head ->
+    # (measurement, cols) so the per-line coercion costs a single dict hit (on
+    # the head) instead of a ``head.split(",", 1)[0]`` AND a second schema
+    # lookup. ``cols`` is the per-measurement column map (or None when the
+    # measurement has no schema, i.e. pass tokens through unchanged); resolving
+    # it here lets the loop hand it straight to the coercer's per-token path.
+    head_cols: Dict[str, tuple] = {}
+    _coercer_schema = coercer._schema if coercer is not None else None
+
+    def cols_for_head(head: str) -> tuple:
+        hit = head_cols.get(head)
+        if hit is None:
+            c = head.find(",")
+            meas = head if c < 0 else head[:c]
+            cols = _coercer_schema.get(meas) if _coercer_schema is not None else None
+            hit = (meas, cols)
+            head_cols[head] = hit
+        return hit
+
     if interval_ns:
         cur_bucket: Optional[int] = None
         acc: Dict[str, Dict[str, str]] = {}  # head -> {field_name: "name=value"}
@@ -480,17 +533,32 @@ def merge_stream(
                 # ts is non-decreasing, so the prior bucket is now complete.
                 flush_bucket()
                 cur_bucket = bucket
-            if coercer is not None:
-                tfields = coercer.transform_fields(head.split(",", 1)[0], fields)
-                if tfields is None:
-                    continue
-                fields = tfields
             fmap = acc.get(head)
             if fmap is None:
                 fmap = {}
                 acc[head] = fmap
-            for tok in fields.split(","):
-                fmap[tok.split("=", 1)[0]] = tok
+            # Long-format input (export-lp) puts one field per line, so ``fields``
+            # has no comma in the overwhelmingly common case: coerce and store
+            # the single token directly, skipping the split(",")/join round trip
+            # done for the rare multi-field line.
+            if "," not in fields:
+                if coercer is not None:
+                    meas, cols = cols_for_head(head)
+                    if cols is not None:
+                        fields = coercer._coerce_token(meas, cols, fields)
+                        if fields is None:
+                            continue
+                eq = fields.find("=")
+                fmap[fields if eq < 0 else fields[:eq]] = fields
+            else:
+                if coercer is not None:
+                    meas, _ = cols_for_head(head)
+                    tfields = coercer.transform_fields(meas, fields)
+                    if tfields is None:
+                        continue
+                    fields = tfields
+                for tok in fields.split(","):
+                    fmap[tok.split("=", 1)[0]] = tok
         flush_bucket()
         finish()
         return points, field_lines
@@ -519,7 +587,12 @@ def merge_stream(
         if on_progress is not None and field_lines % 200_000 == 0:
             on_progress(field_lines)
         if coercer is not None:
-            fields = coercer.transform_fields(head.split(",", 1)[0], fields)
+            meas, cols = cols_for_head(head)
+            if "," not in fields:
+                if cols is not None:
+                    fields = coercer._coerce_token(meas, cols, fields)
+            else:
+                fields = coercer.transform_fields(meas, fields)
         key = (head, ts)
         if key != cur_key:
             flush_point()
