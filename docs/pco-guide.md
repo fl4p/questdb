@@ -56,9 +56,30 @@ To make a pco column smaller, reduce the information it carries:
 - **Drop noise bits you do not need** via `PARQUET(PCO, LOSSY(n))` for FLOAT /
   DOUBLE (keep the top `n` mantissa bits). This is the precision lever made
   explicit; it trades a bounded relative error for density.
+- **For wide-dynamic-range positive columns, use a log grid, not a linear one.**
+  A linear `round(x*100)` grid needs huge integers when values span many orders
+  of magnitude (e.g. prices from 1e-6 to 1e6), which defeats the purpose.
+  Storing `round(ln(x) * scale)` as a LONG instead holds a constant *relative*
+  error across the whole range in a compact integer. On real price data this
+  beat both `LOSSY(n)` and a linear grid by ~15-40% (and ~2x at f32-grade
+  precision). Positive values only: zeros and negatives have no real log, so it
+  cannot be used on signed columns (a signed current, a signed trade quantity).
+  It is a client-side pre-transform (decode with `exp`), lossy with a bounded
+  relative error, and -- unlike the delta in Rule 4 -- legitimately additive,
+  because the log is nonlinear and pco does not do it for you. Not a shipped DDL
+  option today; do it at ingestion if it pays for your data.
 
 Precision reduction shrinks pco because it collapses distinct values. Width
 reduction does not, because pco never charged you for the width.
+
+**But precision reduction is not monotonic -- measure it.** Rounding usually
+shrinks pco, but on a signed or noisy column it can *grow* the blob: the
+rounding perturbs the values pco's delta / int-mult detection keys on. Measured:
+a signed, oscillating current column went from 1.090 bytes/value lossless to
+1.306 at `LOSSY` keep=12 -- rounding made it *bigger*. Always compare lossless
+pco against the rounded variant before committing to `LOSSY`; lossless
+frequently wins on signed or noisy data (and the log grid above is unusable
+there anyway).
 
 ## Rule 3 -- Store integer-valued floats as integers
 
@@ -111,7 +132,10 @@ pair `PARQUET(PCO, ZSTD(...))`.
    SHORT *for* pco.
 2. Float that is integer-valued or fixed-precision: store it as `INT`/`LONG` or
    lossless fixed-point, then `PARQUET(PCO)`.
-3. Float that is genuinely fractional and tolerant: `PARQUET(PCO, LOSSY(n))`.
+3. Float that is genuinely fractional and tolerant: `PARQUET(PCO, LOSSY(n))` --
+   but verify it actually shrinks (on signed/noisy columns lossless can win). For
+   a wide-range positive column, a client-side `round(ln(x)*scale)` log grid
+   beats `LOSSY` and a linear grid.
 4. Timestamp / monotonic / sorted: leave at native precision, `PARQUET(PCO)` (or
    the default delta). Don't reduce precision unless you have measured
    sub-second entropy.
