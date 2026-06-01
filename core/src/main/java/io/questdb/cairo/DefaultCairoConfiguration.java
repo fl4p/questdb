@@ -786,6 +786,11 @@ public class DefaultCairoConfiguration implements CairoConfiguration {
     }
 
     @Override
+    public int getPartitionEncoderParquetIntEncoding() {
+        return ParquetEncoding.ENCODING_DEFAULT;
+    }
+
+    @Override
     public double getPartitionEncoderParquetMinCompressionRatio() {
         return 0.0;
     }

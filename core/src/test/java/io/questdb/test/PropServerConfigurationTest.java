@@ -698,6 +698,58 @@ public class PropServerConfigurationTest {
     }
 
     @Test
+    public void testDefaultPartitionEncoderParquetIntEncoding() throws Exception {
+        Properties properties = new Properties();
+
+        // default: leave the encoding choice to the encoder
+        PropServerConfiguration configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_DEFAULT, configuration.getCairoConfiguration().getPartitionEncoderParquetIntEncoding());
+
+        // explicit "default"
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING.getPropertyPath(), "default");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_DEFAULT, configuration.getCairoConfiguration().getPartitionEncoderParquetIntEncoding());
+
+        // plain
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING.getPropertyPath(), "plain");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PLAIN, configuration.getCairoConfiguration().getPartitionEncoderParquetIntEncoding());
+
+        // delta_binary_packed
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING.getPropertyPath(), "delta_binary_packed");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_DELTA_BINARY_PACKED, configuration.getCairoConfiguration().getPartitionEncoderParquetIntEncoding());
+
+        // pco
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING.getPropertyPath(), "pco");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PCO, configuration.getCairoConfiguration().getPartitionEncoderParquetIntEncoding());
+
+        // case-insensitive
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING.getPropertyPath(), "PCO");
+        configuration = newPropServerConfiguration(properties);
+        Assert.assertEquals(ParquetEncoding.ENCODING_PCO, configuration.getCairoConfiguration().getPartitionEncoderParquetIntEncoding());
+
+        // byte_stream_split is valid for FLOAT but not for the integer family - rejected
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING.getPropertyPath(), "byte_stream_split");
+        try {
+            newPropServerConfiguration(properties);
+            Assert.fail("expected ServerConfigurationException for an encoding not valid for the integer family");
+        } catch (ServerConfigurationException e) {
+            TestUtils.assertContains(e.getMessage(), "cairo.partition.encoder.parquet.int.encoding");
+        }
+
+        // garbage - rejected
+        properties.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING.getPropertyPath(), "nope");
+        try {
+            newPropServerConfiguration(properties);
+            Assert.fail("expected ServerConfigurationException for an unknown encoding name");
+        } catch (ServerConfigurationException e) {
+            TestUtils.assertContains(e.getMessage(), "cairo.partition.encoder.parquet.int.encoding");
+        }
+    }
+
+    @Test
     public void testDefaultPartitionEncoderParquetTimestampEncoding() throws Exception {
         Properties properties = new Properties();
 

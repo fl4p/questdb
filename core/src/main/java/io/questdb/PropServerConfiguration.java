@@ -394,6 +394,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final int partitionEncoderParquetCompressionLevel;
     private final int partitionEncoderParquetDataPageSize;
     private final int partitionEncoderParquetFloatEncoding;
+    private final int partitionEncoderParquetIntEncoding;
     private final double partitionEncoderParquetMinCompressionRatio;
     private final long partitionEncoderParquetO3RewriteUnusedMaxBytes;
     private final double partitionEncoderParquetO3RewriteUnusedRatio;
@@ -2187,6 +2188,8 @@ public class PropServerConfiguration implements ServerConfiguration {
         this.partitionEncoderParquetDataPageSize = getInt(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_DATA_PAGE_SIZE, Numbers.SIZE_1MB);
         this.partitionEncoderParquetFloatEncoding = parseParquetFloatEncoding(
                 getString(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING, "default"));
+        this.partitionEncoderParquetIntEncoding = parseParquetIntEncoding(
+                getString(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING, "default"));
         this.partitionEncoderParquetTimestampEncoding = parseParquetTimestampEncoding(
                 getString(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING, "default"));
         this.partitionEncoderParquetMinCompressionRatio = getDouble(properties, env, PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_MIN_COMPRESSION_RATIO, "1.2");
@@ -2519,6 +2522,24 @@ public class PropServerConfiguration implements ServerConfiguration {
                 throw ServerConfigurationException.forInvalidKey(
                         PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING.getPropertyPath(),
                         "expected one of: default, plain, byte_stream_split (bss), pco");
+        }
+    }
+
+    private static int parseParquetIntEncoding(CharSequence name) throws ServerConfigurationException {
+        // Default encoding applied to SHORT/INT/LONG columns on native->Parquet
+        // conversion when they carry no explicit PARQUET(...) encoding.
+        // byte_stream_split is float-only, so it is rejected here.
+        final int id = ParquetEncoding.getEncoding(name);
+        switch (id) {
+            case ParquetEncoding.ENCODING_DEFAULT:
+            case ParquetEncoding.ENCODING_PLAIN:
+            case ParquetEncoding.ENCODING_DELTA_BINARY_PACKED:
+            case ParquetEncoding.ENCODING_PCO:
+                return id;
+            default:
+                throw ServerConfigurationException.forInvalidKey(
+                        PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING.getPropertyPath(),
+                        "expected one of: default, plain, delta_binary_packed, pco");
         }
     }
 
@@ -4212,6 +4233,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public int getPartitionEncoderParquetFloatEncoding() {
             return partitionEncoderParquetFloatEncoding;
+        }
+
+        @Override
+        public int getPartitionEncoderParquetIntEncoding() {
+            return partitionEncoderParquetIntEncoding;
         }
 
         @Override

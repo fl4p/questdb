@@ -368,6 +368,56 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testConvertToParquetIntEncodingDefaultsToPcoViaServerConfig() throws Exception {
+        // cairo.partition.encoder.parquet.int.encoding = pco makes SHORT/INT/LONG columns that
+        // carry no explicit PARQUET(...) encoding default to the pco codec during native-to-Parquet
+        // conversion, mirroring the float.encoding knob. pco is lossless, so values round-trip
+        // exactly; the proof pco was applied is that the file is smaller than the same data plain.
+        // The server-config default is not persisted to the column metadata.
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            // Baseline: standard (plain) encoding for the integer column.
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING, "plain");
+            execute("CREATE TABLE x_plain (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_plain SELECT (x * 7 - 3)::int, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_plain SELECT (x * 7 - 3)::int, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_plain CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long plainSize = parquetFileSize("x_plain");
+
+            // pco default for the integer family.
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_INT_ENCODING, "pco");
+            execute("CREATE TABLE x_pco (v INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_pco SELECT (x * 7 - 3)::int, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_pco SELECT (x * 7 - 3)::int, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_pco CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long pcoSize = parquetFileSize("x_pco");
+
+            Assert.assertTrue(
+                    "pco-encoded INT column should be smaller than plain [pco=" + pcoSize + ", plain=" + plainSize + ']',
+                    pcoSize < plainSize);
+
+            // pco is lossless: the converted partition reads back exactly through the in-table reader.
+            int n = 0;
+            try (
+                    RecordCursorFactory factory = select("SELECT v FROM x_pco WHERE ts < '2024-06-11'", sqlExecutionContext);
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    Assert.assertEquals("row " + n, (n + 1) * 7 - 3, rec.getInt(0));
+                    n++;
+                }
+            }
+            Assert.assertEquals(10_000, n);
+
+            // The server-config default must not be persisted to column metadata.
+            try (TableReader reader = engine.getReader("x_pco")) {
+                Assert.assertEquals("server-config default must not persist to column metadata",
+                        0, reader.getMetadata().getColumnMetadata(0).getParquetEncodingConfig());
+            }
+        });
+    }
+
+    @Test
     public void testConvertToParquetFloatEncodingDefaultsToPcoViaServerConfig() throws Exception {
         // cairo.partition.encoder.parquet.float.encoding = pco makes FLOAT columns that carry
         // no explicit PARQUET(...) encoding default to the pco codec during native-to-Parquet
