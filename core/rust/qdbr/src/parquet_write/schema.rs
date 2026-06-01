@@ -536,16 +536,25 @@ fn default_encoding(data_type: ColumnType, is_designated_timestamp: bool) -> Enc
 }
 
 /// Column type tags that may carry a pco-encoded payload. pco is a fitted
-/// numeric codec, so only fixed-width numeric columns qualify: FLOAT/DOUBLE and
-/// the i64 family (LONG/TIMESTAMP/DATE). This is the single source of truth for
-/// every pco gate -- the write encoder, both PcoEncoded markers (footer QdbMeta
-/// and the `_pm` ColumnFlags sidecar), the compression override, and DDL
-/// validation must all agree, or the reader would misread the blob.
+/// numeric codec, so only fixed-width numeric columns qualify: FLOAT/DOUBLE, the
+/// i64 family (LONG/TIMESTAMP/DATE), and the i32-backed SHORT/INT. This is the
+/// single source of truth for every pco gate -- the write encoder, both
+/// PcoEncoded markers (footer QdbMeta and the `_pm` ColumnFlags sidecar), the
+/// compression override, and DDL validation must all agree, or the reader would
+/// misread the blob.
+///
+/// SHORT and INT both serialize through the i32 Parquet physical type (Parquet
+/// has no INT16): SHORT widens i16 -> i32 in the NOT NULL int encoder, INT runs
+/// the nullable SIMD encoder directly. pco's per-value binning keys off the
+/// actual value range, not the storage width, so widening SHORT to i32 costs
+/// next to nothing in density.
 pub fn is_pco_eligible_tag(tag: ColumnTypeTag) -> bool {
     matches!(
         tag,
         ColumnTypeTag::Float
             | ColumnTypeTag::Double
+            | ColumnTypeTag::Short
+            | ColumnTypeTag::Int
             | ColumnTypeTag::Long
             | ColumnTypeTag::Timestamp
             | ColumnTypeTag::Date
@@ -562,7 +571,8 @@ pub fn is_encoding_valid_for_column_tag(encoding_id: i32, col_type_tag: i32) -> 
         return true;
     }
     if encoding_id as u32 == PCO_ENCODING_ID {
-        // pco is valid for FLOAT/DOUBLE and the i64 family (LONG/TIMESTAMP/DATE).
+        // pco is valid for FLOAT/DOUBLE, SHORT/INT, and the i64 family
+        // (LONG/TIMESTAMP/DATE). See `is_pco_eligible_tag`.
         return matches!(
             ColumnTypeTag::try_from(col_type_tag as u8),
             Ok(tag) if is_pco_eligible_tag(tag)
@@ -1296,10 +1306,12 @@ mod tests {
     #[test]
     fn test_is_encoding_valid_pco_eligible_types() {
         let pco = PCO_ENCODING_ID as i32;
-        // pco is valid for FLOAT/DOUBLE and the i64 family.
+        // pco is valid for FLOAT/DOUBLE, SHORT/INT, and the i64 family.
         for tag in [
             ColumnTypeTag::Float,
             ColumnTypeTag::Double,
+            ColumnTypeTag::Short,
+            ColumnTypeTag::Int,
             ColumnTypeTag::Long,
             ColumnTypeTag::Timestamp,
             ColumnTypeTag::Date,
@@ -1310,11 +1322,12 @@ mod tests {
                 "PCO should be valid for {tag:?}"
             );
         }
-        // pco is rejected for every other type, including the other integers.
+        // pco is rejected for every other type, including the narrower/unsigned
+        // integers that are not yet wired up.
         for tag in [
-            ColumnTypeTag::Int,
-            ColumnTypeTag::Short,
             ColumnTypeTag::Byte,
+            ColumnTypeTag::Char,
+            ColumnTypeTag::IPv4,
             ColumnTypeTag::GeoLong,
             ColumnTypeTag::Symbol,
             ColumnTypeTag::String,

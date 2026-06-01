@@ -38,7 +38,9 @@ public class ParquetEncoding {
     public static final int ENCODING_DELTA_BINARY_PACKED = ENCODING_DELTA_LENGTH_BYTE_ARRAY + 1; // 4
     public static final int ENCODING_BYTE_STREAM_SPLIT = ENCODING_DELTA_BINARY_PACKED + 1; // 5
     // pco is QuestDB's own numeric codec, not a standard Parquet encoding. A pco
-    // column is readable only by QuestDB, so it is opt-in (FLOAT/DOUBLE only).
+    // column is readable only by QuestDB, so it is opt-in. Eligible column types
+    // (FLOAT/DOUBLE, SHORT/INT, LONG/TIMESTAMP/DATE) are decided in Rust; see
+    // is_pco_eligible_tag and isValidForColumnType.
     public static final int ENCODING_PCO = ENCODING_BYTE_STREAM_SPLIT + 1; // 6
     public static final int MAX_ENUM_INT = ENCODING_PCO + 1;
     private static final IntObjHashMap<CharSequence> encodingToNameMap = new IntObjHashMap<>(16);

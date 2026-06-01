@@ -30,6 +30,15 @@ timestamp included), again opt-in via `PARQUET(PCO)` or, for TIMESTAMP, the
 exchange timestamp columns pco is ~2.4x denser than the shipped
 DELTA_BINARY_PACKED+zstd at microsecond precision; see "pco on timestamps" below.
 
+pco is also opt-in for the i32-backed integers `SHORT` and `INT` via
+`PARQUET(PCO)`. Both serialize through the Parquet INT32 physical type (Parquet
+has no INT16): `SHORT` widens i16 -> i32 in the NOT NULL int encoder, `INT` runs
+the nullable codec directly with its i32::MIN NULL preserved. pco bins on the
+actual value range rather than the storage width, so widening `SHORT` costs next
+to nothing in density -- useful when a wide measurement (e.g. millivolt cell
+voltages) is down-cast from `LONG` to `SHORT` before conversion. The narrower
+and unsigned integers (`BYTE`, `CHAR`, `IPv4`, geohashes) are not yet wired up.
+
 ## Summary
 
 Add optional, per-column **lossy** compression for `DOUBLE`/`FLOAT` columns, applied

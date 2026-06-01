@@ -252,8 +252,8 @@ fn simd_segments_to_page<T: SimdEncodable>(
 ) -> ParquetResult<Page> {
     assert_eq!(primitive_type.field_info.repetition, Repetition::Optional);
 
-    // pco can back FLOAT/DOUBLE and the i64 family (LONG/TIMESTAMP/DATE). Gate
-    // on the column tag, not the physical type: this must select exactly the
+    // pco can back FLOAT/DOUBLE, INT, and the i64 family (LONG/TIMESTAMP/DATE).
+    // Gate on the column tag, not the physical type: this must select exactly the
     // same columns as the PcoEncoded marker (see `schema::is_pco_eligible_tag`),
     // or the reader would pco-decode a page that was not pco-encoded.
     let use_pco = crate::parquet_write::schema::is_pco_eligible_tag(columns[0].data_type.tag())
@@ -501,9 +501,10 @@ where
 {
     assert_eq!(primitive_type.field_info.repetition, Repetition::Required);
 
-    // pco on a NOT NULL i64 column (the designated timestamp). Gate on the column
-    // tag, identical to the nullable simd path and the PcoEncoded marker, so the
-    // encode and the marker never disagree. P is i32 or i64 here, both pco Numbers.
+    // pco on a NOT NULL integer column: the designated timestamp (i64) or a
+    // SHORT (i16 widened to P=i32). Gate on the column tag, identical to the
+    // nullable simd path and the PcoEncoded marker, so the encode and the marker
+    // never disagree. P is i32 or i64 here, both pco Numbers.
     let use_pco = crate::parquet_write::schema::is_pco_eligible_tag(columns[0].data_type.tag())
         && columns[0].parquet_encoding_config.is_pco();
 

@@ -38,6 +38,7 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.engine.table.ParquetRowGroupFilter;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
+import io.questdb.std.Numbers;
 import io.questdb.std.Os;
 import io.questdb.std.datetime.microtime.Micros;
 import io.questdb.std.str.LPSZ;
@@ -451,6 +452,44 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
                     Assert.assertEquals("l row " + n, (n + 1L) * 7 - 3, rec.getLong(0));
                     Assert.assertEquals("ts2 row " + n, ts2Base + (long) n * 500_000L, rec.getTimestamp(1));
                     Assert.assertEquals("ts row " + n, tsBase + (long) n * 1_000_000L, rec.getTimestamp(2));
+                    n++;
+                }
+            }
+            Assert.assertEquals(10_000, n);
+        });
+    }
+
+    @Test
+    public void testConvertToParquetPcoOnShortAndIntColumns() throws Exception {
+        // Per-column PARQUET(PCO) extends to the i32-backed integers SHORT and INT.
+        // SHORT widens i16 -> i32 through the NOT NULL int encoder; INT runs the
+        // nullable SIMD encoder. pco is lossless, so both must read back exactly
+        // through the in-table reader (the _pm ColumnFlags PcoEncoded path, distinct
+        // from read_parquet), including the i32::MIN NULL placed in the INT column.
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            execute("CREATE TABLE x (s SHORT PARQUET(PCO), i INT PARQUET(PCO), ts TIMESTAMP) " +
+                    "TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            // INT carries a NULL every 3rd row to exercise the def-level scatter.
+            execute("INSERT INTO x SELECT (x % 1000)::short, " +
+                    "CASE WHEN x % 3 = 0 THEN NULL ELSE (x * 7 - 3)::int END, " +
+                    "timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("ALTER TABLE x CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+
+            // Read the pco-encoded SHORT and INT columns back through the in-table scan.
+            int n = 0;
+            try (
+                    RecordCursorFactory factory = select("SELECT s, i FROM x WHERE ts < '2024-06-11'", sqlExecutionContext);
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    long x = n + 1L;
+                    Assert.assertEquals("s row " + n, (short) (x % 1000), rec.getShort(0));
+                    if (x % 3 == 0) {
+                        Assert.assertEquals("i null row " + n, Numbers.INT_NULL, rec.getInt(1));
+                    } else {
+                        Assert.assertEquals("i row " + n, (int) (x * 7 - 3), rec.getInt(1));
+                    }
                     n++;
                 }
             }
