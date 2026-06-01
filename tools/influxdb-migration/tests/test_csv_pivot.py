@@ -77,6 +77,25 @@ class ValueShapingTests(unittest.TestCase):
         self.assertEqual(csv_pivot._unescape_lp_string('"a \\"q\\" b"'), 'a "q" b')
         self.assertEqual(csv_pivot._unescape_lp_string("3.5"), "3.5")
 
+    def test_value_coercion_matches_questdb_csv(self):
+        d = tempfile.mkdtemp()
+        sink = CsvSink(d, lambda m: None)  # resolver unused for _format_value
+        # bool: t/f/true/false AND numeric 0/1 (the tail data uses 1/0).
+        self.assertEqual(sink._format_value("bool", "t"), "true")
+        self.assertEqual(sink._format_value("bool", "false"), "false")
+        self.assertEqual(sink._format_value("bool", "1"), "true")
+        self.assertEqual(sink._format_value("bool", "0"), "false")
+        self.assertEqual(sink._format_value("bool", "2"), "true")
+        self.assertEqual(sink._format_value("bool", "junk"), "")  # NULL, not bad syntax
+        # int/long: bare, LP 'i' suffix, and scientific notation (problem_code).
+        self.assertEqual(sink._format_value("int", "14728"), "14728")
+        self.assertEqual(sink._format_value("int", "42i"), "42")
+        self.assertEqual(sink._format_value("int", "5.348024557502464e+15"), "5348024557502464")
+        self.assertEqual(sink._format_value("int", "nope"), "")
+        # float: scientific notation passes through; 'i' stripped.
+        self.assertEqual(sink._format_value("float", "2.3082757e+07"), "2.3082757e+07")
+        self.assertEqual(sink._format_value("float", "3i"), "3")
+
     def test_csv_quote(self):
         self.assertEqual(csv_pivot._csv_quote("plain", ","), "plain")
         self.assertEqual(csv_pivot._csv_quote("a,b", ","), '"a,b"')

@@ -219,8 +219,21 @@ class CsvSink:
         return format_ts_iso_ns(ts_ns)
 
     def _format_value(self, kind: str, raw: str) -> str:
-        if kind in ("int", "float"):
+        if kind == "int":
             # Line protocol integers carry a trailing 'i'; CSV wants a bare number.
+            # A source may also emit a float or scientific notation (e.g.
+            # 5.3e+15) for an INT/LONG column, which QuestDB's CSV parser rejects,
+            # so coerce via float->int (matching the ILP SchemaCoercer). A truly
+            # non-numeric value becomes an empty cell (NULL).
+            if raw and raw[-1] in "iI":
+                raw = raw[:-1]
+            try:
+                return str(int(float(raw)))
+            except ValueError:
+                return ""
+        if kind == "float":
+            # QuestDB FLOAT/DOUBLE accepts scientific notation; only shed a stray
+            # integer 'i' suffix.
             if raw and raw[-1] in "iI":
                 raw = raw[:-1]
             return raw
@@ -230,7 +243,12 @@ class CsvSink:
                 return "true"
             if low in ("f", "false"):
                 return "false"
-            return raw
+            # Numeric boolean (0/1, or any number): zero -> false, nonzero -> true.
+            # A non-numeric, non-t/f value becomes an empty cell (NULL).
+            try:
+                return "false" if float(raw) == 0.0 else "true"
+            except ValueError:
+                return ""
         # str / unknown: drop LP string quoting, then RFC-4180 quote for CSV.
         return _csv_quote(_unescape_lp_string(raw), self._delim)
 
