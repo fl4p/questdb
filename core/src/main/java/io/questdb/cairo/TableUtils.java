@@ -1899,15 +1899,17 @@ public final class TableUtils {
                     } else {
                         parquetEncodingConfig = metadata.getColumnMetadata(columnIndex).getParquetEncodingConfig();
                         // Apply the server-configured default encoding (e.g. pco) to columns that
-                        // carry no explicit PARQUET(...) encoding. FLOAT, the SHORT/INT/LONG integer
-                        // family, and TIMESTAMP have separate knobs; DOUBLE, DATE and any
-                        // explicitly-encoded column stay untouched.
+                        // carry no explicit PARQUET(...) encoding. FLOAT/DOUBLE, the SHORT/INT/LONG
+                        // integer family, and TIMESTAMP/DATE have separate knobs; any
+                        // explicitly-encoded column stays untouched.
                         if (!isParquetConfigExplicit(parquetEncodingConfig)) {
                             final int defaultEncoding = switch (ColumnType.tagOf(columnType)) {
-                                case ColumnType.FLOAT -> configuration.getPartitionEncoderParquetFloatEncoding();
+                                case ColumnType.FLOAT, ColumnType.DOUBLE ->
+                                        configuration.getPartitionEncoderParquetFloatEncoding();
                                 case ColumnType.SHORT, ColumnType.INT, ColumnType.LONG ->
                                         configuration.getPartitionEncoderParquetIntEncoding();
-                                case ColumnType.TIMESTAMP -> configuration.getPartitionEncoderParquetTimestampEncoding();
+                                case ColumnType.TIMESTAMP, ColumnType.DATE ->
+                                        configuration.getPartitionEncoderParquetTimestampEncoding();
                                 default -> ParquetEncoding.ENCODING_DEFAULT;
                             };
                             if (defaultEncoding != ParquetEncoding.ENCODING_DEFAULT) {

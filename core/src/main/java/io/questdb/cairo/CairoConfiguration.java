@@ -482,8 +482,8 @@ public interface CairoConfiguration {
     int getPartitionEncoderParquetDataPageSize();
 
     /**
-     * Default Parquet encoding for FLOAT columns during native-to-Parquet partition conversion,
-     * applied only to columns that carry no explicit {@code PARQUET(...)} encoding. Returns one of
+     * Default Parquet encoding for FLOAT and DOUBLE columns during native-to-Parquet partition
+     * conversion, applied only to columns that carry no explicit {@code PARQUET(...)} encoding. Returns one of
      * the {@link io.questdb.griffin.engine.table.parquet.ParquetEncoding} {@code ENCODING_*}
      * constants; {@code ENCODING_DEFAULT} leaves the choice to the encoder (the standard, externally
      * readable layout). {@code ENCODING_PCO} produces a denser but QuestDB-internal column.
@@ -508,8 +508,8 @@ public interface CairoConfiguration {
     int getPartitionEncoderParquetRowGroupSize();
 
     /**
-     * Default Parquet encoding for TIMESTAMP columns during native-to-Parquet partition conversion,
-     * applied only to columns that carry no explicit {@code PARQUET(...)} encoding. Returns one of
+     * Default Parquet encoding for TIMESTAMP and DATE columns during native-to-Parquet partition
+     * conversion, applied only to columns that carry no explicit {@code PARQUET(...)} encoding. Returns one of
      * the {@link io.questdb.griffin.engine.table.parquet.ParquetEncoding} {@code ENCODING_*}
      * constants; {@code ENCODING_DEFAULT} leaves the choice to the encoder (the designated timestamp
      * defaults to DELTA_BINARY_PACKED, externally readable). {@code ENCODING_PCO} produces a denser

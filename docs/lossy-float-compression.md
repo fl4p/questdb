@@ -576,15 +576,18 @@ resolved at conversion time, an explicit per-column setting always wins):
 
 ```properties
 # conf/server.conf (or the QDB_... env var)
-cairo.partition.encoder.parquet.timestamp.encoding=pco   # TIMESTAMP columns
-cairo.partition.encoder.parquet.float.encoding=pco       # FLOAT columns
+cairo.partition.encoder.parquet.float.encoding=pco       # FLOAT and DOUBLE columns
+cairo.partition.encoder.parquet.int.encoding=pco         # SHORT, INT, LONG columns
+cairo.partition.encoder.parquet.timestamp.encoding=pco   # TIMESTAMP and DATE columns
 ```
 
-`timestamp.encoding` accepts `default` (standard DELTA_BINARY_PACKED, externally
-readable), `plain`, `delta_binary_packed`, `pco`. There is no LONG/DATE or DOUBLE
-server default -- use per-column `PARQUET(PCO)` for those. Confirm a conversion
-took with `table_partitions('trades')` (`isParquet`, `parquetFileSize`): a pco
-column is far smaller than the same data stored plain.
+Each knob accepts `default` (the encoder's own choice -- the standard, externally
+readable layout; the designated timestamp's `default` is DELTA_BINARY_PACKED),
+`plain`, `pco`, plus `byte_stream_split`/`bss` (float family) or
+`delta_binary_packed` (int/timestamp family). The three families cover every
+pco-eligible fixed-width type; only DECIMAL still needs per-column `PARQUET(PCO)`.
+Confirm a conversion took with `table_partitions('trades')` (`isParquet`,
+`parquetFileSize`): a pco column is far smaller than the same data stored plain.
 
 ### pco integration (implemented)
 
@@ -617,16 +620,20 @@ validation all consult it, so the encode gate and the marker never disagree.
 Server-level defaults:
 
 - `cairo.partition.encoder.parquet.float.encoding` selects the default encoding
-  for FLOAT columns during native-to-Parquet conversion. Values: `default`
-  (the default -- leaves the choice to the encoder, i.e. the standard
+  for FLOAT and DOUBLE columns during native-to-Parquet conversion. Values:
+  `default` (the default -- leaves the choice to the encoder, i.e. the standard
   interoperable layout), `plain`, `byte_stream_split` (alias `bss`), and `pco`.
-  Set it to `pco` to make FLOAT columns default to pco without an explicit
+  Set it to `pco` to make FLOAT/DOUBLE columns default to pco without an explicit
   `PARQUET(PCO)` on every column.
-- `cairo.partition.encoder.parquet.timestamp.encoding` is the TIMESTAMP sibling.
-  Values: `default` (the encoder's own default -- DELTA_BINARY_PACKED for the
-  designated timestamp, externally readable), `plain`, `delta_binary_packed`, and
-  `pco`. `byte_stream_split` is rejected (it is a float-only encoding). Set it to
-  `pco` to make TIMESTAMP columns default to pco without per-column DDL.
+- `cairo.partition.encoder.parquet.int.encoding` is the SHORT/INT/LONG sibling.
+  Values: `default`, `plain`, `delta_binary_packed`, and `pco`;
+  `byte_stream_split` is rejected (float-only). Set it to `pco` to make the
+  integer family default to pco without per-column DDL.
+- `cairo.partition.encoder.parquet.timestamp.encoding` is the TIMESTAMP/DATE
+  sibling. Values: `default` (the encoder's own default -- DELTA_BINARY_PACKED for
+  the designated timestamp, externally readable), `plain`, `delta_binary_packed`,
+  and `pco`. `byte_stream_split` is rejected (it is a float-only encoding). Set it
+  to `pco` to make TIMESTAMP/DATE columns default to pco without per-column DDL.
 - Each default is applied only to columns of its type that carry no explicit
   `PARQUET(...)` encoding; other columns (e.g. DOUBLE, LONG, explicitly-encoded)
   are untouched. The applied default is not persisted to the column metadata --

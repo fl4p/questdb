@@ -418,6 +418,82 @@ public class AlterTableConvertPartitionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testConvertToParquetDoubleEncodingViaFloatConfig() throws Exception {
+        // float.encoding applies to DOUBLE as well as FLOAT. pco is lossless; the proof it was
+        // applied is the pco file being smaller than the same data encoded plain.
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING, "plain");
+            execute("CREATE TABLE x_plain (d DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_plain SELECT x * 0.1 + 1.0, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_plain SELECT x * 0.1 + 1.0, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_plain CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long plainSize = parquetFileSize("x_plain");
+
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_FLOAT_ENCODING, "pco");
+            execute("CREATE TABLE x_pco (d DOUBLE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_pco SELECT x * 0.1 + 1.0, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_pco SELECT x * 0.1 + 1.0, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_pco CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long pcoSize = parquetFileSize("x_pco");
+
+            Assert.assertTrue(
+                    "pco-encoded DOUBLE column should be smaller than plain [pco=" + pcoSize + ", plain=" + plainSize + ']',
+                    pcoSize < plainSize);
+
+            int n = 0;
+            try (
+                    RecordCursorFactory factory = select("SELECT d FROM x_pco WHERE ts < '2024-06-11'", sqlExecutionContext);
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    Assert.assertEquals("row " + n, (n + 1) * 0.1 + 1.0, rec.getDouble(0), 0.0);
+                    n++;
+                }
+            }
+            Assert.assertEquals(10_000, n);
+        });
+    }
+
+    @Test
+    public void testConvertToParquetDateEncodingViaTimestampConfig() throws Exception {
+        // timestamp.encoding applies to DATE as well as the designated TIMESTAMP. DATE shares the
+        // i64 pco path; pco is lossless, so the DATE column round-trips exactly.
+        assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING, "plain");
+            execute("CREATE TABLE x_plain (d DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_plain SELECT (x * 86_400_000L)::date, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_plain SELECT (x * 86_400_000L)::date, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_plain CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long plainSize = parquetFileSize("x_plain");
+
+            node1.setProperty(PropertyKey.CAIRO_PARTITION_ENCODER_PARQUET_TIMESTAMP_ENCODING, "pco");
+            execute("CREATE TABLE x_pco (d DATE, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO x_pco SELECT (x * 86_400_000L)::date, timestamp_sequence('2024-06-10', 1_000_000L) FROM long_sequence(10_000)");
+            execute("INSERT INTO x_pco SELECT (x * 86_400_000L)::date, timestamp_sequence('2024-06-12', 60_000_000L) FROM long_sequence(10)");
+            execute("ALTER TABLE x_pco CONVERT PARTITION TO PARQUET LIST '2024-06-10'");
+            final long pcoSize = parquetFileSize("x_pco");
+
+            Assert.assertTrue(
+                    "pco-encoded DATE column should be smaller than plain [pco=" + pcoSize + ", plain=" + plainSize + ']',
+                    pcoSize < plainSize);
+
+            int n = 0;
+            try (
+                    RecordCursorFactory factory = select("SELECT d FROM x_pco WHERE ts < '2024-06-11'", sqlExecutionContext);
+                    RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+            ) {
+                final Record rec = cursor.getRecord();
+                while (cursor.hasNext()) {
+                    Assert.assertEquals("row " + n, (n + 1L) * 86_400_000L, rec.getDate(0));
+                    n++;
+                }
+            }
+            Assert.assertEquals(10_000, n);
+        });
+    }
+
+    @Test
     public void testConvertToParquetFloatEncodingDefaultsToPcoViaServerConfig() throws Exception {
         // cairo.partition.encoder.parquet.float.encoding = pco makes FLOAT columns that carry
         // no explicit PARQUET(...) encoding default to the pco codec during native-to-Parquet
