@@ -585,7 +585,10 @@ Each knob accepts `default` (the encoder's own choice -- the standard, externall
 readable layout; the designated timestamp's `default` is DELTA_BINARY_PACKED),
 `plain`, `pco`, plus `byte_stream_split`/`bss` (float family) or
 `delta_binary_packed` (int/timestamp family). The three families cover every
-pco-eligible fixed-width type; only DECIMAL still needs per-column `PARQUET(PCO)`.
+pco-eligible scalar type that has a server default. `DECIMAL32`/`DECIMAL64` are
+also pco-eligible but have no server knob, so they need per-column `PARQUET(PCO)`
+(pco compresses their native unscaled integer, bypassing the big-endian FLBA
+layout). `DECIMAL8`/`16`/`128`/`256` are not eligible.
 Confirm a conversion took with `table_partitions('trades')` (`isParquet`,
 `parquetFileSize`): a pco column is far smaller than the same data stored plain.
 

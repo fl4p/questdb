@@ -273,6 +273,7 @@ fn decode_page_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
             bufs,
             column_type,
             len,
+            is_pco,
             mode,
         ),
         PhysicalType::ByteArray => decode_byte_array_dispatch::<FILTERED, FILL_NULLS>(
@@ -943,6 +944,7 @@ fn decode_int64_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_fixed_len_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
     page: &DataPage,
     dict: Option<&DictPage>,
@@ -950,8 +952,38 @@ fn decode_fixed_len_dispatch<const FILTERED: bool, const FILL_NULLS: bool>(
     bufs: &mut ColumnChunkBuffers,
     column_type: ColumnType,
     len: usize,
+    is_pco: bool,
     mode: DecodeModeContext<'_>,
 ) -> ParquetResult<bool> {
+    // A pco-encoded DECIMAL32/DECIMAL64 column writes its native unscaled integer
+    // as a pco blob behind a PLAIN page header (the big-endian FLBA layout is
+    // bypassed). pco-decode it back into the little-endian column bytes the
+    // PlainPrimitiveDecoder writes, the same i32/i64 path INT/LONG use.
+    if is_pco {
+        match column_type.tag() {
+            ColumnTypeTag::Decimal32 => {
+                clear_aux_buffers(bufs);
+                let reconstructed = pco_decode_to_value_bytes::<i32>(values_buffer)?;
+                decode_page0_mode::<_, FILTERED, FILL_NULLS>(
+                    page,
+                    mode,
+                    &mut PlainPrimitiveDecoder::<i32>::new(&reconstructed, bufs, nulls::DECIMAL32),
+                )?;
+                return Ok(true);
+            }
+            ColumnTypeTag::Decimal64 => {
+                clear_aux_buffers(bufs);
+                let reconstructed = pco_decode_to_value_bytes::<i64>(values_buffer)?;
+                decode_page0_mode::<_, FILTERED, FILL_NULLS>(
+                    page,
+                    mode,
+                    &mut PlainPrimitiveDecoder::<i64>::new(&reconstructed, bufs, nulls::DECIMAL64),
+                )?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
     match (len, column_type.tag()) {
         (16, ColumnTypeTag::Uuid) => match page.encoding() {
             Encoding::Plain => {
@@ -3077,6 +3109,70 @@ mod tests {
                 "short_col",
                 expected_buffs[1].0.data_vec.as_ref(),
                 ColumnTypeTag::Short.into_type(),
+                pco_cfg,
+            ),
+        ];
+
+        assert_columns(
+            row_count,
+            row_group_size,
+            data_page_size,
+            version,
+            columns,
+            &expected_buffs,
+        );
+    }
+
+    #[test]
+    fn test_decode_pco_decimal32_decimal64() {
+        // pco on the i32/i64-backed decimals. The standard path serializes these
+        // as big-endian FixedLenByteArray; pco compresses the native unscaled
+        // integer instead. Exercises encode (PcoDecimalEncode) -> PLAIN page +
+        // PcoEncoded marker -> decode_fixed_len_dispatch pco branch -> scatter
+        // into the i32::MIN / i64::MIN null positions at every other row.
+        use crate::parquet_write::schema::ParquetEncodingConfig;
+        let pco_cfg = ParquetEncodingConfig::new(6, 0, -1).raw();
+
+        #[cfg(miri)]
+        let (row_count, row_group_size, data_page_size) = (100, 10, 10);
+        #[cfg(not(miri))]
+        let (row_count, row_group_size, data_page_size) = (10000, 1000, 1000);
+        let version = Version::V2;
+
+        // precision 9 -> Decimal32 (i32), precision 18 -> Decimal64 (i64).
+        let dec32 = ColumnType::new_decimal(9, 2).unwrap();
+        let dec64 = ColumnType::new_decimal(18, 4).unwrap();
+
+        let expected_buffs: Vec<(ColumnBuffers, ColumnType)> = vec![
+            (
+                create_col_data_buff::<i32, 4, _>(row_count, DECIMAL32_NULL, |v: i32| {
+                    v.to_le_bytes()
+                }),
+                dec32,
+            ),
+            (
+                create_col_data_buff::<i64, 8, _>(row_count, DECIMAL64_NULL, |v: i64| {
+                    v.to_le_bytes()
+                }),
+                dec64,
+            ),
+        ];
+
+        let columns = vec![
+            create_fix_column_with_config(
+                0,
+                row_count,
+                "dec32_col",
+                expected_buffs[0].0.data_vec.as_ref(),
+                dec32,
+                pco_cfg,
+            ),
+            create_fix_column_with_config(
+                1,
+                row_count,
+                "dec64_col",
+                expected_buffs[1].0.data_vec.as_ref(),
+                dec64,
                 pco_cfg,
             ),
         ];

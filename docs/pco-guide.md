@@ -3,7 +3,8 @@
 pco is QuestDB's fitted numeric codec, opt-in per column via `PARQUET(PCO)`. It
 applies **only on the native -> Parquet conversion path** (converted partitions),
 never to the native `.d` hot store, and a pco column is readable only by QuestDB.
-Eligible types: `FLOAT`, `DOUBLE`, `SHORT`, `INT`, `LONG`, `TIMESTAMP`, `DATE`.
+Eligible types: `FLOAT`, `DOUBLE`, `SHORT`, `INT`, `LONG`, `TIMESTAMP`, `DATE`,
+and `DECIMAL32`/`DECIMAL64` (per-column `PARQUET(PCO)` only -- no server default).
 
 This guide is the practical model for *when pco helps and how to feed it*. It is
 general; the numbers cited are illustrative measurements, not a dataset report.

@@ -537,17 +537,22 @@ fn default_encoding(data_type: ColumnType, is_designated_timestamp: bool) -> Enc
 
 /// Column type tags that may carry a pco-encoded payload. pco is a fitted
 /// numeric codec, so only fixed-width numeric columns qualify: FLOAT/DOUBLE, the
-/// i64 family (LONG/TIMESTAMP/DATE), and the i32-backed SHORT/INT. This is the
-/// single source of truth for every pco gate -- the write encoder, both
-/// PcoEncoded markers (footer QdbMeta and the `_pm` ColumnFlags sidecar), the
-/// compression override, and DDL validation must all agree, or the reader would
-/// misread the blob.
+/// i64 family (LONG/TIMESTAMP/DATE), the i32-backed SHORT/INT, and the i32/i64
+/// DECIMAL32/DECIMAL64. This is the single source of truth for every pco gate --
+/// the write encoder, both PcoEncoded markers (footer QdbMeta and the `_pm`
+/// ColumnFlags sidecar), the compression override, and DDL validation must all
+/// agree, or the reader would misread the blob.
 ///
 /// SHORT and INT both serialize through the i32 Parquet physical type (Parquet
 /// has no INT16): SHORT widens i16 -> i32 in the NOT NULL int encoder, INT runs
 /// the nullable SIMD encoder directly. pco's per-value binning keys off the
 /// actual value range, not the storage width, so widening SHORT to i32 costs
 /// next to nothing in density.
+///
+/// DECIMAL32/DECIMAL64 normally serialize as big-endian FixedLenByteArray, but
+/// pco compresses their native unscaled integer (i32/i64) directly and the
+/// reader scatters it back into the LE column -- the BE FLBA format is bypassed
+/// for pco columns. DECIMAL8/16/128/256 are not eligible.
 pub fn is_pco_eligible_tag(tag: ColumnTypeTag) -> bool {
     matches!(
         tag,
@@ -558,6 +563,8 @@ pub fn is_pco_eligible_tag(tag: ColumnTypeTag) -> bool {
             | ColumnTypeTag::Long
             | ColumnTypeTag::Timestamp
             | ColumnTypeTag::Date
+            | ColumnTypeTag::Decimal32
+            | ColumnTypeTag::Decimal64
     )
 }
 
@@ -1315,6 +1322,8 @@ mod tests {
             ColumnTypeTag::Long,
             ColumnTypeTag::Timestamp,
             ColumnTypeTag::Date,
+            ColumnTypeTag::Decimal32,
+            ColumnTypeTag::Decimal64,
         ] {
             assert!(is_pco_eligible_tag(tag), "{tag:?} should be pco-eligible");
             assert!(
@@ -1332,6 +1341,10 @@ mod tests {
             ColumnTypeTag::Symbol,
             ColumnTypeTag::String,
             ColumnTypeTag::Boolean,
+            ColumnTypeTag::Decimal8,
+            ColumnTypeTag::Decimal16,
+            ColumnTypeTag::Decimal128,
+            ColumnTypeTag::Decimal256,
         ] {
             assert!(
                 !is_pco_eligible_tag(tag),

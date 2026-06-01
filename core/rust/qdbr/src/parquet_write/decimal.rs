@@ -183,6 +183,50 @@ native!(Decimal16, i16);
 native!(Decimal32, i32);
 native!(Decimal64, i64);
 
+/// pco compression of a decimal column's native unscaled integers. Only
+/// DECIMAL32 (i32) and DECIMAL64 (i64) are pco-eligible (see
+/// `schema::is_pco_eligible_tag`); the other widths return Unsupported and are
+/// never reached, since the encode gate keys off the same eligibility helper.
+/// pco compresses the inner integer directly, bypassing the big-endian FLBA
+/// layout `to_bytes` produces for the standard path.
+pub trait PcoDecimalEncode: Sized {
+    fn pco_compress_non_null(values: &[Self]) -> crate::parquet::error::ParquetResult<Vec<u8>>;
+}
+
+impl PcoDecimalEncode for Decimal32 {
+    fn pco_compress_non_null(values: &[Self]) -> crate::parquet::error::ParquetResult<Vec<u8>> {
+        let inner: Vec<i32> = values.iter().map(|d| d.0).collect();
+        crate::parquet::pco_codec::compress(&inner)
+    }
+}
+
+impl PcoDecimalEncode for Decimal64 {
+    fn pco_compress_non_null(values: &[Self]) -> crate::parquet::error::ParquetResult<Vec<u8>> {
+        let inner: Vec<i64> = values.iter().map(|d| d.0).collect();
+        crate::parquet::pco_codec::compress(&inner)
+    }
+}
+
+macro_rules! pco_decimal_unsupported {
+    ($type:ty) => {
+        impl PcoDecimalEncode for $type {
+            fn pco_compress_non_null(
+                _values: &[Self],
+            ) -> crate::parquet::error::ParquetResult<Vec<u8>> {
+                Err(crate::parquet::error::fmt_err!(
+                    Unsupported,
+                    "pco is only supported for DECIMAL32 and DECIMAL64"
+                ))
+            }
+        }
+    };
+}
+
+pco_decimal_unsupported!(Decimal8);
+pco_decimal_unsupported!(Decimal16);
+pco_decimal_unsupported!(Decimal128);
+pco_decimal_unsupported!(Decimal256);
+
 #[cfg(test)]
 mod tests {
     use super::*;

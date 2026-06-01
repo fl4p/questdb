@@ -187,7 +187,7 @@ pub fn encode_decimal<T>(
     bloom_set: Option<Arc<Mutex<HashSet<u64>>>>,
 ) -> ParquetResult<Vec<Page>>
 where
-    T: Nullable + NativeType + Debug + Copy,
+    T: Nullable + NativeType + Debug + Copy + crate::parquet_write::decimal::PcoDecimalEncode,
 {
     let rows_per_page = rows_per_primitive_page(&options, primitive_type.physical_type);
     encode_column_chunk(
@@ -679,9 +679,16 @@ fn decimal_segments_to_page<T>(
     mut bloom_hashes: Option<&mut HashSet<u64>>,
 ) -> ParquetResult<Page>
 where
-    T: Nullable + NativeType + Debug + 'static,
+    T: Nullable + NativeType + Debug + 'static + crate::parquet_write::decimal::PcoDecimalEncode,
 {
     assert_eq!(primitive_type.field_info.repetition, Repetition::Optional);
+
+    // pco can back DECIMAL32/DECIMAL64. Gate on the column tag, identical to the
+    // PcoEncoded marker (see `schema::is_pco_eligible_tag`), so the encode and
+    // the marker never disagree. pco compresses the native unscaled integer, not
+    // the big-endian FLBA bytes `to_bytes` would emit.
+    let use_pco = crate::parquet_write::schema::is_pco_eligible_tag(columns[0].data_type.tag())
+        && columns[0].parquet_encoding_config.is_pco();
 
     let num_rows = window.row_count;
     let mut validity = FlatValidity::new();
@@ -713,7 +720,15 @@ where
     let null_count = def_levels.null_count;
     let definition_levels_byte_length = def_levels.definition_levels_byte_length;
 
-    // Pass 2: append present values, updating stats/bloom.
+    // Pass 2: append present values, updating stats/bloom. A pco column (page
+    // header still reads PLAIN) collects the present values and emits one pco
+    // blob of their native integers; the reader pco-decodes and scatters via the
+    // definition levels. The standard path appends big-endian FLBA bytes.
+    let mut pco_values: Vec<T> = if use_pco {
+        Vec::with_capacity(num_rows - null_count)
+    } else {
+        Vec::new()
+    };
     // SAFETY: Column data originates from JNI/Java memory-mapped buffers.
     let views_pass2 = unsafe {
         page_chunk_views::<T>(columns, first_partition_start, last_partition_end, window)
@@ -727,9 +742,17 @@ where
                 if let Some(ref mut h) = bloom_hashes {
                     h.insert(hash_native(value));
                 }
-                buffer.extend_from_slice(value.to_bytes().as_ref());
+                if use_pco {
+                    pco_values.push(value);
+                } else {
+                    buffer.extend_from_slice(value.to_bytes().as_ref());
+                }
             }
         }
+    }
+
+    if use_pco {
+        buffer.extend_from_slice(&T::pco_compress_non_null(&pco_values)?);
     }
 
     let statistics = if options.write_statistics {
