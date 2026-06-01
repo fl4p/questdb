@@ -281,7 +281,121 @@ fn run_dataset(title: &str, data: &[f64]) {
             rmax,
             rmean,
         );
+
+        // log-quantize -> pco(i64): the arctic LnQ transform. Only meaningful
+        // for the lossy rows; at full precision there is no quantization grid.
+        if spec.keep < 52 {
+            let (q, _clamped) = log_quantize(data, spec.keep);
+            let deq = log_dequantize(&q, spec.keep);
+            let (lmax, lmean) = rel_error(data, &deq);
+            let (lb, le, ld) = bench_pco(&q);
+            let lbpv = lb as f64 / q.len() as f64;
+            println!(
+                "| logQ+pco | {} | {} | pco-8(i64) | {:.3} | {:.2}x | {:.1} | {:.1} | {:.2e} | {:.2e} |",
+                keep_disp,
+                implied,
+                lbpv,
+                8.0 / lbpv,
+                le,
+                ld,
+                lmax,
+                lmean,
+            );
+        }
     }
+
+    // Arctic LnQ30pco reference row: fixed ~229 ppm error, independent of the
+    // keep_bits grid above, so it is reported once per dataset.
+    let (q, _bad) = lnq30_quantize(data);
+    let deq = lnq30_dequantize(&q);
+    let (lmax, lmean) = rel_error(data, &deq);
+    let (lb, le, ld) = bench_pco(&q);
+    let lbpv = lb as f64 / q.len() as f64;
+    println!(
+        "| LnQ30pco | ~229ppm | 2.29e-4 | pco-8(i64) | {:.3} | {:.2}x | {:.1} | {:.1} | {:.2e} | {:.2e} |",
+        lbpv,
+        8.0 / lbpv,
+        le,
+        ld,
+        lmax,
+        lmean,
+    );
+}
+
+/// Quantize positive values onto a uniform natural-log grid with step `2^-keep`:
+/// `q = round(ln(x) * 2^keep)`. The reconstruction `x ~= exp(q / 2^keep)` has a
+/// relative error of ~`2^-(keep+1)` -- the SAME bound as the keep-bit mantissa
+/// rounding the shipped path uses -- but the quantized stream is an i64 whose
+/// successive differences are small for a geometric (log-random-walk) series, so
+/// pco's integer delta+binning captures the structure directly. This is a
+/// domain-specific transform: it only applies to strictly positive columns
+/// (prices, quantities, volumes). Non-positive inputs are clamped to a tiny
+/// epsilon here so the bench never produces +/-inf; a production codec would
+/// reject or sign-split them. Returns the quantized stream and the count of
+/// inputs that needed clamping (0 for clean positive data).
+fn log_quantize(data: &[f64], keep: u32) -> (Vec<i64>, usize) {
+    let scale = (1u64 << keep) as f64;
+    let mut clamped = 0usize;
+    let q = data
+        .iter()
+        .map(|&x| {
+            let x = if x > 0.0 {
+                x
+            } else {
+                clamped += 1;
+                1e-300
+            };
+            (x.ln() * scale).round() as i64
+        })
+        .collect();
+    (q, clamped)
+}
+
+/// Inverse of [`log_quantize`]: `x = exp(q / 2^keep)`.
+fn log_dequantize(q: &[i64], keep: u32) -> Vec<f64> {
+    let inv = 1.0 / (1u64 << keep) as f64;
+    q.iter().map(|&v| (v as f64 * inv).exp()).collect()
+}
+
+/// Prescale and pre-add for the arctic LnQ30pco codec.
+const LNQ30_PRESCALE: f64 = (1u64 << 20) as f64; // log_prescale = 20
+const LNQ30_PREADD: f64 = 1e-12; // loq_preadd
+/// Quantization scale S = 2^16 / loss, loss = 30.
+const LNQ30_SCALE: f64 = 65536.0 / 30.0;
+
+/// Arctic `LnQ30pco` = `LnQ16_pco(loq_loss=30, log_prescale=20, loq_preadd=1e-12)`
+/// (registered in the TickStore as the write-once/read-many price codec):
+/// `q = round(ln(x * 2^20 + 1e-12) * 2^16/30)`. loss=30 sets the scale and so the
+/// inherent max relative error (~`loss/2^17` ~= 229 ppm), between keep=11 (244 ppm)
+/// and keep=12 (122 ppm). The `*2^20` is a constant offset in log space (invisible
+/// to pco's delta); `+1e-12` floors the log argument so exact zeros round-trip
+/// (`exp(ln(1e-12)) - 1e-12 = 0`). Negative inputs still fall outside the log
+/// domain -- arctic carries signed quantities with a separate sign-split codec
+/// (`LnQ15pcoS`). Returns the quantized stream and the count of clamped inputs.
+fn lnq30_quantize(data: &[f64]) -> (Vec<i64>, usize) {
+    let mut bad = 0usize;
+    let q = data
+        .iter()
+        .map(|&x| {
+            let z = x * LNQ30_PRESCALE + LNQ30_PREADD;
+            let z = if z > 0.0 {
+                z
+            } else {
+                bad += 1;
+                LNQ30_PREADD
+            };
+            (z.ln() * LNQ30_SCALE).round() as i64
+        })
+        .collect();
+    (q, bad)
+}
+
+/// Inverse of [`lnq30_quantize`]: `x = (exp(q / S) - 1e-12) / 2^20`.
+fn lnq30_dequantize(q: &[i64]) -> Vec<f64> {
+    let inv = 1.0 / LNQ30_SCALE;
+    q.iter()
+        .map(|&v| ((v as f64 * inv).exp() - LNQ30_PREADD) / LNQ30_PRESCALE)
+        .collect()
 }
 
 /// Compress with pco (level 8) and round-trip-decompress for timing+correctness.
@@ -480,7 +594,53 @@ fn run_real_dataset(name: &str, data: &[f32]) {
             pd,
             rmax,
         );
+
+        // log-quantize -> pco(i64): the arctic LnQ transform on real px/qty.
+        // Compares against the shipped round->pco at the same error bound.
+        let data64: Vec<f64> = data.iter().map(|&x| x as f64).collect();
+        let (q, clamped) = log_quantize(&data64, keep);
+        let deq = log_dequantize(&q, keep);
+        let (lmax, _) = rel_error(&data64, &deq);
+        let (lb, le, ld) = bench_pco(&q);
+        let lbpv = lb as f64 / q.len() as f64;
+        let note = if clamped > 0 {
+            format!(" ({clamped} non-pos clamped)")
+        } else {
+            String::new()
+        };
+        println!(
+            "| {} | logQ+pco(i64){} | {:.3} | {:.2}x | {:.1} | {:.1} | {:.2e} |",
+            keep_disp,
+            note,
+            lbpv,
+            4.0 / lbpv,
+            le,
+            ld,
+            lmax,
+        );
     }
+
+    // Arctic LnQ30pco reference row: fixed ~229 ppm, independent of keep_bits.
+    let data64: Vec<f64> = data.iter().map(|&x| x as f64).collect();
+    let (q, bad) = lnq30_quantize(&data64);
+    let deq = lnq30_dequantize(&q);
+    let (lmax, _) = rel_error(&data64, &deq);
+    let (lb, le, ld) = bench_pco(&q);
+    let lbpv = lb as f64 / q.len() as f64;
+    let note = if bad > 0 {
+        format!(" ({bad} non-pos clamped)")
+    } else {
+        String::new()
+    };
+    println!(
+        "| ~229ppm | LnQ30pco(arctic){} | {:.3} | {:.2}x | {:.1} | {:.1} | {:.2e} |",
+        note,
+        lbpv,
+        4.0 / lbpv,
+        le,
+        ld,
+        lmax,
+    );
 }
 
 fn rel_error_f32(orig: &[f32], rounded: &[f32]) -> (f64, f64) {
@@ -515,6 +675,33 @@ fn run_pco_real_bench() {
     files.sort();
     if files.is_empty() {
         println!("(no /tmp/real_*.npy files found; skipping)");
+        return;
+    }
+    for f in files {
+        match load_npy_f32(&f) {
+            Some(data) if !data.is_empty() => run_real_dataset(&f, &data),
+            _ => println!("\n## {f}  (could not load; skipped)"),
+        }
+    }
+}
+
+#[test]
+#[ignore = "benchmark; needs /tmp/real_bms_*.npy; run in release with --ignored --nocapture"]
+fn run_pco_bms_bench() {
+    // Same comparison as run_pco_real_bench but scoped to the BMS columns
+    // exported by load_bms_device.py (real_bms_<device>_<col>.npy), so it does
+    // not re-run the multi-GB crypto sweep.
+    println!("\n# BMS columns: round -> BSS+zstd (shipped) vs round -> pco vs logQ/LnQ30pco");
+    let mut files: Vec<String> = std::fs::read_dir("/tmp")
+        .expect("read /tmp")
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("real_bms_") && n.ends_with(".npy"))
+        .map(|n| format!("/tmp/{n}"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        println!("(no /tmp/real_bms_*.npy files found; run load_bms_device.py --npy first)");
         return;
     }
     for f in files {
@@ -802,6 +989,130 @@ fn run_pco_timestamp_bench() {
         match load_i64_raw(&f) {
             Some(data) if data.len() > 1 => run_timestamp_dataset(&f, &data),
             _ => println!("\n## {f}  (could not load; skipped)"),
+        }
+    }
+}
+
+/// Build a sparse f64 column: `present` values are scattered into a length-`total`
+/// column, the rest are NaN (QuestDB's DOUBLE null sentinel, which the encoder
+/// stores as a Parquet null -- definition level 0 -- not a data value). This is
+/// the "rowmask" scenario: only present values reach the value buffer; nulls cost
+/// a bit in the RLE/bit-packed definition-level bitmap. `clustered` puts the nulls
+/// in contiguous runs (a field that updates in bursts), where the bitmap RLE wins;
+/// otherwise nulls are Bernoulli-random, the bitmap's worst case. Returns the
+/// column and its present (non-null) count.
+fn make_sparse(
+    present: &[f64],
+    total: usize,
+    null_frac: f64,
+    clustered: bool,
+) -> (Vec<f64>, usize) {
+    let mut out: Vec<f64> = Vec::with_capacity(total);
+    let mut pi = 0usize;
+    if null_frac <= 0.0 {
+        for _ in 0..total {
+            out.push(present[pi % present.len()]);
+            pi += 1;
+        }
+    } else if clustered {
+        // Alternating runs: a present run of 50, then a null run sized to hit the
+        // target fraction. Many runs across the column, not one big block.
+        let present_run = 50usize;
+        let null_run =
+            (((present_run as f64) * null_frac / (1.0 - null_frac)).round() as usize).max(1);
+        while out.len() < total {
+            for _ in 0..present_run {
+                if out.len() >= total {
+                    break;
+                }
+                out.push(present[pi % present.len()]);
+                pi += 1;
+            }
+            for _ in 0..null_run {
+                if out.len() >= total {
+                    break;
+                }
+                out.push(f64::NAN);
+            }
+        }
+    } else {
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        for _ in 0..total {
+            if rng.random::<f64>() < null_frac {
+                out.push(f64::NAN);
+            } else {
+                out.push(present[pi % present.len()]);
+                pi += 1;
+            }
+        }
+    }
+    let present_count = out.iter().filter(|v| !v.is_nan()).count();
+    (out, present_count)
+}
+
+#[test]
+#[ignore = "benchmark; run in release with --ignored --nocapture"]
+fn run_rowmask_bench() {
+    // Smaller than the codec benches: this runs 21 full write+read cycles, and the
+    // ratio we care about (bytes/row vs sparsity) is size-stable well below 1M.
+    const ROWMASK_N: usize = 200_000;
+    println!("\n# Rowmask (sparse-column) compression: nulls as Parquet def levels");
+    println!("Present values are a price-like random walk; nulls are NaN (def level 0).");
+    println!("total rows = {ROWMASK_N}. bytes/row over ALL rows; bytes/present over non-nulls.");
+
+    let present = &gen_price_like(0xC0FFEE)[..ROWMASK_N];
+    let uncompressed = &CODECS[0];
+    let zstd = CODECS.iter().find(|c| c.name == "zstd").unwrap();
+
+    // (label, encoding id, codec)
+    let variants: &[(&str, i32, &Codec)] = &[
+        ("pco", 6, uncompressed),
+        ("bss+zstd", 5, zstd),
+        ("plain+zstd", 1, zstd),
+    ];
+
+    println!("\n| null% | pattern | encoding | total bytes | bytes/row | bytes/present |");
+    println!("|---|---|---|---|---|---|");
+    for &null_frac in &[0.0_f64, 0.5, 0.9, 0.99] {
+        for &clustered in &[false, true] {
+            let pattern = if null_frac == 0.0 {
+                "dense"
+            } else if clustered {
+                "clustered"
+            } else {
+                "random"
+            };
+            let (col, present_count) = make_sparse(present, ROWMASK_N, null_frac, clustered);
+            for (label, enc_id, codec) in variants {
+                let (bytes, _) = encode_to_parquet(&col, *enc_id, codec);
+                // Only the standard encodings are arrow-decodable; a pco page is a
+                // blob behind a PLAIN header that arrow cannot read. pco round-trip
+                // is covered by the dedicated decode tests via QuestDB's decoder, so
+                // here we only need the encoded size.
+                if *enc_id != 6 {
+                    let (cnt, _) = decode_from_parquet(&bytes);
+                    assert_eq!(cnt, ROWMASK_N);
+                }
+                let bpr = bytes.len() as f64 / ROWMASK_N as f64;
+                let bpp = if present_count > 0 {
+                    bytes.len() as f64 / present_count as f64
+                } else {
+                    0.0
+                };
+                println!(
+                    "| {:.0} | {} | {} | {} | {:.3} | {:.3} |",
+                    null_frac * 100.0,
+                    pattern,
+                    label,
+                    bytes.len(),
+                    bpr,
+                    bpp
+                );
+            }
+            // dense has no null pattern variants; emit once.
+            if null_frac == 0.0 {
+                break;
+            }
         }
     }
 }
