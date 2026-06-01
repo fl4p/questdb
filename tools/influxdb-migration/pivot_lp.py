@@ -463,6 +463,19 @@ def merge_stream(
                 on_progress(field_lines)
             if cur_bucket is None:
                 cur_bucket = bucket
+            elif bucket < cur_bucket:
+                # Downsample's single-open-bucket merge is ONLY correct when the
+                # input timestamps are non-decreasing. A regression means the
+                # input is not time-sorted (e.g. raw series-major export-lp fed
+                # straight in). Without this guard the merge silently emits one
+                # fragmented row per field instead of one merged row per bucket
+                # -- corruption with no error. Fail loudly instead.
+                raise ValueError(
+                    "downsample requires timestamp-sorted input, but timestamp %s "
+                    "falls before the open bucket %d. Sort the export first "
+                    "(timestamp-major), e.g. the awk-prepend sort in "
+                    "import_batmon_copy.sh." % (ts, cur_bucket)
+                )
             elif bucket != cur_bucket:
                 # ts is non-decreasing, so the prior bucket is now complete.
                 flush_bucket()

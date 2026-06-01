@@ -249,6 +249,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     interval_ns = parse_interval_ns(args.downsample)
     if interval_ns:
         log.info("downsampling to a fixed %s grid (last value per field per bucket)", args.downsample)
+        if not args.assume_sorted:
+            log.warning(
+                "downsample requires TIMESTAMP-SORTED input. The raw export-lp is "
+                "series-major, so sort it first (timestamp-major, e.g. the "
+                "awk-prepend sort in import_batmon_copy.sh) and pass "
+                "--assume-sorted. The pivot aborts if it sees unsorted input."
+            )
 
     if not args.from_stdin and not args.lp_file and not args.database:
         log.error("a source is required: --from-stdin, --lp-file, or --database (+ --datadir/--waldir)")
@@ -443,6 +450,13 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         action="store_true",
         help="omit DEDUP UPSERT KEYS when pre-creating (default: add it for "
         "idempotent resumes).",
+    )
+    p.add_argument(
+        "--assume-sorted",
+        action="store_true",
+        help="acknowledge the input is already timestamp-sorted (downsample "
+        "requires it). Without this, a reminder is logged; the pivot aborts "
+        "loudly either way if it detects unsorted input.",
     )
     p.add_argument("--keep-csv", action="store_true", help="keep staged CSVs after COPY")
     p.add_argument("--poll-secs", type=float, default=2.0, help="COPY status poll interval")

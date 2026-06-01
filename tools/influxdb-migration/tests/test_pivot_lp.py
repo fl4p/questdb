@@ -157,6 +157,19 @@ class DownsampleNoLookaheadTests(unittest.TestCase):
         merge_stream(lines, "", feeder, interval_ns=100)
         self.assertEqual(feeder.lines, ["m,t=a v=1 200", "m,t=a v=9 300"])
 
+    def test_unsorted_input_aborts(self):
+        # Downsample's single-open-bucket merge is only correct on time-sorted
+        # input. A timestamp that regresses to an earlier bucket (e.g. raw
+        # series-major export-lp fed straight in) must abort loudly, not silently
+        # emit fragmented rows.
+        lines = [
+            "m,t=a voltage=1 250",  # bucket [200,300)
+            "m,t=a current=2 120",  # regresses to [100,200) -> abort
+        ]
+        feeder = _CountingFeeder()
+        with self.assertRaises(ValueError):
+            merge_stream(lines, "", feeder, interval_ns=100)
+
 
 class WalThrottlePendingTests(unittest.TestCase):
     def _throttle_with(self, dataset, prefix="p_", batch_size=10_000):

@@ -140,24 +140,31 @@ type carrying a comma (e.g. `DECIMAL(10,2)`) is not supported.
 
 For a one-shot historical backfill, `bulk_copy.py` is the fastest path. Instead of
 feeding ILP-over-HTTP, it pivots the export into one wide **CSV per measurement**
-and hands each file to QuestDB's parallel `COPY`. This exploits how both databases
-store data: the export is series-major (one field per line), and `COPY`
-(`ParallelCsvFileImporter`) is built for **unordered** CSV — it sorts each
-partition by timestamp in parallel and writes column files directly. The effect:
+and hands each file to QuestDB's parallel `COPY` (`ParallelCsvFileImporter`), which
+writes column files directly. Versus the ILP path this drops:
 
-- **No global external sort.** `COPY` does the per-partition sort itself, so the
-  expensive `sort -S 1G` of the whole export is gone. The pivot writes rows in any
-  order.
-- **No ILP re-parse, no WAL throttle, no O3 rewrites.** `COPY` bypasses the WAL
-  sequencer and out-of-order partition rewrites entirely.
+- **The ILP re-parse, the WAL sequencer, O3 partition rewrites, and the WAL-apply
+  throttle.** `COPY` writes columns directly and sorts each partition itself.
 - **Idempotent resumes.** Pre-created tables carry `DEDUP UPSERT KEYS(timestamp,
   <tags>)`, so a re-run or resume cannot duplicate rows.
 
+**The timestamp sort stays.** `COPY` sorts each *partition* for its own column
+writes, but that is not a substitute for the pivot's pre-merge sort: the downsample
+pivot merges all fields of a `(tagset, bucket)` into one row using a single open
+bucket, which is only correct when the input is timestamp-sorted. The raw export-lp
+is series-major (each field's full time-series contiguous), so it **must** be
+sorted first — exactly as in `import_batmon.sh`. Verified on the real bucket: sorted
+input reproduces the production table exactly; unsorted input produced ~12x too many
+fragmented rows, so the pivot now **aborts loudly** on unsorted input rather than
+corrupting.
+
 ```bash
-# v2 bucket piped in, downsampled to 20s, schema from a CREATE TABLE file
+# v2 bucket piped in, sorted timestamp-major, downsampled to 20s
 influxd inspect export-lp --bucket-id B --engine-path /data/engine --output-path - \
   | grep -E '^(batmon|cells),' \
-  | python3 bulk_copy.py --from-stdin --prefix batmon_tele_ --downsample 20s \
+  | awk '{print $NF"\t"$0}' | LC_ALL=C sort -S 1G -k1,1n | cut -f2- \
+  | python3 bulk_copy.py --from-stdin --assume-sorted \
+      --prefix batmon_tele_ --downsample 20s \
       --schema-file tm-tables.sql --copy-root /var/lib/questdb/import \
       --questdb-url http://localhost:9000 --user admin --password secret
 ```
@@ -180,13 +187,11 @@ into a `TIMESTAMP_NS` column via `FORMAT 'yyyy-MM-ddTHH:mm:ss.SSSUUUNNNZ'`; for 
 microsecond `TIMESTAMP` column use `--copy-timestamp-format
 'yyyy-MM-ddTHH:mm:ss.SSSUUUZ'`.
 
-**Before relying on the no-global-sort pivot**, run `verify_series_major.sh` on a
-sample export to confirm it is series-major (every measurement+tagset contiguous).
-If it is not, keep the `awk`-prepend sort from `import_batmon.sh` ahead of the
-pivot — `COPY` still sorts each partition, so the main win holds either way.
-`import_batmon_copy.sh` is a ready-to-edit runbook. Keep the ILP path
-(`pivot_lp.py`) for small incremental top-ups, deduplicated on the overlap by the
-table's `DEDUP UPSERT KEYS`.
+`import_batmon_copy.sh` is a ready-to-edit runbook (export | grep | awk-prepend
+sort | `bulk_copy.py`). `verify_series_major.sh` reports whether an export is
+series-major if you want to understand its ordering, but the sort is required
+regardless. Keep the ILP path (`pivot_lp.py`) for small incremental top-ups,
+deduplicated on the overlap by the table's `DEDUP UPSERT KEYS`.
 
 ## Artifacts (the ACL seam)
 
