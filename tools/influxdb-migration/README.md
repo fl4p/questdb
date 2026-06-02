@@ -162,6 +162,12 @@ input reproduces the production table exactly; unsorted input produced ~12x too 
 fragmented rows, so the pivot now **aborts loudly** on unsorted input rather than
 corrupting.
 
+For why `export-lp` is series-major, why its cost is decode-bound (the per-call
+fixed cost is ~1 s, not the ~80 s once assumed), why `--start/--end` windows
+output without pruning shard reads, and why v2 has no per-shard dump, see
+[`export-lp-cost-model.md`](export-lp-cost-model.md) (verified against InfluxDB
+`v2.7.11` source and measured on the batmon bucket).
+
 ```bash
 # v2 bucket piped in, sorted timestamp-major, downsampled to 20s
 influxd inspect export-lp --bucket-id B --engine-path /data/engine --output-path - \
@@ -215,19 +221,30 @@ and the gap grows with scale. ILP's line generation is lighter and, on pre-sorte
 input, WAL apply keeps up. So COPY's column-write ceiling only surfaces with a
 **compiled producer**.
 
-Two measured levers:
+Measured levers (since the producer is the bottleneck, every lever targets it):
 
 - **PyPy** — running either path under `pypy3` (no code changes) gives ~1.7-1.9x
   end-to-end and narrows the COPY-vs-ILP gap to ~7% (it accelerates the
-  string-heavy CSV producer most). Lowest-effort win.
-- **DuckDB -> Parquet** — a DuckDB `time_bucket`+`last()` pivot to Parquet, loaded
-  via `INSERT INTO t SELECT * FROM read_parquet(...)` into a pre-created partitioned
-  WAL table, measured ~2-2.5x over ILP and **bit-for-bit equal** to `pivot_lp`
-  output. The throughput winner, but with caveats that
-  erode the gain at scale: DuckDB groups the whole input (high RSS -> time-chunking
-  mandatory on a small box), `read_parquet` only resolves under the import root
-  (file staging into the QuestDB container), and the `INSERT` applies via WAL
-  asynchronously. Prototype a per-day windowed run and measure before adopting.
+  string-heavy CSV producer most). Lowest-effort win, and the default in the
+  chunked importer.
+- **Parallelism** — the producer is single-threaded but the planner's chunks are
+  time-disjoint, so producing them is embarrassingly parallel, and COPY is
+  O3-free and order-tolerant, so the CSVs can be produced wide and drained
+  serially in any order. `import_batmon_parallel.sh` does exactly this: PAR
+  producers (`pivot_lp` under PyPy, ~139 MB RSS each) feeding one serial
+  `copy_chunk.py` COPY consumer. Measured on the 4-core box while it was *also*
+  running QuestDB and a concurrent import (load ~5): K=2 1.49x, K=3 1.73x, K=4
+  2.18x aggregate over a single producer; an idle box would scale closer to
+  linear. This is the largest lever for fastest total backfill time.
+- **DuckDB -> Parquet/CSV** — a DuckDB `time_bucket`+`last()` pivot
+  (`duckdb_pivot.py`) is **bit-for-bit equal** to `pivot_lp` output, but at scale
+  it is **not faster** than the PyPy `pivot_lp` producer (both are text-parse-bound
+  on the LP input) and uses **~14x the RAM**. Measured on a 35.5M-line, 4.3 GB
+  sorted day: `pivot_lp`/PyPy 202 s / 139 MB RSS; DuckDB->CSV 206 s / 1.98 GB;
+  DuckDB->Parquet 206 s / 1.9 GB. (An earlier "~2-2.5x over ILP" figure compared
+  DuckDB against *CPython* ILP on small slices, not against PyPy at scale.) Keep
+  `duckdb_pivot.py` as a validated reference, but parallel PyPy is both faster and
+  far lighter. Full methodology and numbers: `backfill-producer-benchmark.md`.
 
 ## Artifacts (the ACL seam)
 
