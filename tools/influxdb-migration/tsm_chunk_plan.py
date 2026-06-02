@@ -33,7 +33,7 @@ import argparse
 import subprocess
 import sys
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def _run(cmd: List[str]) -> str:
@@ -44,18 +44,18 @@ def _run(cmd: List[str]) -> str:
     return proc.stdout
 
 
-def list_tsm_files(engine_path: str, bucket_id: str) -> List[Tuple[str, str, str]]:
-    """Return (replication_policy, shard, file) rows for the bucket via report-tsm."""
+def list_tsm_files(engine_path: str, bucket_id: str) -> List[Tuple[str, str, str, str]]:
+    """Return (replication_policy, shard, file, max_time) rows via report-tsm."""
     out = _run([
         "sudo", "-n", "/usr/bin/influxd", "inspect", "report-tsm",
         "--data-path", f"{engine_path}/data", "--pattern", bucket_id,
     ])
-    rows: List[Tuple[str, str, str]] = []
+    rows: List[Tuple[str, str, str, str]] = []
     for line in out.splitlines():
         parts = line.split()
-        # Data rows start with the bucket id; columns: DB RP Shard File Series ...
-        if len(parts) >= 4 and parts[0] == bucket_id:
-            rows.append((parts[1], parts[2], parts[3]))
+        # Data rows: DB RP Shard File Series New(est) MinTime MaxTime LoadTime
+        if len(parts) >= 8 and parts[0] == bucket_id:
+            rows.append((parts[1], parts[2], parts[3], parts[7]))
     return rows
 
 
@@ -77,14 +77,26 @@ def build_histogram(
     bucket_id: str,
     measurements: Tuple[str, ...],
     bin_seconds: int,
+    since_epoch: Optional[int] = None,
 ) -> Dict[int, int]:
-    """Map bin-start-epoch -> summed compressed block bytes, over the index only."""
+    """Map bin-start-epoch -> summed compressed block bytes, over the index only.
+
+    With ``since_epoch`` set (incremental mode), files whose whole time range
+    predates it are skipped without opening them, and bins entirely before it are
+    dropped -- so the planner reads and plans only the newer tail.
+    """
     files = list_tsm_files(engine_path, bucket_id)
     if not files:
         raise SystemExit(f"no TSM files found for bucket {bucket_id}")
     prefixes = tuple(m + "," for m in measurements)
     hist: Dict[int, int] = {}
-    for rp, shard, fname in files:
+    for rp, shard, fname, max_time in files:
+        if since_epoch is not None:
+            try:
+                if int(parse_ts(max_time).timestamp()) < since_epoch:
+                    continue  # whole file predates the watermark
+            except ValueError:
+                pass
         path = f"{engine_path}/data/{bucket_id}/{rp}/{shard}/{fname}"
         out = _run([
             "sudo", "-n", "/usr/bin/influxd", "inspect", "dump-tsm",
@@ -104,23 +116,28 @@ def build_histogram(
             except (ValueError, IndexError):
                 continue
             b = epoch - (epoch % bin_seconds)
+            if since_epoch is not None and b + bin_seconds <= since_epoch:
+                continue  # bin entirely before the watermark
             hist[b] = hist.get(b, 0) + size
     return hist
 
 
 def plan_chunks(
-    hist: Dict[int, int], target_bytes: int, bin_seconds: int
+    hist: Dict[int, int], target_bytes: int, bin_seconds: int,
+    since_epoch: Optional[int] = None,
 ) -> List[Tuple[datetime, datetime, int]]:
     """Greedy: accumulate bins in time order; cut once a chunk reaches target.
 
     Empty time contributes no bins, so a gap is absorbed into the chunk that
-    spans it -- no chunk is ever spent purely on empty time.
+    spans it -- no chunk is ever spent purely on empty time. With ``since_epoch``
+    the first chunk starts exactly at the watermark (not its bin boundary), so
+    the incremental export re-does at most one partial bin (idempotent via DEDUP).
     """
     if not hist:
         return []
     bins = sorted(hist)
     chunks: List[Tuple[datetime, datetime, int]] = []
-    start = bins[0]
+    start = bins[0] if since_epoch is None else max(bins[0], since_epoch)
     acc = 0
     for b in bins:
         acc += hist[b]
@@ -164,14 +181,21 @@ def main(argv=None) -> int:
         "--bin-minutes", type=int, default=60,
         help="histogram resolution; also the minimum chunk granularity",
     )
+    p.add_argument(
+        "--since", default=None,
+        help="incremental: only plan data at/after this RFC3339 watermark "
+        "(skips older files/bins; first chunk starts exactly here)",
+    )
     args = p.parse_args(argv)
 
     bin_seconds = args.bin_minutes * 60
+    since_epoch = int(parse_ts(args.since).timestamp()) if args.since else None
     hist = build_histogram(
-        args.engine_path, args.bucket_id, tuple(args.measurement), bin_seconds
+        args.engine_path, args.bucket_id, tuple(args.measurement), bin_seconds,
+        since_epoch,
     )
     target_bytes = int(args.target_mb * 1024 * 1024)
-    chunks = plan_chunks(hist, target_bytes, bin_seconds)
+    chunks = plan_chunks(hist, target_bytes, bin_seconds, since_epoch)
 
     total = sum(hist.values())
     sys.stderr.write(
