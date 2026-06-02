@@ -46,6 +46,17 @@ SORTTMP=${SORTTMP:-/mnt/HC_Vol32/bak/sorttmp}
 QDB_URL=${QDB_URL:-http://localhost:9000}
 TARGET_MB=${TARGET_MB:-500}
 BIN_MINUTES=${BIN_MINUTES:-60}
+
+# Run the pivot (the producer bottleneck -- single-core Python) under PyPy when
+# available: ~1.7x over CPython on this workload, output byte-identical. A portable
+# PyPy may sit in ~/.local/bin without being on a non-interactive ssh PATH, so
+# probe that too. Fall back to CPython. Override with PIVOT_PY=... .
+if [ -z "${PIVOT_PY:-}" ]; then
+  if command -v pypy3 >/dev/null 2>&1; then PIVOT_PY=pypy3
+  elif [ -x "$HOME/.local/bin/pypy3" ]; then PIVOT_PY="$HOME/.local/bin/pypy3"
+  else PIVOT_PY=python3; fi
+fi
+
 mkdir -p "$SORTTMP"
 
 rows() {
@@ -66,7 +77,7 @@ if [ "$n" -eq 0 ]; then
   exit 1
 fi
 
-echo "chunked import started $(date -u +%FT%TZ); $n volume-balanced ranges (~${TARGET_MB} MB each)"
+echo "chunked import started $(date -u +%FT%TZ); $n volume-balanced ranges (~${TARGET_MB} MB each); pivot=$PIVOT_PY"
 
 fail=0
 for ((i = 0; i < n; i++)); do
@@ -80,7 +91,7 @@ for ((i = 0; i < n; i++)); do
     | awk '/^(batmon|cells),/{print $NF"\t"$0}' \
     | LC_ALL=C sort -S 1G --parallel=2 -T "$SORTTMP" -k1,1n \
     | cut -f2- \
-    | python3 pivot_lp.py --prefix batmon_tele_ --downsample 20s \
+    | "$PIVOT_PY" pivot_lp.py --prefix batmon_tele_ --downsample 20s \
           --schema-file tm-tables.sql --questdb-url "$QDB_URL" \
           --max-pending-rows 10000000
   rc=$?
