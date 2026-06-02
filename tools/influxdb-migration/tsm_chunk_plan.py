@@ -35,6 +35,8 @@ import sys
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
+from bulk_v1 import _measurement_end, _unescape_measurement
+
 
 def _run(cmd: List[str]) -> str:
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -88,7 +90,7 @@ def build_histogram(
     files = list_tsm_files(engine_path, bucket_id)
     if not files:
         raise SystemExit(f"no TSM files found for bucket {bucket_id}")
-    prefixes = tuple(m + "," for m in measurements)
+    want = set(measurements)  # exact, unescaped measurement names
     hist: Dict[int, int] = {}
     for rp, shard, fname, max_time in files:
         if since_epoch is not None:
@@ -108,8 +110,13 @@ def build_histogram(
             if len(cols) < 6 or "T" not in cols[1]:
                 continue
             key = cols[5]
-            if measurements and not key.startswith(prefixes):
-                continue
+            # The Key is the escaped "measurement,tags" series key; match on the
+            # UNESCAPED measurement so names with spaces/specials (e.g. HA's
+            # "% available", "kWh/d") filter correctly, not just clean prefixes.
+            if want:
+                meas = _unescape_measurement(key[:_measurement_end(key)])
+                if meas not in want:
+                    continue
             try:
                 epoch = int(parse_ts(cols[1]).timestamp())
                 size = int(cols[4])
