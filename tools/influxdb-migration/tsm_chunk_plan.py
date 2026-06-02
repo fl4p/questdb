@@ -3,11 +3,13 @@
 
 The bulk importer (import_batmon_chunked.sh) runs ``export-lp | sort | pivot``
 per time range. The sort inside each range is blocking, so first-row latency and
-peak sort-temp are set by the LARGEST range. A fixed time span is a poor unit:
-the source is wildly non-uniform in density (InfluxDB telemetry here is ~700 MB
-compressed across two dense months in 2023 plus ~2 GB in a single recent week,
-with ~14-month empty deserts between). Fixed *time* either makes 2023 ranges
-huge or wastes an ~80 s export per empty day.
+peak sort-temp are set by the LARGEST range -- bounding that sort is the whole
+point of chunking. A fixed time span is a poor unit: the source is wildly
+non-uniform in density (InfluxDB telemetry here is ~700 MB compressed across two
+dense months in 2023 plus ~2 GB in a single recent week, with ~14-month empty
+deserts between), so equal time spans yield wildly unequal sorts. (export-lp's
+own startup is cheap -- ~1 s measured -- so this is about the sort, not export
+overhead; see export-lp-cost-model.md.)
 
 This planner reads only the TSM *index* (``influxd inspect dump-tsm --index``,
 no block decode -- seconds, not minutes) to build a fine time histogram of

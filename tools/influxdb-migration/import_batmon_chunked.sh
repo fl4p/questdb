@@ -19,14 +19,16 @@
 # in two ranges -- DEDUP UPSERT KEYS on the tables (enabled separately) make that
 # boundary, and any whole-range re-run, idempotent.
 #
-# Granularity is DATA-DRIVEN, not a fixed time span. export-lp costs a FIXED
-# ~80 s per call regardless of window, so uniform daily ranges would burn ~20 h
-# of overhead -- almost all of it scanning empty days (this source has ~14-month
-# deserts). And the source is wildly non-uniform in density (the 2023 history is
-# sparse in downsampled ROWS but DENSE in field-lines -- 2023 sampled
-# sub-second). Because the sort inside each range is itself blocking, first-row
-# latency and peak sort-temp are set by the LARGEST range, so the ranges must be
-# balanced by DATA VOLUME, not by time.
+# Granularity is DATA-DRIVEN, not a fixed time span. The reason is the SORT, not
+# export-lp's startup: measured, export-lp's fixed per-call cost is only ~1 s (a
+# full-bucket export over an empty window returns 0 rows in ~1 s); its time is
+# decode-bound and scales with the data IN the window (the dense recent week
+# alone is ~406 M points / ~257 s). The source is wildly non-uniform in density
+# (the 2023 history is sparse in downsampled ROWS but DENSE in field-lines --
+# 2023 sampled sub-second). Because the sort inside each range is blocking,
+# first-row latency and peak sort-temp are set by the LARGEST range, so the
+# ranges must be balanced by DATA VOLUME, not by time. See
+# export-lp-cost-model.md for the measurements.
 #
 # tsm_chunk_plan.py reads only the TSM index (cheap) to histogram per-block
 # compressed bytes, then cuts the populated span into ~TARGET_MB chunks. Empty
