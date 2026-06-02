@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Plan volume-balanced, gap-skipping time chunks for an InfluxDB->QuestDB import.
+
+The bulk importer (import_batmon_chunked.sh) runs ``export-lp | sort | pivot``
+per time range. The sort inside each range is blocking, so first-row latency and
+peak sort-temp are set by the LARGEST range. A fixed time span is a poor unit:
+the source is wildly non-uniform in density (InfluxDB telemetry here is ~700 MB
+compressed across two dense months in 2023 plus ~2 GB in a single recent week,
+with ~14-month empty deserts between). Fixed *time* either makes 2023 ranges
+huge or wastes an ~80 s export per empty day.
+
+This planner reads only the TSM *index* (``influxd inspect dump-tsm --index``,
+no block decode -- seconds, not minutes) to build a fine time histogram of
+per-block compressed byte size, then greedily cuts it into chunks each holding
+about ``--target-mb`` compressed bytes. Empty bins contribute nothing, so a gap
+is simply absorbed into whichever chunk straddles it -- no export is ever spent
+on an empty span. Compressed size (not point count) is the unit because it is
+free from the index and tracks both the export stream and the sort cost; the
+LP-expanded volume is a roughly constant multiple of it.
+
+It enumerates the bucket's TSM files via ``influxd inspect report-tsm`` so it
+needs no directory listing (the engine dir is root-owned). Both inspect calls go
+through ``sudo -n`` to match the import scripts' NOPASSWD rule.
+
+Output (stdout): one ``START_RFC3339 END_RFC3339`` pair per line, ascending,
+contiguous, covering exactly the populated span. A human-readable plan with the
+estimated bytes per chunk goes to stderr.
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple
+
+
+def _run(cmd: List[str]) -> str:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise SystemExit(f"command failed ({proc.returncode}): {' '.join(cmd)}")
+    return proc.stdout
+
+
+def list_tsm_files(engine_path: str, bucket_id: str) -> List[Tuple[str, str, str]]:
+    """Return (replication_policy, shard, file) rows for the bucket via report-tsm."""
+    out = _run([
+        "sudo", "-n", "/usr/bin/influxd", "inspect", "report-tsm",
+        "--data-path", f"{engine_path}/data", "--pattern", bucket_id,
+    ])
+    rows: List[Tuple[str, str, str]] = []
+    for line in out.splitlines():
+        parts = line.split()
+        # Data rows start with the bucket id; columns: DB RP Shard File Series ...
+        if len(parts) >= 4 and parts[0] == bucket_id:
+            rows.append((parts[1], parts[2], parts[3]))
+    return rows
+
+
+def parse_ts(s: str) -> datetime:
+    # RFC3339 like 2023-11-08T09:58:55.772Z (variable fractional digits).
+    s = s.rstrip("Z")
+    if "." in s:
+        head, frac = s.split(".")
+        frac = (frac + "000000")[:6]
+        s = f"{head}.{frac}"
+        fmt = "%Y-%m-%dT%H:%M:%S.%f"
+    else:
+        fmt = "%Y-%m-%dT%H:%M:%S"
+    return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+
+
+def build_histogram(
+    engine_path: str,
+    bucket_id: str,
+    measurements: Tuple[str, ...],
+    bin_seconds: int,
+) -> Dict[int, int]:
+    """Map bin-start-epoch -> summed compressed block bytes, over the index only."""
+    files = list_tsm_files(engine_path, bucket_id)
+    if not files:
+        raise SystemExit(f"no TSM files found for bucket {bucket_id}")
+    prefixes = tuple(m + "," for m in measurements)
+    hist: Dict[int, int] = {}
+    for rp, shard, fname in files:
+        path = f"{engine_path}/data/{bucket_id}/{rp}/{shard}/{fname}"
+        out = _run([
+            "sudo", "-n", "/usr/bin/influxd", "inspect", "dump-tsm",
+            "--index", "--file-path", path,
+        ])
+        for line in out.splitlines():
+            cols = line.split("\t")
+            # Index rows: Pos, MinTime, MaxTime, Ofs, Size, Key, Field
+            if len(cols) < 6 or "T" not in cols[1]:
+                continue
+            key = cols[5]
+            if measurements and not key.startswith(prefixes):
+                continue
+            try:
+                epoch = int(parse_ts(cols[1]).timestamp())
+                size = int(cols[4])
+            except (ValueError, IndexError):
+                continue
+            b = epoch - (epoch % bin_seconds)
+            hist[b] = hist.get(b, 0) + size
+    return hist
+
+
+def plan_chunks(
+    hist: Dict[int, int], target_bytes: int, bin_seconds: int
+) -> List[Tuple[datetime, datetime, int]]:
+    """Greedy: accumulate bins in time order; cut once a chunk reaches target.
+
+    Empty time contributes no bins, so a gap is absorbed into the chunk that
+    spans it -- no chunk is ever spent purely on empty time.
+    """
+    if not hist:
+        return []
+    bins = sorted(hist)
+    chunks: List[Tuple[datetime, datetime, int]] = []
+    start = bins[0]
+    acc = 0
+    for b in bins:
+        acc += hist[b]
+        if acc >= target_bytes:
+            end = b + bin_seconds  # close at the end of this bin
+            chunks.append((
+                datetime.fromtimestamp(start, timezone.utc),
+                datetime.fromtimestamp(end, timezone.utc),
+                acc,
+            ))
+            start = end
+            acc = 0
+    if acc > 0:  # trailing remainder
+        end = bins[-1] + bin_seconds
+        chunks.append((
+            datetime.fromtimestamp(start, timezone.utc),
+            datetime.fromtimestamp(end, timezone.utc),
+            acc,
+        ))
+    return chunks
+
+
+def fmt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--engine-path", required=True)
+    p.add_argument("--bucket-id", required=True)
+    p.add_argument(
+        "--measurement", action="append", default=[],
+        help="restrict the histogram to these measurement(s); repeatable",
+    )
+    p.add_argument(
+        "--target-mb", type=float, default=150.0,
+        help="target COMPRESSED MB per chunk (LP-expanded is ~40x this); "
+        "default 150 MB ~= a few GB of sort temp per chunk",
+    )
+    p.add_argument(
+        "--bin-minutes", type=int, default=60,
+        help="histogram resolution; also the minimum chunk granularity",
+    )
+    args = p.parse_args(argv)
+
+    bin_seconds = args.bin_minutes * 60
+    hist = build_histogram(
+        args.engine_path, args.bucket_id, tuple(args.measurement), bin_seconds
+    )
+    target_bytes = int(args.target_mb * 1024 * 1024)
+    chunks = plan_chunks(hist, target_bytes, bin_seconds)
+
+    total = sum(hist.values())
+    sys.stderr.write(
+        f"plan: {len(chunks)} chunks over {total / 1048576:.1f} MB compressed "
+        f"({len(hist)} non-empty {args.bin_minutes}-min bins), "
+        f"target {args.target_mb:.0f} MB/chunk\n"
+    )
+    for i, (s, e, b) in enumerate(chunks):
+        span = e - s
+        sys.stderr.write(
+            f"  chunk {i + 1:2d}: {fmt(s)} .. {fmt(e)}  "
+            f"({b / 1048576:7.1f} MB, span {span})\n"
+        )
+        print(f"{fmt(s)} {fmt(e)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

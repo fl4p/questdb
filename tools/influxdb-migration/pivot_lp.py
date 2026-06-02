@@ -309,6 +309,98 @@ class SchemaCoercer:
         # original token instead of re-concatenating name + "=" + value.
         return tok if coerced is value else name + "=" + coerced
 
+    def compile_token_coercer(self, measurement: str, cols: Dict[str, str]) -> "Callable[[str], Optional[str]]":
+        """Build a fast single-token coercer specialized for one measurement.
+
+        The hot path (downsample/exact merge over long-format input) calls the
+        returned closure once per field-line. It produces output byte-identical
+        to :meth:`_coerce_token` but avoids that method's per-token costs:
+
+        * no ``str.partition`` (which allocates a 3-tuple + 2 substrings every
+          line) -- a single ``find("=")`` locates the name/value split, and the
+          name is sliced only when a dict lookup is actually needed;
+        * no secondary bound-method dispatch to ``_to_int``/``_to_bool``/
+          ``_to_float`` -- the dominant INT canonical-``Ni`` case is fully inline
+          and returns the ORIGINAL token object (no re-concatenation), so the
+          common line costs one ``find`` + one ``dict.get`` + a tight digit check;
+        * all attribute lookups it does need (the schema dict, the warn/drop
+          sets, the slow-path fallbacks) are hoisted to closure locals so the
+          per-line body touches no ``self.`` attributes.
+
+        The rarer BOOL/STR kinds and any non-canonical INT delegate to the
+        unchanged methods, so warn-once, drop-once, NULL/None and error handling
+        are identical to the slow path. FLOAT is inlined (its only normalization
+        is stripping a trailing integer marker).
+        """
+        # Hoist everything the body might touch into closure-local fast cells.
+        cols_get = cols.get
+        dropped = self.dropped_cols
+        to_bool = self._to_bool
+        to_int = self._to_int
+
+        def coerce(tok: str) -> Optional[str]:
+            eq = tok.find("=")
+            if eq < 0:
+                return tok
+            name = tok[:eq]
+            kind = cols_get(name)
+            if kind is None:
+                if (measurement, name) not in dropped:
+                    dropped.add((measurement, name))
+                    log.info(
+                        "schema: dropping column not in schema [%s.%s]",
+                        measurement,
+                        name,
+                    )
+                return None
+            if kind == "int":
+                # Inline canonical-Ni fast path (the dominant column kind for
+                # this workload, and most values already arrive canonical). Must
+                # stay byte-identical to _to_int's fast path: optional leading
+                # '-', all digits, no leading zero (except a lone '0'), no '-0',
+                # trailing 'i'. On a hit, return the ORIGINAL token unchanged.
+                #
+                # Slice the magnitude straight out of ``tok`` using the known '='
+                # offset so the canonical case allocates only ``name`` (needed for
+                # the dict lookup) plus the digit slice the validation requires --
+                # not a separate ``value`` string.
+                last = tok[-1]
+                if last == "i" or last == "I":
+                    # digits = chars between '=' and the trailing i/I marker.
+                    dstart = eq + 1
+                    neg = tok[dstart:dstart + 1] == "-"
+                    mag = tok[dstart + 1:-1] if neg else tok[dstart:-1]
+                    if mag.isdigit() and (mag == "0" or mag[0] != "0") and not (neg and mag == "0"):
+                        # _to_int always emits a lowercase 'i'. When the source
+                        # already used 'i', the canonical token IS `tok` -- return
+                        # it unchanged (no allocation). An uppercase 'I' source is
+                        # still canonical numerically but must be rewritten to 'i'
+                        # to match _to_int byte-for-byte.
+                        return tok if last == "i" else tok[:-1] + "i"
+                coerced = to_int(measurement, name, tok[eq + 1:])
+                if coerced is None:
+                    return None
+                return name + "=" + coerced
+            if kind == "float":
+                # value -> FLOAT: _to_float's ONLY change is stripping a trailing
+                # integer marker 'i'/'I' (an int source into a float column;
+                # lossless, no warning). tok is name+"="+value, so tok[:-1] equals
+                # name+"="+value[:-1] exactly -- byte-identical to the old
+                # name + "=" + _to_float(value), but with no value slice and no
+                # call (FLOAT is the dominant coerced kind on this workload).
+                last = tok[-1]
+                return tok[:-1] if last == "i" or last == "I" else tok
+            value = tok[eq + 1:]
+            if kind == "bool":
+                coerced = to_bool(measurement, name, value)
+            else:
+                return tok
+            if coerced is None:
+                return None
+            return tok if coerced is value else name + "=" + coerced
+
+        return coerce
+
     def transform_fields(self, measurement: str, fields: str) -> Optional[str]:
         """Return the filtered/coerced field set, or None if nothing survives."""
         cols = self._schema.get(measurement)
@@ -470,6 +562,11 @@ def merge_stream(
     # lookup. ``cols`` is the per-measurement column map (or None when the
     # measurement has no schema, i.e. pass tokens through unchanged); resolving
     # it here lets the loop hand it straight to the coercer's per-token path.
+    # head -> (measurement, cols, coerce) where ``coerce`` is the compiled
+    # single-token closure for that measurement (or None when the measurement has
+    # no schema). Compiling once per measurement lets the per-line hot path call
+    # one closure with all method/attribute lookups already hoisted to locals,
+    # instead of going through _coerce_token's per-token bound-method dispatch.
     head_cols: Dict[str, tuple] = {}
     _coercer_schema = coercer._schema if coercer is not None else None
 
@@ -479,9 +576,18 @@ def merge_stream(
             c = head.find(",")
             meas = head if c < 0 else head[:c]
             cols = _coercer_schema.get(meas) if _coercer_schema is not None else None
-            hit = (meas, cols)
+            coerce = (
+                coercer.compile_token_coercer(meas, cols)
+                if coercer is not None and cols is not None
+                else None
+            )
+            hit = (meas, cols, coerce)
             head_cols[head] = hit
         return hit
+
+    # Hoist the cache's bound ``get`` so the per-line common case (a cache hit)
+    # is a single C-level dict lookup, not a Python ``cols_for_head`` call frame.
+    _hc_get = head_cols.get
 
     if interval_ns:
         cur_bucket: Optional[int] = None
@@ -543,16 +649,20 @@ def merge_stream(
             # done for the rare multi-field line.
             if "," not in fields:
                 if coercer is not None:
-                    meas, cols = cols_for_head(head)
-                    if cols is not None:
-                        fields = coercer._coerce_token(meas, cols, fields)
+                    # Inline the head cache lookup: a hit (the steady state, one
+                    # entry per distinct series) avoids the per-line
+                    # cols_for_head() call frame entirely.
+                    hit = _hc_get(head)
+                    coerce = hit[2] if hit is not None else cols_for_head(head)[2]
+                    if coerce is not None:
+                        fields = coerce(fields)
                         if fields is None:
                             continue
                 eq = fields.find("=")
                 fmap[fields if eq < 0 else fields[:eq]] = fields
             else:
                 if coercer is not None:
-                    meas, _ = cols_for_head(head)
+                    meas, _, _ = cols_for_head(head)
                     tfields = coercer.transform_fields(meas, fields)
                     if tfields is None:
                         continue
@@ -587,11 +697,13 @@ def merge_stream(
         if on_progress is not None and field_lines % 200_000 == 0:
             on_progress(field_lines)
         if coercer is not None:
-            meas, cols = cols_for_head(head)
             if "," not in fields:
-                if cols is not None:
-                    fields = coercer._coerce_token(meas, cols, fields)
+                hit = _hc_get(head)
+                coerce = hit[2] if hit is not None else cols_for_head(head)[2]
+                if coerce is not None:
+                    fields = coerce(fields)
             else:
+                meas = cols_for_head(head)[0]
                 fields = coercer.transform_fields(meas, fields)
         key = (head, ts)
         if key != cur_key:
