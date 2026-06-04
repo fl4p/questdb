@@ -17,6 +17,7 @@ reuses bulk_v1 so escaped commas/spaces in the original name are handled.
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 
@@ -83,23 +84,104 @@ def sanitized(literal: str):
     return g
 
 
-def main() -> int:
+def _first_unescaped_space(s: str) -> int:
+    """Index of the first space not preceded by a backslash, or -1.
+
+    The head (measurement + tag keys/values) escapes spaces as ``\\ ``; the
+    head/fields boundary is the first UNescaped space. A plain find() would stop
+    inside names like ``% available``.
+    """
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == " ":
+            return i
+        i += 1
+    return -1
+
+
+def split_line(line: str):
+    """(head, field, ts) for a long-format LP line; None if malformed.
+
+    head = "measurement,tags" (up to the first UNescaped space); field = the
+    single "name=value" token; ts = trailing nanosecond timestamp. The last space
+    delimits ts, so a quoted string value with internal spaces stays in ``field``.
+
+    Strips all trailing whitespace, not just the newline: a stray trailing space
+    would otherwise make ``rfind(" ")`` point past the real timestamp and emit a
+    line with an empty ts (which QuestDB rejects).
+    """
+    line = line.rstrip()
+    sp1 = _first_unescaped_space(line)
+    sp2 = line.rfind(" ")
+    if sp1 < 0 or sp2 <= sp1:
+        return None
+    return line[:sp1], line[sp1 + 1:sp2], line[sp2 + 1:]
+
+
+def rebuild_head(head: str, new_meas: str, keep_tags) -> str:
+    """Replace the measurement and drop any tag whose key is not in keep_tags.
+
+    HA tags (entity_id, domain) carry no escaped commas, so a plain comma split
+    is safe here; this is what strips dirty tag keys like 'Available (Important)'.
+    """
+    end = _measurement_end(head)
+    tags = head[end + 1:] if end < len(head) and head[end] == "," else ""
+    kept = [kv for kv in tags.split(",") if kv and kv.split("=", 1)[0] in keep_tags]
+    return new_meas + ("," + ",".join(kept) if kept else "")
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--value-only", action="store_true",
+        help="keep only the 'value' field and the --keep-tags tags; drop all "
+        "other fields/tags (HA attribute fields/tags have arbitrary names that "
+        "are illegal QuestDB columns)",
+    )
+    p.add_argument("--value-field", default="value")
+    p.add_argument("--keep-tags", default="entity_id,domain")
+    args = p.parse_args(argv)
+    keep_tags = set(t for t in args.keep_tags.split(",") if t)
+
     out = sys.stdout
     write = out.write
-    dropped = 0
-    kept = 0
-    for line in sys.stdin:
-        if not line or line[0] == "#":
-            continue
-        end = _measurement_end(line)
-        literal = _unescape_measurement(line[:end])
-        name = sanitized(literal)
-        if name is None:
-            dropped += 1
-            continue
-        # ``name`` is a clean identifier, so no re-escaping is needed.
-        write(name + line[end:])
-        kept += 1
+    dropped = kept = 0
+
+    if not args.value_only:
+        for line in sys.stdin:
+            if not line or line[0] == "#":
+                continue
+            end = _measurement_end(line)
+            name = sanitized(_unescape_measurement(line[:end]))
+            if name is None:
+                dropped += 1
+                continue
+            write(name + line[end:])  # name is clean, no re-escape needed
+            kept += 1
+    else:
+        vfield = args.value_field
+        for line in sys.stdin:
+            if not line or line[0] == "#":
+                continue
+            parts = split_line(line)
+            if parts is None:
+                dropped += 1
+                continue
+            head, field, ts = parts
+            if field.split("=", 1)[0] != vfield:
+                dropped += 1  # not the value field -> drop (metadata/attribute)
+                continue
+            name = sanitized(_unescape_measurement(head[:_measurement_end(head)]))
+            if name is None:
+                dropped += 1
+                continue
+            write(rebuild_head(head, name, keep_tags) + " " + field + " " + ts + "\n")
+            kept += 1
+
     out.flush()
     sys.stderr.write(f"sanitize_lp: kept {kept} lines, dropped {dropped}\n")
     return 0
