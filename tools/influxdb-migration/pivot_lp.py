@@ -606,7 +606,7 @@ def merge_stream(
             acc.clear()
 
         for raw in lines:
-            raw = raw.rstrip("\n")
+            raw = raw.rstrip()
             if not raw:
                 continue
             parts = _split_lp(raw)
@@ -686,7 +686,7 @@ def merge_stream(
         points += 1
 
     for raw in lines:
-        raw = raw.rstrip("\n")
+        raw = raw.rstrip()
         if not raw:
             continue
         parts = _split_lp(raw)

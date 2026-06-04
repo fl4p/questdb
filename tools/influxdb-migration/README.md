@@ -1,12 +1,36 @@
 # InfluxDB → QuestDB migration
 
-Copies **all data** and **users/permissions** from an InfluxDB instance (v1.x
-or v2.x) into QuestDB. Data is written over InfluxDB Line Protocol (ILP);
-users/permissions are replayed into the fork's file-based ACL (`conf/acl.conf`,
-see [`../../docs/ACL.md`](../../docs/ACL.md)).
+Copies **all data** (and, on the HTTP path, **users/permissions**) from an
+InfluxDB instance into QuestDB. The table-naming convention
+(`<db>_<measurement>`, single underscore) matches the fork's InfluxQL `/query`
+endpoint and the file-based ACL prefix contract, so Grafana/REST clients keep
+working after the cut-over.
 
-The table-naming convention matches the fork's InfluxQL `/query` endpoint, so
-Grafana/REST clients keep working after the cut-over.
+## Pipelines at a glance
+
+There are **three data-migration pipelines**. Pick by how you can reach the
+source and how you want to write QuestDB:
+
+| # | Pipeline | Source read | Write to QuestDB | Driver(s) | Engine |
+|---|----------|-------------|------------------|-----------|--------|
+| 1 | **Offline -> ILP** | `influxd inspect export-lp` (local engine files) | ILP feed (wide pivot) | `import_ha_van.sh`, `import_batmon_chunked.sh` | `pivot_lp.py` |
+| 2 | **Offline -> COPY** | `influxd inspect export-lp` (local engine files) | wide CSV + parallel `COPY` | `import_batmon_copy.sh`, `import_batmon_parallel.sh` | `bulk_copy.py` (+ `copy_chunk.py`) |
+| 3 | **HTTP -> ILP** | InfluxDB HTTP API (remote, live server) | ILP feed | `influx_migrate.py` | `readers/` + `writer.py` |
+
+- **1 and 2 share one offline front-end** -- `export-lp | sanitize | sort | pivot`
+  -- and differ only on the write side. Both need filesystem access to the
+  InfluxDB TSM engine directory. ILP (1) goes through the WAL; COPY (2) writes
+  column files directly and is idempotent on resume via `DEDUP UPSERT KEYS`.
+- **3 is fully separate.** It reads a remote, running InfluxDB over HTTP (no
+  engine access) and is the only path that also migrates users/permissions.
+- **ACL generation is a post-step, not a pipeline.** `acl_from_artifacts.py`
+  consumes the manifest/principals artifacts that pipeline 3 emits and writes
+  `conf/acl.conf` (see [`../../docs/ACL.md`](../../docs/ACL.md)); it touches
+  neither InfluxDB nor QuestDB data.
+
+The sections below cover the HTTP path (Usage), the shared ILP/schema/index
+options, the COPY path, and verification. For the offline `export-lp` pipelines,
+`import_ha_van.sh` and `import_batmon_copy.sh` are the ready-to-edit runbooks.
 
 ## Install
 
@@ -15,8 +39,11 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt   # influxdb / influxdb-client imported lazily
 ```
 
-Install only the source client you need: `questdb` plus `influxdb` for a v1
-source, or `questdb` plus `influxdb-client` for a v2 source.
+This is only for the **HTTP path** (pipeline 3): install the source client you
+need -- `questdb` plus `influxdb` for a v1 source, or `questdb` plus
+`influxdb-client` for a v2 source (both imported lazily). The **offline
+`export-lp` pipelines** (1 and 2) are pure standard-library Python and shell out
+to `influxd inspect export-lp`, so they need nothing installed.
 
 ## Usage
 
@@ -157,7 +184,7 @@ writes, but that is not a substitute for the pivot's pre-merge sort: the downsam
 pivot merges all fields of a `(tagset, bucket)` into one row using a single open
 bucket, which is only correct when the input is timestamp-sorted. The raw export-lp
 is series-major (each field's full time-series contiguous), so it **must** be
-sorted first — exactly as in `import_batmon.sh`. Verified on the real bucket: sorted
+sorted first — exactly as in `import_batmon_copy.sh`. Verified on the real bucket: sorted
 input reproduces the production table exactly; unsorted input produced ~12x too many
 fragmented rows, so the pivot now **aborts loudly** on unsorted input rather than
 corrupting.
